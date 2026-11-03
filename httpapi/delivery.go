@@ -13,6 +13,7 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/control"
+	"github.com/nostalume/mountweave/input"
 	"github.com/nostalume/mountweave/task"
 )
 
@@ -104,6 +105,20 @@ func respond(w http.ResponseWriter, r *http.Request, id string, status int, valu
 }
 func domainStatus(err error) (int, string) {
 	switch {
+	case errors.Is(err, input.ErrInvalid):
+		return 400, "invalid_request"
+	case errors.Is(err, input.ErrNotFound):
+		return 404, "not_found"
+	case errors.Is(err, input.ErrCapacity):
+		return 429, "capacity_exceeded"
+	case errors.Is(err, input.ErrConflict):
+		return 409, "input_conflict"
+	case errors.Is(err, input.ErrBusy):
+		return 409, "input_busy"
+	case errors.Is(err, input.ErrState):
+		return 409, "input_state"
+	case errors.Is(err, input.ErrClosed), errors.Is(err, input.ErrCorrupt), errors.Is(err, input.ErrUncertain):
+		return 503, "unavailable"
 	case errors.Is(err, control.ErrConflict):
 		return 409, "revision_conflict"
 	case errors.Is(err, control.ErrNotFound):
@@ -154,7 +169,18 @@ func (h *Handler) operation(w http.ResponseWriter, r *http.Request, id string, p
 		writeDomainProblem(w, r, id, err, FileResult{Effect: core.Unchanged.String()})
 		return
 	}
-	result, err := work.Run(r.Context(), func(any) {})
+	result, err := func() (result any, err error) {
+		defer func() {
+			if cleanupErr := h.finishWork(work.Cleanup); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
+				if file, ok := result.(FileResult); ok {
+					file.CleanupError = errorCode(cleanupErr)
+					result = file
+				}
+			}
+		}()
+		return work.Run(r.Context(), func(any) {})
+	}()
 	if err != nil {
 		writeDomainProblem(w, r, id, err, result)
 		return

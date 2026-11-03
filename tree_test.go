@@ -85,6 +85,29 @@ func TestAliasesAndTreeCopy(t *testing.T) {
 			t.Fatal(name, string(data), err)
 		}
 	}
+	// Equal child names in distinct bound parents must keep their provenance.
+	if err = os.Mkdir(filepath.Join(root, "other"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "other/a", []byte("another-parent"))
+	if err = c.BindAlias(ctx, "/other-view", m, "/other"); err != nil {
+		t.Fatal(err)
+	}
+	otherRows, otherErr := c.CopyTree(ctx, "alice", "/other-view", "/files/other-output", options)
+	otherData, otherReadErr := os.ReadFile(filepath.Join(root, "other-output", "a"))
+	if otherErr != nil || len(otherRows) != 2 || otherReadErr != nil || string(otherData) != "another-parent" {
+		t.Fatal(otherRows, otherErr, string(otherData), otherReadErr)
+	}
+	// An enumerated alias child still renews its primary Read grant at execution.
+	deny = true
+	_, deniedErr := c.CopyTree(ctx, "alice", "/view", "/files/denied-output", options)
+	deny = false
+	if core.CodeOf(deniedErr) != core.PermissionDenied {
+		t.Fatalf("scoped child bypassed primary grant: %v", deniedErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "denied-output", "a")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("denied child was copied: %v", statErr)
+	}
 	if info, err := os.Stat(filepath.Join(root, "output", "empty")); err != nil || !info.IsDir() {
 		t.Fatal(info, err)
 	}
@@ -496,6 +519,63 @@ func TestTreeRemovalBoundaries(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSubtreeRemovalAuthorityAndFallback(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "tree", "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "tree/nested/a", []byte("selected"))
+	write(t, root, "outside", []byte("retained"))
+	whole := false
+	c := newCore(t, core.Options{Authorize: func(ctx context.Context, p core.Principal, a core.Action, name string) error {
+		if p == "alice" && (name == "/view/tree" || name == "/files/tree" || name == "/files" || name == "/view") {
+			if a == core.RemoveAction || (whole && a == core.RemoveTreeAction) {
+				return nil
+			}
+		}
+		return errors.New("no child/list grant")
+	}})
+	defer closeCore(t, c)
+	d, err := local.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := installCopyMount(t, c, "/files", d)
+	if err := c.BindAlias(ctx, "/view", m, "/"); err != nil {
+		t.Fatal(err)
+	}
+	limits := core.TreeOptions{ExecutionOptions: core.ExecutionOptions{Concurrency: 2}, MaxEntries: 10, MaxPlanBytes: 128}
+	policy := core.DirectoryRemoveOptions{Scope: core.Subtree}
+	if rows, err := c.RemoveTree(ctx, "alice", "/view/tree", limits); len(rows) != 0 || core.CodeOf(err) != core.PermissionDenied {
+		t.Fatal(rows, err)
+	}
+	if rows, err := c.RemoveTree(ctx, "alice", "/view/tree", limits, policy); len(rows) != 0 || core.CodeOf(err) != core.PermissionDenied {
+		t.Fatal(rows, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree", "nested", "a")); err != nil {
+		t.Fatal(err)
+	}
+	whole = true
+	if rows, err := c.RemoveTree(ctx, "alice", "/view/tree", limits, policy); err != nil || len(rows) != 3 || rows[2].Change.Effect != core.Applied {
+		t.Fatal(rows, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"/files", "/view"} {
+		if _, err := c.RemoveTree(ctx, "alice", target, limits, policy); core.CodeOf(err) != core.InvalidRequest {
+			t.Fatal(target, err)
+		}
+	}
+	if _, err := c.RemoveTree(ctx, "alice", "/files/outside", limits, core.DirectoryRemoveOptions{Scope: "auto"}); core.CodeOf(err) != core.InvalidRequest {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "outside")); err != nil || string(data) != "retained" {
+		t.Fatal(string(data), err)
+	}
 }
 
 func TestTreeRemovalEffectsAndCleanup(t *testing.T) {

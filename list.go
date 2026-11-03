@@ -115,7 +115,7 @@ func (c *Core) beginList(ctx context.Context, p Principal, target string, limit 
 	s.timer = time.AfterFunc(time.Until(s.expires), s.invalidate)
 	call, end := requestScope(ctx, s.life)
 	if u != nil {
-		err = c.authorizeBinding(call, p, ListAction, u.binding, u.path)
+		err = c.authorizeBinding(call, p, ListAction, u.location)
 		if err == nil {
 			s.iter, err = u.mount.driver.Enumerate(call, u.path)
 		}

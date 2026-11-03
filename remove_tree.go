@@ -4,8 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 )
+
+// RemovalScope selects permitted effects, independently of execution strategy.
+type RemovalScope string
+
+const (
+	Discovered RemovalScope = "discovered"
+	Subtree    RemovalScope = "subtree"
+)
+
+// DirectoryRemoveOptions defaults to Discovered when omitted or empty.
+type DirectoryRemoveOptions struct{ Scope RemovalScope }
+
+// SubtreeRemover optionally removes a directory and its native descendants.
+// It must not follow redirects outside that subtree. Limits bound client discovery
+// and planning, not the number of descendants a native recursive request deletes.
+// Applied requires confirmed completion, not asynchronous task acceptance. On
+// cancellation, stop dispatch and await active client I/O; remote effects may
+// continue and must remain Unknown when completion cannot be established.
+type SubtreeRemover interface {
+	RemoveSubtree(context.Context, string, TreeOptions) (Change, error)
+}
 
 type removalEntry struct {
 	relative string
@@ -18,11 +38,23 @@ type removalDirectory struct {
 	children []removalEntry
 }
 
-// RemoveTree removes only the names in a bounded discovery of one directory.
-// Compatible same-name replacements can be removed; unlisted new names are not
-// chased. Directories are removed only when empty. Results are the started prefix
-// in child-before-parent execution order, with the root last.
-func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, options TreeOptions) (results []TreeItemResult, err error) {
+// RemoveTree defaults to a bounded discovery: only selected names are removed,
+// compatible same-name replacements may be removed, and directories must be empty.
+// Explicit Subtree requires RemoveTreeAction and permits native recursive effects,
+// including new descendants. Native execution returns one root receipt; otherwise
+// the existing bounded planner/executor returns child-before-parent receipts.
+// Neither mode promises a snapshot or protection against later recreation.
+func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, options TreeOptions, policies ...DirectoryRemoveOptions) (results []TreeItemResult, err error) {
+	if len(policies) > 1 {
+		return nil, Fail(InvalidRequest, nil)
+	}
+	scope := Discovered
+	if len(policies) == 1 && policies[0].Scope != "" {
+		scope = policies[0].Scope
+	}
+	if scope != Discovered && scope != Subtree {
+		return nil, Fail(InvalidRequest, nil)
+	}
 	limit, err := concurrency([]ExecutionOptions{options.ExecutionOptions})
 	if err != nil {
 		return nil, err
@@ -30,7 +62,11 @@ func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, optio
 	if options.MaxEntries <= 0 || options.MaxPlanBytes <= 0 {
 		return nil, Fail(InvalidRequest, nil)
 	}
-	root, _, err := c.beginChangeAt(ctx, p, RemoveAction, target, nil)
+	action := RemoveAction
+	if scope == Subtree {
+		action = RemoveTreeAction
+	}
+	root, err := c.beginChange(ctx, p, action, target)
 	if err != nil {
 		return nil, err
 	}
@@ -38,32 +74,66 @@ func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, optio
 	ctx, end := requestScope(ctx, root.ctx)
 	defer end()
 	defer func() { err = observedCause(ctx, err) }()
-	at := func(relative string) *location {
-		return &location{binding: root.binding, path: joinPath(root.path, relative)}
+	if scope == Subtree {
+		if remover, ok := root.mount.driver.(SubtreeRemover); ok {
+			if err = ctx.Err(); err != nil {
+				return nil, err
+			}
+			change, nativeErr := remover.RemoveSubtree(root.ctx, root.path, options)
+			change, nativeErr = c.finishChange(root, change, nativeErr)
+			return []TreeItemResult{{RelativePath: "/", Change: change, Err: nativeErr}}, nativeErr
+		}
 	}
-	// Root removal needs its parent's mutation scope, without listing that parent.
-	parent, scope, err := c.openRemovalDirectory(ctx, p, target, at("/"))
+	at := func(relative string) *location {
+		return root.location.descend(relative)
+	}
+	// Whole-subtree authority includes internal traversal and child mutation.
+	// Renew that root grant for client steps while retaining the captured binding.
+	begin := func(at *location) (*use, error) {
+		if scope == Discovered {
+			return c.beginChangeAt(ctx, p, RemoveAction, at)
+		}
+		if err := c.preflightAt(ctx, p, RemoveTreeAction, root.location); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		u, err := c.borrowAtLocked(ctx, at)
+		c.mu.Unlock()
+		return u, err
+	}
+	openRemoval := func(at *location) (*directory, error) { return openRemovalDirectory(begin(at)) }
+	parent, err := openRemoval(at("/"))
 	if err != nil {
 		return nil, err
 	}
-	if err = closeDirectory(parent, scope); err != nil {
+	if err = parent.close(); err != nil {
 		return nil, err
 	}
 
 	directories := []removalDirectory{{path: "/"}}
 	entries, bytes := 1, 1
 	for i := 0; i < len(directories); i++ {
-		directory := directories[i].path
-		u, scope, openErr := c.openDirectory(ctx, p, joinPath(target, directory), at(directory))
+		relativeDir := directories[i].path
+		var directoryScope *directory
+		var openErr error
+		if scope == Discovered {
+			directoryScope, openErr = c.openDirectory(ctx, p, at(relativeDir))
+		} else {
+			var u *use
+			u, openErr = begin(at(relativeDir))
+			if openErr == nil {
+				directoryScope, openErr = openDirectoryAt(u, false)
+			}
+		}
 		if openErr != nil {
-			return nil, fmt.Errorf("discover %s: %w", directory, openErr)
+			return nil, fmt.Errorf("discover %s: %w", relativeDir, openErr)
 		}
 		var scanErr error
-		if _, ok := scope.(ChildRemover); !ok {
+		if _, ok := directoryScope.native.(ChildRemover); !ok {
 			scanErr = Fail(UnsupportedOperation, nil)
 		} else {
-			scanErr = scanDirectory(u, scope, joinPath(target, directory), options, func(meta Metadata) error {
-				relative := joinPath(directory, "/"+meta.Name)
+			scanErr = directoryScope.scan(options, func(meta Metadata) error {
+				relative := joinPath(relativeDir, "/"+meta.Name)
 				if ValidatePath(joinPath(target, relative)) != nil {
 					return Fail(UnrepresentableName, nil)
 				}
@@ -72,8 +142,10 @@ func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, optio
 				if entries > options.MaxEntries || bytes > options.MaxPlanBytes {
 					return Fail(CapacityExceeded, nil)
 				}
-				if err := c.preflightChange(ctx, p, RemoveAction, joinPath(target, relative), at(relative)); err != nil {
-					return err
+				if scope == Discovered {
+					if err := c.preflightAt(ctx, p, RemoveAction, at(relative)); err != nil {
+						return err
+					}
 				}
 				directories[i].children = append(directories[i].children, removalEntry{relative, meta.Kind})
 				if meta.Kind == Directory {
@@ -82,40 +154,39 @@ func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, optio
 				return nil
 			})
 		}
-		closeErr := closeDirectory(u, scope)
+		closeErr := directoryScope.close()
 		if scanErr != nil || closeErr != nil {
-			return nil, fmt.Errorf("discover %s: %w", directory, errors.Join(scanErr, closeErr))
+			return nil, fmt.Errorf("discover %s: %w", relativeDir, errors.Join(scanErr, closeErr))
 		}
 	}
 
 	removeGroups := func(groups []removalDirectory) error {
 		var removeErr error
 		results, removeErr = executeDirectories(ctx, len(groups), limit, results,
-			func(i int) (*use, DirectoryScope, int, error) {
+			func(i int) (*directory, int, error) {
 				children := groups[i].children
 				if len(children) == 0 {
-					return nil, nil, 0, nil
+					return nil, 0, nil
 				}
 				first := children[0].relative
-				u, scope, openErr := c.openRemovalDirectory(ctx, p, joinPath(target, first), at(first))
+				scope, openErr := openRemoval(at(first))
 				if openErr != nil {
 					openErr = fmt.Errorf("open removal parent of %s: %w", first, openErr)
 				}
-				return u, scope, len(children), openErr
+				return scope, len(children), openErr
 			},
-			func(i int, scope DirectoryScope, item int) work[TreeItemResult] {
+			func(i int, scope *directory, item int) work[TreeItemResult] {
 				entry := groups[i].children[item]
 				expected := at(entry.relative)
 				return work[TreeItemResult]{accesses: []access{{at: expected, write: true}}, run: func() (TreeItemResult, error) {
 					row := TreeItemResult{RelativePath: entry.relative, Change: Change{Unchanged}}
-					item, native, admissionErr := c.beginChangeAt(ctx, p, RemoveAction, joinPath(target, entry.relative), expected)
+					item, admissionErr := begin(expected)
 					if admissionErr != nil {
 						row.Err = admissionErr
 					} else {
 						defer item.release()
 						if row.Err = item.ctx.Err(); row.Err == nil {
-							row.Change, row.Err = scope.(ChildRemover).RemoveChild(item.ctx, path.Base(native), entry.kind)
-							row.Change, row.Err = c.finishChange(item, row.Change, row.Err)
+							row.Change, row.Err = scope.removeChild(item, entry.kind)
 						}
 					}
 					return row, row.Err
@@ -138,18 +209,17 @@ func (c *Core) RemoveTree(ctx context.Context, p Principal, target string, optio
 	return results, err
 }
 
-// The child's RemoveAction authorizes opening its parent for mutation, not listing.
-func (c *Core) openRemovalDirectory(ctx context.Context, p Principal, target string, expected *location) (*use, DirectoryScope, error) {
-	u, native, err := c.beginChangeAt(ctx, p, RemoveAction, target, expected)
+// The caller has admitted a child mutation, including opening its parent.
+func openRemovalDirectory(u *use, err error) (*directory, error) {
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	scope, err := openDirectoryAt(u, path.Dir(native))
+	scope, err := openDirectoryAt(u, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if _, ok := scope.(ChildRemover); !ok {
-		return nil, nil, errors.Join(Fail(UnsupportedOperation, nil), closeDirectory(u, scope))
+	if _, ok := scope.native.(ChildRemover); !ok {
+		return nil, errors.Join(Fail(UnsupportedOperation, nil), scope.close())
 	}
-	return u, scope, nil
+	return scope, nil
 }

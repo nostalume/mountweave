@@ -14,12 +14,13 @@ type Principal string
 type Action string
 
 const (
-	StatAction   Action = "stat"
-	ListAction   Action = "list"
-	ReadAction   Action = "read"
-	CreateAction Action = "create"
-	WriteAction  Action = "write" // Explicit create-or-replace permission.
-	RemoveAction Action = "remove"
+	StatAction       Action = "stat"
+	ListAction       Action = "list"
+	ReadAction       Action = "read"
+	CreateAction     Action = "create"
+	WriteAction      Action = "write" // Explicit create-or-replace permission.
+	RemoveAction     Action = "remove"
+	RemoveTreeAction Action = "remove_tree" // Grants deletion and traversal of a whole subtree.
 )
 
 type Code string

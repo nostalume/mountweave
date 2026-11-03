@@ -12,6 +12,7 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/control"
+	"github.com/nostalume/mountweave/input"
 	"github.com/nostalume/mountweave/task"
 )
 
@@ -49,13 +50,15 @@ type TaskInfo struct {
 // reserved and completed HTTP records; completed records evict oldest-first by
 // acceptance order. The queue and all injected components remain host-owned.
 type Options struct {
-	Control       *control.Controller
-	ProjectConfig func(context.Context, core.Principal, control.Definition) (any, error)
-	Queue         *task.Queue
-	TaskKinds     map[string]TaskKind
-	AuthorizeTask func(context.Context, core.Principal, TaskAction, TaskInfo) error
-	MaxTasks      int
-	MaxJSONBytes  int64
+	Control        *control.Controller
+	ProjectConfig  func(context.Context, core.Principal, control.Definition) (any, error)
+	Queue          *task.Queue
+	TaskKinds      map[string]TaskKind
+	AuthorizeTask  func(context.Context, core.Principal, TaskAction, TaskInfo) error
+	MaxTasks       int
+	MaxJSONBytes   int64
+	Inputs         *input.Store
+	AuthorizeInput func(context.Context, core.Principal, InputAction, InputInfo) error
 }
 type taskRecord struct {
 	info   TaskInfo
@@ -87,6 +90,12 @@ func (h *Handler) configure(options []Options) error {
 		return errors.New("task HTTP delivery requires a record budget and authorizer")
 	}
 	h.files = FileTaskKinds(h.core)
+	if o.Inputs != nil {
+		if o.AuthorizeInput == nil {
+			return errors.New("input HTTP delivery requires an authorizer")
+		}
+		h.files["fs.write"] = h.inputWriteKind()
+	}
 	h.kinds = make(map[string]TaskKind, len(h.files)+len(o.TaskKinds))
 	for name, kind := range h.files {
 		h.kinds[name] = kind
@@ -95,7 +104,7 @@ func (h *Handler) configure(options []Options) error {
 		if name == "" || kind.Prepare == nil || kind.Project == nil {
 			return errors.New("task kind, prepare and projection are required")
 		}
-		if _, exists := h.files[name]; exists {
+		if _, exists := h.files[name]; exists || name == "fs.write" {
 			return errors.New("host task kinds cannot replace built-in file semantics")
 		}
 		h.kinds[name] = kind
@@ -202,11 +211,8 @@ func (h *Handler) submit(w http.ResponseWriter, r *http.Request, id string, p co
 		// Retain failed cleanup ownership and report it through Close.
 		// Run is never invoked on rejected admission.
 		if work.Cleanup != nil {
-			cleanupErr := cleanupWork(work.Cleanup)
+			cleanupErr := h.finishWork(work.Cleanup)
 			if cleanupErr != nil {
-				h.tasks.mu.Lock()
-				h.failed = append(h.failed, failedTask{cleanup: work.Cleanup, err: cleanupErr})
-				h.tasks.mu.Unlock()
 				err = errors.Join(err, cleanupErr)
 				rejection = map[string]string{"cleanup_error": errorCode(cleanupErr)}
 			}
@@ -343,4 +349,17 @@ func cleanupWork(cleanup func() error) (err error) {
 		}
 	}()
 	return cleanup()
+}
+
+func (h *Handler) finishWork(cleanup func() error) error {
+	if cleanup == nil {
+		return nil
+	}
+	err := cleanupWork(cleanup)
+	if err != nil {
+		h.tasks.mu.Lock()
+		h.failed = append(h.failed, failedTask{cleanup: cleanup, err: err})
+		h.tasks.mu.Unlock()
+	}
+	return err
 }

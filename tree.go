@@ -48,6 +48,9 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 	if len(directoryOptions) == 1 {
 		policy = directoryOptions[0]
 	}
+	if policy.Continuation != nil {
+		return nil, Fail(UnsupportedOperation, nil)
+	}
 	limit, err := concurrency([]ExecutionOptions{options.ExecutionOptions})
 	if err != nil {
 		return nil, err
@@ -55,7 +58,7 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 	if options.MaxEntries <= 0 || options.MaxPlanBytes <= 0 {
 		return nil, Fail(InvalidRequest, nil)
 	}
-	from, _, err := c.admit(ctx, p, ListAction, source, nil)
+	from, _, err := c.admit(ctx, p, ListAction, source)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +66,7 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 		return nil, Fail(UnsupportedOperation, nil)
 	}
 	defer from.release()
-	to, _, err := c.admit(ctx, p, CreateAction, target, nil)
+	to, _, err := c.admit(ctx, p, CreateAction, target)
 	if err != nil {
 		return nil, err
 	}
@@ -100,14 +103,14 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 	defer func() { err = observedCause(ctx, err) }()
 
 	at := func(u *use, rel string) *location {
-		return &location{binding: u.binding, path: joinPath(u.path, rel)}
+		return u.location.descend(rel)
 	}
 	directories := []treeDirectory{{path: "/"}}
 	entries, pathBytes := 1, 1
 	for i := 0; i < len(directories); i++ {
 		directory := directories[i].path
 		var files []string
-		u, scope, readErr := c.readDirectory(ctx, p, joinPath(source, directory), at(from, directory), options, func(meta Metadata) error {
+		scope, readErr := c.readDirectory(ctx, p, at(from, directory), options, func(meta Metadata) error {
 			rel := joinPath(directory, "/"+meta.Name)
 			if ValidatePath(joinPath(source, rel)) != nil || ValidatePath(joinPath(target, rel)) != nil {
 				return Fail(UnrepresentableName, nil)
@@ -127,7 +130,7 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 		if readErr != nil {
 			return nil, fmt.Errorf("discover %s: %w", directory, readErr)
 		}
-		if closeErr := closeDirectory(u, scope); closeErr != nil {
+		if closeErr := scope.close(); closeErr != nil {
 			return nil, fmt.Errorf("close discovery %s: %w", directory, closeErr)
 		}
 		directories[i].files = files
@@ -137,7 +140,7 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 		rel := directories[i].path
 		targetAt := at(to, rel)
 		return work[TreeItemResult]{accesses: []access{{at: targetAt, write: true}}, run: func() (TreeItemResult, error) {
-			change, err := c.copyDirectory(ctx, p, joinPath(target, rel), targetAt, policy.MergeDirectories)
+			change, err := c.copyDirectory(ctx, p, targetAt, policy.MergeDirectories)
 			return TreeItemResult{RelativePath: rel, Change: change, Err: err}, err
 		}}
 	})
@@ -145,29 +148,29 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 		return results, err
 	}
 	results, err = executeDirectories(ctx, len(directories), limit, results,
-		func(i int) (*use, DirectoryScope, int, error) {
+		func(i int) (*directory, int, error) {
 			directory := directories[i]
 			if len(directory.files) == 0 {
-				return nil, nil, 0, nil
+				return nil, 0, nil
 			}
-			u, scope, openErr := c.readDirectory(ctx, p, joinPath(source, directory.path), at(from, directory.path), options, nil)
+			scope, openErr := c.readDirectory(ctx, p, at(from, directory.path), options, nil)
 			if openErr != nil {
 				openErr = fmt.Errorf("open source directory %s: %w", directory.path, openErr)
 			}
-			return u, scope, len(directory.files), openErr
+			return scope, len(directory.files), openErr
 		},
-		func(i int, scope DirectoryScope, item int) work[TreeItemResult] {
+		func(i int, scope *directory, item int) work[TreeItemResult] {
 			directory := directories[i]
 			rel := joinPath(directory.path, "/"+directory.files[item])
 			sourceAt, targetAt := at(from, rel), at(to, rel)
 			return work[TreeItemResult]{accesses: []access{{at: sourceAt}, {at: targetAt, write: true}}, run: func() (TreeItemResult, error) {
 				row := TreeItemResult{RelativePath: rel, Change: Change{Unchanged}}
-				opened, err := c.open(ctx, p, joinPath(source, rel), nil, sourceAt, scope)
+				opened, err := scope.openFile(ctx, p, directory.files[item])
 				if err != nil {
 					row.Err = fmt.Errorf("open source: %w", err)
 					return row, row.Err
 				}
-				row.Change, row.Err = c.copyContent(ctx, p, joinPath(target, rel), opened, policy.WriteOptions, targetAt)
+				row.Change, row.Err = c.copyContent(ctx, p, targetAt, opened, policy.WriteOptions)
 				return row, row.Err
 			}}
 		})
@@ -177,20 +180,20 @@ func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string,
 // copyDirectory accepts an existing directory only after an unchanged conflict
 // and a no-follow open. The scope confirms this name now, not the whole future
 // target tree. Confirmation uses CreateAction without consuming its iterator.
-func (c *Core) copyDirectory(ctx context.Context, p Principal, target string, expected *location, merge bool) (Change, error) {
-	change, err := c.mkdir(ctx, p, target, expected)
+func (c *Core) copyDirectory(ctx context.Context, p Principal, at *location, merge bool) (Change, error) {
+	change, err := c.mkdirAt(ctx, p, at)
 	if !merge || change.Effect != Unchanged || !directoryConflict(err) {
 		return change, err
 	}
-	u, _, err := c.beginChangeAt(ctx, p, CreateAction, target, expected)
+	u, err := c.beginChangeAt(ctx, p, CreateAction, at)
 	if err != nil {
 		return change, err
 	}
-	scope, err := openDirectoryAt(u, u.path)
+	scope, err := openDirectoryAt(u, false)
 	if err != nil {
 		return change, err
 	}
-	return change, observedCause(ctx, closeDirectory(u, scope))
+	return change, observedCause(ctx, scope.close())
 }
 
 // directoryConflict follows context wrappers but never hides another joined
@@ -216,18 +219,19 @@ func directoryConflict(err error) bool {
 // readDirectory returns an owned, fully enumerated scope. A second, bounded
 // scan at execution observes current membership without rescanning ancestors per
 // file. Additional entries are validated but do not extend the original plan.
-func (c *Core) readDirectory(ctx context.Context, p Principal, target string, expected *location, options TreeOptions, visit func(Metadata) error) (*use, DirectoryScope, error) {
-	u, scope, err := c.openDirectory(ctx, p, target, expected)
+func (c *Core) readDirectory(ctx context.Context, p Principal, at *location, options TreeOptions, visit func(Metadata) error) (*directory, error) {
+	scope, err := c.openDirectory(ctx, p, at)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if err = scanDirectory(u, scope, target, options, visit); err != nil {
-		return nil, nil, errors.Join(err, closeDirectory(u, scope))
+	if err = scope.scan(options, visit); err != nil {
+		return nil, errors.Join(err, scope.close())
 	}
-	return u, scope, nil
+	return scope, nil
 }
 
-func scanDirectory(u *use, scope DirectoryScope, target string, options TreeOptions, visit func(Metadata) error) error {
+func (d *directory) scan(options TreeOptions, visit func(Metadata) error) error {
+	u, scope, target := d.owner, d.native, d.at.visible()
 	seen := make(map[string]bool)
 	count, bytes := 0, 0
 	for {

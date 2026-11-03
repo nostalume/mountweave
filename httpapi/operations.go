@@ -58,6 +58,7 @@ type copyTreeInput struct {
 type removeTreeInput struct {
 	pathInput
 	treeInput
+	Scope core.RemovalScope `json:"scope,omitempty"`
 }
 
 // FileResult preserves endpoint effects and attempted-prefix receipts on errors.
@@ -67,6 +68,7 @@ type FileResult struct {
 	SourceEffect string     `json:"source_effect,omitempty"`
 	TargetEffect string     `json:"target_effect,omitempty"`
 	Items        []FileItem `json:"items,omitempty"`
+	CleanupError string     `json:"cleanup_error,omitempty"`
 }
 type FileItem struct {
 	Index        int    `json:"index"`
@@ -264,8 +266,11 @@ func FileTaskKinds(c *core.Core) map[string]TaskKind {
 			if i.MaxEntries <= 0 || i.MaxPlanBytes <= 0 || i.Concurrency < 0 {
 				return nil, nil, core.Fail(core.InvalidRequest, nil)
 			}
+			if i.Scope != "" && i.Scope != core.Discovered && i.Scope != core.Subtree {
+				return nil, nil, core.Fail(core.InvalidRequest, nil)
+			}
 			return []core.PathAccess{{Path: i.Path, Write: true}}, func(ctx context.Context, p core.Principal) (FileResult, error) {
-				r, err := c.RemoveTree(ctx, p, i.Path, i.options())
+				r, err := c.RemoveTree(ctx, p, i.Path, i.options(), core.DirectoryRemoveOptions{Scope: i.Scope})
 				return treeResult(r), err
 			}, nil
 		}),

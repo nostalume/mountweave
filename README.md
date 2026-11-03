@@ -52,6 +52,8 @@ creator. The application eventually calls Core.Close with its own wait context.
 | `local` | Prepared filesystem root and native file operations | `go doc -all ./local` |
 | `control` | Desired mount definitions and explicit activation/restore | `go doc -all ./control` |
 | `task` | Arbitrary bounded function execution | `go doc -all ./task` |
+| `input` | Durable sequential byte receipt, sealed sources and reference lifetime | `go doc -all ./input` |
+| `transfer` | Durable upload intent, source retention and native checkpoint handoff | `go doc -all ./transfer` |
 | `httpapi` | Optional HTTP delivery with injected identity and policies | [OpenAPI](api/openapi.json), `go doc -all ./httpapi` |
 | Optional Drivers | Native clients, credentials and storage representation | [S3](drivers/s3/README.md), [Alipan](drivers/alipan/README.md), [Pool](drivers/pool/README.md) |
 
@@ -66,8 +68,14 @@ Driver capabilities determine which mutations are available. Cross-mount Move
 is currently unsupported. File effects remain observable alongside errors and
 cancellation; a tree operation is not a transaction.
 
-Local provides file and directory mutations. S3 currently provides reads and
-known-length conditional creation; Alipan provides reads and rotating credentials.
+Local provides file and directory mutations. S3 provides reads, directory markers,
+file deletion and optional bounded multipart creation/complete replacement. Alipan
+provides reads, rotating credentials, directory creation, optional known-length
+uploads, file deletion and qualified native rename/move. Native capability limits
+and host-selected transfer budgets are described in the Driver references.
+RemoveTree defaults to discovered names. Explicit subtree scope uses separate
+subtree authority and optional native recursive deletion; it may affect new
+descendants and returns the receipts the implementation can actually confirm.
 The optional Pool Driver provides an erasure-coded logical filesystem, member
 management, repair and durable maintenance. These are independently versioned
 modules; the core does not import them or their SDK/database dependencies.
@@ -76,6 +84,11 @@ Remote adapters have closed protocol tests, not a universal live-service
 compatibility claim. The host owns credential persistence and chooses budgets.
 Cancellation requests a stop; it does not forcibly interrupt arbitrary native I/O.
 There is no product executable, frontend or legacy configuration converter.
+An optional input Store supports client reconnect/restart continuation. Sealed
+inputs feed Core.Write directly or through HTTP fs.write tasks; ordinary streamed
+writes remain available. The optional transfer consumer resumes S3 native multipart
+uploads through the same Core.Write, with host-provided protected persistence and
+stable configuration binding. It does not make queued closures durable.
 
 ## Development and availability
 
@@ -93,8 +106,10 @@ go get github.com/nostalume/mountweave/drivers/alipan@v0.1.0
 go get github.com/nostalume/mountweave/drivers/pool@v0.1.0
 ```
 
-The Driver modules depend on core v0.1.0. Relative replacements apply only to
-checkout development; consuming applications do not need local replacements.
+The published v0.1.0 Driver modules depend on core v0.1.0. Relative replacements
+apply only to checkout development. Working-tree transfer additions require the
+matching core revision and have not been released; consuming released modules
+does not require local replacements.
 
 See [Contributing](CONTRIBUTING.md) for commands covering all four modules.
 The API is under development; no v1 compatibility promise is made yet.

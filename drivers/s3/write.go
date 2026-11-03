@@ -12,8 +12,12 @@ import (
 	core "github.com/nostalume/mountweave"
 )
 
-// Create supports one conditional PUT with an exact, known input length.
+// Create conditionally creates a file. Configured buffering enables multipart;
+// otherwise it uses one PUT with an exact, known input length.
 func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
+	if d.buffer != nil {
+		return d.bufferedWrite(ctx, p, input, length, false)
+	}
 	unchanged := core.Change{Effect: core.Unchanged}
 	if input == nil || (length != nil && *length < 0) {
 		return unchanged, core.Fail(core.InvalidRequest, nil)

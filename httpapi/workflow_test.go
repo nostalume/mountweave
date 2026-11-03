@@ -155,7 +155,17 @@ func TestSharedFileDeliveryAndPublication(t *testing.T) {
 	if result := untilTask(t, h, id); result["error"] != nil || len(result["result"].(map[string]any)["items"].([]any)) != 2 {
 		t.Fatal(result)
 	}
-	wire(t, jsonCall(t, h, "POST", "/api/v1/fs/operations", "write-token", operation("fs.remove_tree", map[string]any{"path": "/files/copied", "max_entries": 10, "max_plan_bytes": 100})), 200)
+	removal := operation("fs.remove_tree", map[string]any{"path": "/files/copied", "max_entries": 10, "max_plan_bytes": 100, "scope": "subtree"})
+	contractExample(t, "FileOperationRequest", removal)
+	wire(t, jsonCall(t, h, "POST", "/api/v1/fs/operations", "write-token", removal), 200)
+	removal["input"].(map[string]any)["path"] = "/files/tree"
+	contractExample(t, "TaskRequest", removal)
+	id = wire(t, jsonCall(t, h, "POST", "/api/v1/tasks", "write-token", removal), 202)["id"].(string)
+	if result := untilTask(t, h, id); result["error"] != nil {
+		t.Fatal(result)
+	}
+	removal["input"].(map[string]any)["scope"] = "auto"
+	wire(t, jsonCall(t, h, "POST", "/api/v1/tasks", "write-token", removal), 400)
 	id = wire(t, jsonCall(t, h, "POST", "/api/v1/tasks", "write-token", operation("host.saved-copy", map[string]any{"source": "/files/data.bin", "target": "/files/saved"})), 202)["id"].(string)
 	result := untilTask(t, h, id)
 	if result["error"] != nil || result["completion_error"] != "internal_error" || result["result"].(map[string]any)["effect"] != "applied" || executions.Load() != 1 {

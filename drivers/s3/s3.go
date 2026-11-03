@@ -1,4 +1,4 @@
-// Package s3 adapts a prepared AWS S3 client to core reads and new-file writes.
+// Package s3 adapts a prepared AWS S3 client to core reads and native mutations.
 package s3
 
 import (
@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
@@ -17,6 +19,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	core "github.com/nostalume/mountweave"
+	"github.com/nostalume/mountweave/internal/upload"
 )
 
 // Driver borrows its SDK client. The host owns transports and credential providers.
@@ -24,16 +27,67 @@ type Driver struct {
 	client         *sdk.Client
 	bucket, prefix string
 	closed         atomic.Bool
+	opts           Options
+	buffer         *upload.Budget
+	mu             sync.Mutex
+	pending        map[string]PendingUpload
 }
 
-func New(client *sdk.Client, bucket, prefix string) (*Driver, error) {
+// Options enables bounded buffered/multipart writes when PartSize and
+// MaxBufferedBytes are set together. PartConcurrency and PartAttempts default
+// to one. CleanupTimeout zero adds no deadline beyond the borrowed client.
+type Options struct {
+	PartSize, MaxBufferedBytes    int64
+	PartConcurrency, PartAttempts int
+	CleanupTimeout                time.Duration
+	// ResumeScope is a stable host identity for the native account/service. It
+	// contains no credentials and must change when that identity changes.
+	ResumeScope string
+}
+
+func New(client *sdk.Client, bucket, prefix string, options ...Options) (*Driver, error) {
 	if client == nil || bucket == "" || strings.ContainsAny(bucket, "/\\") ||
 		(prefix != "" && !strings.HasSuffix(prefix, "/")) {
 		return nil, errors.New("a prepared client, bucket, and empty or slash-terminated prefix are required")
 	}
-	return &Driver{client: client, bucket: bucket, prefix: prefix}, nil
+	if len(options) > 1 {
+		return nil, core.Fail(core.InvalidRequest, nil)
+	}
+	var opts Options
+	if len(options) == 1 {
+		opts = options[0]
+	}
+	if opts.PartConcurrency < 0 || opts.PartAttempts < 0 || opts.CleanupTimeout < 0 ||
+		(opts.PartSize == 0) != (opts.MaxBufferedBytes == 0) || opts.PartSize < 0 || opts.MaxBufferedBytes < 0 ||
+		(opts.PartSize != 0 && (opts.PartSize < 5<<20 || opts.PartSize > 5<<30)) {
+		return nil, core.Fail(core.InvalidRequest, nil)
+	}
+	if opts.PartAttempts == 0 {
+		opts.PartAttempts = 1
+	}
+	d := &Driver{client: client, bucket: bucket, prefix: prefix, opts: opts, pending: make(map[string]PendingUpload)}
+	if opts.PartSize != 0 {
+		var err error
+		d.buffer, err = upload.New(opts.PartSize, opts.MaxBufferedBytes, opts.PartConcurrency)
+		if err != nil {
+			return nil, core.Fail(core.InvalidRequest, err)
+		}
+	}
+	return d, nil
 }
-func (d *Driver) Close() error { d.closed.Store(true); return nil }
+func (d *Driver) Close() error {
+	d.closed.Store(true)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.pending) != 0 {
+		err := errors.New("private multipart uploads still require cleanup")
+		for _, p := range d.pending {
+			err = errors.Join(err, p.cause)
+		}
+		return err
+	}
+	return nil
+}
 func (d *Driver) admit(ctx context.Context, p string) error {
 	if err := ctx.Err(); err != nil {
 		return err

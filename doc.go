@@ -339,8 +339,9 @@
 //
 // # Directory removal
 //
-// Core.RemoveTree(ctx, principal, target, TreeOptions) removes one real directory
-// using a finite discovery plan. Core.Remove remains nonrecursive. Mount, alias
+// Core.RemoveTree(ctx, principal, target, TreeOptions, DirectoryRemoveOptions...)
+// defaults to Discovered: remove one real directory using a finite discovery plan.
+// Core.Remove remains nonrecursive. Mount, alias
 // and virtual roots are refused. The positive entry/path budgets have the same
 // meaning as CopyTree. Discovery, name validation, known capability checks,
 // authorization preflight and enumeration cleanup finish before any deletion.
@@ -378,7 +379,26 @@
 // on Linux and parent-relative DELETE handles with POSIX disposition on Windows.
 // A successful Windows delete-handle close confirms namespace removal; pending
 // deletion alone is not reported as Applied. Unsupported native modes have no
-// recursive or delayed-success fallback. S3 and Alipan read scopes remain read-only; Pool supplies ChildRemover.
+// recursive or delayed-success fallback. S3 and Alipan read scopes remain read-only;
+// their default Discovered removal is unsupported. Pool supplies ChildRemover.
+//
+// Explicit DirectoryRemoveOptions{Scope: Subtree} requires RemoveTreeAction on
+// the target, including its physical alias target. That grant authorizes subtree
+// traversal and deletion, including newly added descendants; an entry's ordinary
+// RemoveAction alone is insufficient. The optional Driver SubtreeRemover supplies
+// native deletion with one root receipt. Without it, Core reuses the finite planner
+// and executor, renewing the root subtree grant for client steps instead of
+// requiring child ListAction/RemoveAction. Native execution need not enumerate
+// descendants or return invented per-child results. TreeOptions bounds client
+// discovery/planning, not total native affected entries or provider concurrency.
+// S3 uses finite key discovery and batches of at most 1,000, removes its marker
+// after acknowledged child batches, then observes prefix absence. New remaining
+// keys return DirectoryNotEmpty with retained effects. Alipan captures a directory
+// ID and waits for synchronous confirmation or native deletion-task success.
+// Task acceptance alone is not Applied. Canceling a native wait may leave remote
+// deletion running and reports Unknown; it does not undo deletion. No strategy
+// automatically broadens scope, continually chases additions or prevents later
+// recreation. Frontend confirmation belongs to the caller.
 //
 // RemoveTree returns []TreeItemResult in started execution order, with "/" for the
 // root. Every item keeps its Change and Err; cancellation, preparation and cleanup
@@ -387,4 +407,11 @@
 // storage reclamation or protection against later recreation. Failed cleanup stays
 // owned by its original scope/Driver. There are no retries, durable jobs or
 // cross-mount Move guarantees.
+//
+// Captured access routes preserve the alias used by the caller and the installed
+// generation's rooted address together. Read/write composition and owned directory
+// scopes retain that same location; a retired route never resolves to a replacement.
+// Each child operation renews its current grant, including the primary path grant
+// for aliases. Returned entry paths project from the admitted access route. These
+// captured addresses do not identify immutable file content or persistent objects.
 package core

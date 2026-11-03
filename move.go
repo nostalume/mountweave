@@ -28,51 +28,63 @@ type MoveResult struct {
 // errors. Currently only
 // native relocation within one mount is supported; copying followed by removal
 // through an unbound source path is never used.
-func (c *Core) Move(ctx context.Context, p Principal, source, target string) (MoveResult, error) {
-	return c.move(ctx, p, source, target, nil, nil)
-}
-
-func (c *Core) move(ctx context.Context, p Principal, source, target string, expectedSource, expectedTarget *location) (result MoveResult, err error) {
+func (c *Core) Move(ctx context.Context, p Principal, source, target string) (result MoveResult, err error) {
 	result = MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}
-	defer func() {
-		if cause := ctx.Err(); cause != nil && !errors.Is(err, cause) {
-			err = errors.Join(err, cause)
-		}
-	}()
+	defer func() { err = observedCause(ctx, err) }()
 	if c == nil {
-		return result, Fail(InvalidRequest, errors.New("core is required"))
+		return result, Fail(InvalidRequest, nil)
 	}
 	if err = ValidatePath(source); err != nil {
-		return result, fmt.Errorf("source path: %w", err)
+		return result, err
 	}
 	if err = ValidatePath(target); err != nil {
-		return result, fmt.Errorf("target path: %w", err)
+		return result, err
 	}
 	if source == target {
-		return result, Fail(InvalidRequest, errors.New("source and target must differ"))
+		return result, Fail(InvalidRequest, nil)
 	}
-	from, oldPath, err := c.beginChangeAt(ctx, p, RemoveAction, source, expectedSource)
+	from, err := c.beginChange(ctx, p, RemoveAction, source)
 	if err != nil {
 		return result, fmt.Errorf("source: %w", err)
 	}
-	defer from.release()
-	to, newPath, err := c.beginChangeAt(ctx, p, CreateAction, target, expectedTarget)
+	to, err := c.beginChange(ctx, p, CreateAction, target)
 	if err != nil {
+		from.release()
 		return result, fmt.Errorf("target: %w", err)
 	}
+	return c.relocate(from, to)
+}
+func (c *Core) moveAt(ctx context.Context, p Principal, source, target *location) (result MoveResult, err error) {
+	result = MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}
+	defer func() { err = observedCause(ctx, err) }()
+	from, err := c.beginChangeAt(ctx, p, RemoveAction, source)
+	if err != nil {
+		return result, err
+	}
+	to, err := c.beginChangeAt(ctx, p, CreateAction, target)
+	if err != nil {
+		from.release()
+		return result, err
+	}
+	return c.relocate(from, to)
+}
+func (c *Core) relocate(from, to *use) (result MoveResult, err error) {
+	defer from.release()
 	defer to.release()
+	result = MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}
+	oldPath, newPath := from.path, to.path
 	if from.mount == to.mount && Within(newPath, oldPath) {
-		return result, Fail(InvalidRequest, nil)
+		return MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}, Fail(InvalidRequest, nil)
 	}
 	if from.mount != to.mount {
-		return result, Fail(UnsupportedOperation, nil)
+		return MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}, Fail(UnsupportedOperation, nil)
 	}
 	mover, ok := from.mount.driver.(Relocator)
 	if !ok {
-		return result, Fail(UnsupportedOperation, nil)
+		return MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}, Fail(UnsupportedOperation, nil)
 	}
 	if err = from.ctx.Err(); err != nil {
-		return result, err
+		return MoveResult{Source: Change{Unchanged}, Target: Change{Unchanged}}, err
 	}
 	change, err := mover.Relocate(from.ctx, oldPath, newPath)
 	if change.Effect == Incomplete {

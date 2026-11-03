@@ -4,7 +4,7 @@
   "info": {
     "title": "Mountweave API",
     "version": "0.3.0",
-    "description": "Composable file, mount-control and generic task HTTP delivery. Synchronous file operations and file tasks use the same typed request and Core semantics. The host injects identity policy, driver factories, durable storage and optional task kinds. Advertised operations are not per-mount capability or authorization grants."
+    "description": "Composable file, mount-control and generic task HTTP delivery. Synchronous file operations and file tasks use the same typed request and Core semantics. The host injects identity policy, driver factories, durable storage and optional task kinds. Advertised operations are not per-mount capability or authorization grants. Optional durable inputs resume client byte receipt; sealed inputs feed the same Core.Write semantics synchronously or through process-local tasks."
   },
   "servers": [
     {
@@ -29,6 +29,10 @@
     {
       "name": "tasks",
       "description": "Optional bounded process-local task delivery with host-defined wire adapters and access policy."
+    },
+    {
+      "name": "inputs",
+      "description": "Optional durable input bytes and immutable source versions. Ownership policy is independent of file and task authorization."
     }
   ],
   "paths": {
@@ -4887,6 +4891,369 @@
           }
         ]
       }
+    },
+    "/api/v1/inputs": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "getInputs",
+        "summary": "Read an authorized input or list authorized input summaries",
+        "responses": {
+          "200": {
+            "description": "Read an authorized input or list authorized input summaries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InputRecord"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InputList"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "description": "Optional input component is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InputID"
+            }
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "createInput",
+        "summary": "Create an empty input owned by the verified principal",
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "description": "Optional input component is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "201": {
+            "description": "Create an empty input owned by the verified principal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputRecord"
+                }
+              }
+            }
+          }
+        },
+        "description": "No request body. The host injects a private input Store and Input authorizer. Create is not implicitly retried; unacknowledged creations can be found in the authorized list."
+      },
+      "delete": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "releaseInput",
+        "summary": "Release input admission and reclaim after existing references finish",
+        "responses": {
+          "200": {
+            "description": "Release input admission and reclaim after existing references finish",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "description": "Optional input component is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InputID"
+            }
+          }
+        ],
+        "description": "No request body. A successful retired record does not promise physical reclamation while queued work or readers hold references. After final cleanup, status returns 404."
+      }
+    },
+    "/api/v1/inputs/content": {
+      "put": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "appendInput",
+        "summary": "Append one length-delimited block or verify an exact retry",
+        "responses": {
+          "200": {
+            "description": "Append one length-delimited block or verify an exact retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "description": "Optional input component is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InputID"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Expected confirmed payload offset; an exact committed block retry verifies its digest."
+          },
+          {
+            "name": "Content-Length",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "description": "Exact positive payload length, bounded by input_append_max_bytes. Chunked/unknown length is refused."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "description": "Only identity content encoding. The Store synchronizes data and checksum receipts before acknowledging offset. Incomplete or invalid input rolls back the unconfirmed tail. Exact offset/length/digest retries do not append twice; rechunked overlaps and gaps conflict. Same-input concurrent mutations return input_busy before consuming input."
+      }
+    },
+    "/api/v1/inputs/seal": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "sealInput",
+        "summary": "Seal an immutable source at the expected offset",
+        "responses": {
+          "200": {
+            "description": "Seal an immutable source at the expected offset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "description": "Optional input component is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InputID"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Expected confirmed payload offset; an exact committed block retry verifies its digest."
+          }
+        ],
+        "description": "No request body. Sealing is idempotent for the same confirmed offset and version. No complete-file copy is made; sealed data is read from verified journal extents."
+      }
     }
   },
   "components": {
@@ -5487,7 +5854,11 @@
               "path_max_utf8_bytes",
               "path_max_segments",
               "task_records_max",
-              "json_request_max_bytes"
+              "json_request_max_bytes",
+              "input_journal_max_bytes",
+              "input_append_max_bytes",
+              "input_records_max",
+              "input_blocks_max"
             ],
             "properties": {
               "page_default": {
@@ -5513,6 +5884,26 @@
               "json_request_max_bytes": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "input_journal_max_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Host-selected input limit; zero when the input component is absent."
+              },
+              "input_append_max_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Host-selected input limit; zero when the input component is absent."
+              },
+              "input_records_max": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Host-selected input limit; zero when the input component is absent."
+              },
+              "input_blocks_max": {
+                "description": "Host-selected retained/reserved block-index limit; zero when input storage is absent.",
+                "minimum": 0,
+                "type": "integer"
               }
             },
             "description": "Host-selected task record bound and JSON input limit, with zero meaning component absent/no extra JSON limit; existing Core path/page limits remain unchanged. Raw file content uses Core/Driver and host transport budgets."
@@ -5526,11 +5917,15 @@
               },
               "tasks": {
                 "type": "boolean"
+              },
+              "inputs": {
+                "type": "boolean"
               }
             },
             "required": [
               "control",
-              "tasks"
+              "tasks",
+              "inputs"
             ]
           },
           "task_kinds": {
@@ -5559,11 +5954,16 @@
               "path_max_utf8_bytes": 4096,
               "path_max_segments": 64,
               "task_records_max": 0,
-              "json_request_max_bytes": 0
+              "json_request_max_bytes": 0,
+              "input_journal_max_bytes": 0,
+              "input_append_max_bytes": 0,
+              "input_records_max": 0,
+              "input_blocks_max": 0
             },
             "components": {
               "control": false,
-              "tasks": false
+              "tasks": false,
+              "inputs": false
             },
             "task_kinds": []
           }
@@ -5785,7 +6185,10 @@
               "already_exists",
               "directory_not_empty",
               "revision_conflict",
-              "unavailable"
+              "unavailable",
+              "input_conflict",
+              "input_busy",
+              "input_state"
             ]
           },
           "request_id": {
@@ -6063,11 +6466,23 @@
           },
           "max_entries": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Bounds client discovery/planning, not the number of descendants affected by native subtree deletion."
           },
           "max_plan_bytes": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Bounds stored client plan path/key bytes; native subtree deletion need not enumerate descendants."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "",
+              "discovered",
+              "subtree"
+            ],
+            "default": "discovered",
+            "description": "Empty/omitted selects discovered and preserves the finite-name plan. Subtree requires remove_tree authority for descendant deletion; new descendants may be affected and native execution may return only a root receipt."
           }
         },
         "required": [
@@ -6221,6 +6636,22 @@
               "kind",
               "input"
             ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "input"
+            ],
+            "properties": {
+              "kind": {
+                "const": "fs.write"
+              },
+              "input": {
+                "$ref": "#/components/schemas/WriteInput"
+              }
+            }
           }
         ],
         "description": "One typed file request, used unchanged for synchronous execution or queued delivery. Input syntax and all selected real bindings are admitted before execution. Execution retains Core stop, attempted-prefix, cancellation, link and partial-effect contracts. Copy defaults to new-file conflict; tree merge and per-file replacement are independent. Move is native same-mount relocation only. RemoveTree uses execution-time name intent. Structured mutations reject conditional/range headers; no automatic retries or rollback."
@@ -6247,7 +6678,8 @@
                     "fs.move_batch",
                     "fs.remove_batch",
                     "fs.copy_tree",
-                    "fs.remove_tree"
+                    "fs.remove_tree",
+                    "fs.write"
                   ]
                 }
               },
@@ -6307,6 +6739,10 @@
             "items": {
               "$ref": "#/components/schemas/FileItem"
             }
+          },
+          "cleanup_error": {
+            "type": "string",
+            "description": "Cleanup failure retains the known file effect."
           }
         },
         "required": [],
@@ -6547,6 +6983,77 @@
           "result"
         ],
         "description": "A successful GET observes a task, even when the task failed. Finished is not a success or absence-of-effects claim. Execution, cleanup and completion-save errors are separate stable codes; task kind owns safe progress/result projection. Published values are immutable."
+      },
+      "InputID": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{32}$"
+      },
+      "InputRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "owner",
+          "offset",
+          "sealed",
+          "released",
+          "blocked"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/InputID"
+          },
+          "owner": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "offset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sealed": {
+            "type": "boolean"
+          },
+          "released": {
+            "type": "boolean"
+          },
+          "blocked": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Immutable journal/content version identity, not a whole-file content hash."
+          }
+        },
+        "description": "Offset is a confirmed contiguous payload prefix, not target publication. Release blocks new references; accepted work and opened bodies retain bytes until cleanup. Blocked inputs need storage reconciliation."
+      },
+      "InputList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/InputRecord"
+        }
+      },
+      "WriteInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "input_id"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/LogicalPath"
+          },
+          "input_id": {
+            "$ref": "#/components/schemas/InputID"
+          },
+          "replace": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "description": "Pins a sealed input at admission, opens it at execution, and invokes Core.Write with the same file authorization, binding and effects as streamed PUT. Queue lifetime and input lifetime remain separate."
       }
     }
   },

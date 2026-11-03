@@ -30,11 +30,14 @@ func listing(r *http.Request, items, marker string, truncated bool) *http.Respon
 	return response(r, 200, fmt.Sprintf("<ListBucketResult><IsTruncated>%t</IsTruncated><EncodingType>url</EncodingType>%s<NextContinuationToken>%s</NextContinuationToken></ListBucketResult>", truncated, items, marker))
 }
 func prepared(t *testing.T, rt transport, options ...func(*sdk.Options)) (*driver.Driver, *core.Core) {
+	return preparedDriver(t, rt, nil, options...)
+}
+func preparedDriver(t *testing.T, rt transport, storageOptions []driver.Options, options ...func(*sdk.Options)) (*driver.Driver, *core.Core) {
 	t.Helper()
 	client := sdk.New(sdk.Options{Region: "us-east-1", BaseEndpoint: aws.String("https://s3.example.test"), UsePathStyle: true, RetryMaxAttempts: 1, Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
 		return aws.Credentials{AccessKeyID: "test-key", SecretAccessKey: "test-secret"}, nil
 	}), HTTPClient: &http.Client{Transport: rt}}, options...)
-	d, err := driver.New(client, "bucket", "vault/")
+	d, err := driver.New(client, "bucket", "vault/", storageOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}

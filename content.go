@@ -4,19 +4,25 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strings"
 	"sync"
 	"time"
 )
 
 func (c *Core) Open(ctx context.Context, p Principal, target string, wanted *Range) (Content, error) {
-	return c.open(ctx, p, target, wanted, nil, nil)
-}
-func (c *Core) open(ctx context.Context, p Principal, target string, wanted *Range, expected *location, scope DirectoryScope) (Content, error) {
 	if wanted != nil && !wanted.Valid() {
 		return Content{}, Fail(InvalidRange, nil)
 	}
-	u, _, err := c.admit(ctx, p, ReadAction, target, expected)
+	u, _, err := c.admit(ctx, p, ReadAction, target)
+	return c.openUse(u, wanted, err, nil)
+}
+func (c *Core) openAt(ctx context.Context, p Principal, at *location, wanted *Range) (Content, error) {
+	u, err := c.admitAt(ctx, p, ReadAction, at)
+	return c.openUse(u, wanted, err, nil)
+}
+
+// openUse owns timeout, adoption and cleanup for either a rooted open or a child
+// open from an already bound parent. Only the parent constructs the latter.
+func (c *Core) openUse(u *use, wanted *Range, err error, openChild func(context.Context) (Opened, error)) (Content, error) {
 	if err != nil {
 		return Content{}, err
 	}
@@ -39,10 +45,10 @@ func (c *Core) open(ctx context.Context, p Principal, target string, wanted *Ran
 	rel := u.path
 	var opened Opened
 	var openErr error
-	if scope == nil {
+	if openChild == nil {
 		opened, openErr = u.mount.driver.Open(u.ctx, rel, wanted)
 	} else {
-		opened, openErr = scope.OpenFile(u.ctx, rel[strings.LastIndexByte(rel, '/')+1:])
+		opened, openErr = openChild(u.ctx)
 	}
 	phase.Lock()
 	if timer != nil {
@@ -57,15 +63,15 @@ func (c *Core) open(ctx context.Context, p Principal, target string, wanted *Ran
 	if expired {
 		openErr = errors.Join(context.DeadlineExceeded, openErr)
 	}
-	return c.adoptOpened(u, target, rel, wanted, opened, openErr)
+	return c.adoptOpened(u, wanted, opened, openErr)
 }
 
-func (c *Core) adoptOpened(u *use, target, rel string, wanted *Range, opened Opened, openErr error) (Content, error) {
+func (c *Core) adoptOpened(u *use, wanted *Range, opened Opened, openErr error) (Content, error) {
 	if openErr == nil {
 		openErr = u.ctx.Err()
 	}
 	if openErr == nil {
-		openErr = validateOpened(opened, rel, wanted)
+		openErr = validateOpened(opened, u.path, wanted)
 	}
 	if openErr != nil {
 		if opened.Body != nil {
@@ -77,7 +83,7 @@ func (c *Core) adoptOpened(u *use, target, rel string, wanted *Range, opened Ope
 		u.release()
 		return Content{}, openErr
 	}
-	entry, err := project(target, opened.Metadata)
+	entry, err := project(u.visible(), opened.Metadata)
 	if err != nil {
 		closeErr := opened.Body.Close()
 		if closeErr == nil {

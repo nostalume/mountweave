@@ -20,18 +20,16 @@ type Mount struct {
 	closeErr, cleanupErr error
 }
 type use struct {
-	mount          *Mount
-	binding        *binding
-	path           string
+	*location
 	ctx            context.Context
 	cancel         context.CancelFunc
 	once           sync.Once
 	failedResource io.Closer
 }
 
-func (m *Mount) borrowLocked(parent context.Context) *use {
+func (m *Mount) borrowLocked(parent context.Context, at *location) *use {
 	ctx, cancel := context.WithCancel(parent)
-	u := &use{mount: m, ctx: ctx, cancel: cancel}
+	u := &use{location: at, ctx: ctx, cancel: cancel}
 	m.uses[u] = struct{}{}
 	return u
 }

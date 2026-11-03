@@ -27,6 +27,9 @@
 // | POST /api/v1/mounts/stop?id=..., POST /api/v1/mounts/restore | Explicit stop/restore |
 // | GET/POST /api/v1/tasks | Authorized retained summaries / task admission |
 // | GET /api/v1/tasks/task?id=..., POST /api/v1/tasks/cancel?id=... | Observe / request cancellation |
+// | GET/POST/DELETE /api/v1/inputs | Optional durable input listing/status, creation and release |
+// | PUT /api/v1/inputs/content?id=...&offset=... | Length-delimited append or exact block retry |
+// | POST /api/v1/inputs/seal?id=...&offset=... | Seal one immutable input version |
 //
 // Synchronous operations and queued file tasks accept the same application/json
 // envelope. For example, send this body to either /fs/operations or /tasks under
@@ -52,6 +55,24 @@
 // prepared function through the ordinary Core API, preserving stop/prefix, links,
 // explicit replacement/merge and partial-effect contracts. A stale queued binding
 // fails instead of targeting a replacement. Move retains its same-mount restriction.
+// fs.remove_tree accepts scope: discovered (default) or subtree. Empty also selects
+// discovered. Subtree requires Core RemoveTreeAction, may affect new descendants
+// and may return only a root receipt for native execution. Planning budgets limit
+// client work rather than native affected entries. Synchronous and queued requests
+// carry the same scope; presentation confirmation remains caller-owned.
+//
+// Optional Options.Inputs borrows an independent input.Store and requires
+// AuthorizeInput for create/list/read/append/seal/release/use. A permitted input
+// does not grant target file access. Its host-selected limits appear in /info.
+// fs.write accepts {path, input_id, replace?} through the same operation/task
+// envelope. Prepare pins a sealed source and captures the target binding; Run
+// reauthorizes source use, opens its body under execution lifetime and calls
+// Core.Write. Cleanup releases the reference on synchronous completion, queue
+// rejection, cancellation-before-run and ordinary task completion. Release may
+// precede accepted execution without invalidating its source. File effects and
+// cleanup errors remain separate. Handler never closes the borrowed input Store.
+// Stop HTTP admission, close this adapter/queue, then the input Store and Core.
+// Inputs survive process restart; the process-local task queue does not.
 // Synchronous requests call Core directly under request lifetime; their operations
 // do not participate in queue conflict ordering. A host needing shared scheduling
 // can submit FileTaskKinds work and wait, explicitly linking request cancellation

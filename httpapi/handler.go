@@ -76,6 +76,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		allow = "GET, PUT"
 	case "/api/v1/mounts/activation", "/api/v1/tasks":
 		allow = "GET, POST"
+	case "/api/v1/inputs":
+		allow = "GET, POST, DELETE"
+	case "/api/v1/inputs/content":
+		allow = "PUT"
+	case "/api/v1/inputs/seal":
+		allow = "POST"
 	}
 	permitted := slices.Contains(strings.Split(allow, ", "), r.Method)
 	mutation := permitted && strings.HasPrefix(r.URL.Path, "/api/v1/fs/") && r.Method != http.MethodGet && r.Method != http.MethodHead
@@ -119,6 +125,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/v1/tasks") {
 		h.taskRoute(w, r, id, principal)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/inputs") {
+		h.inputRoute(w, r, id, principal)
 		return
 	}
 	query, err := url.ParseQuery(r.URL.RawQuery)
@@ -178,12 +188,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeConditional(w, r, id, status)
 			return
 		}
+		var inputBytes, inputAppend int64
+		var inputCount, inputBlocks int
+		if h.options.Inputs != nil {
+			limits := h.options.Inputs.Limits()
+			inputBytes, inputAppend, inputCount, inputBlocks = limits.MaxBytes, limits.MaxAppendBytes, limits.MaxInputs, limits.MaxBlocks
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"api_major": 1,
 			"operations":                []string{"stat", "list", "read", "mkdir", "create", "write", "remove", "copy", "move", "copy_batch", "move_batch", "remove_batch", "copy_tree", "remove_tree"},
 			"file_operations_read_only": false,
-			"components":                map[string]bool{"control": h.options.Control != nil, "tasks": h.options.Queue != nil},
+			"components":                map[string]bool{"control": h.options.Control != nil, "tasks": h.options.Queue != nil, "inputs": h.options.Inputs != nil},
 			"task_kinds":                h.taskNames(),
-			"limits":                    map[string]any{"page_default": core.DefaultPage, "page_max": core.MaxPage, "path_max_utf8_bytes": core.MaxPathBytes, "path_max_segments": core.MaxPathSegments, "task_records_max": h.options.MaxTasks, "json_request_max_bytes": h.options.MaxJSONBytes}})
+			"limits":                    map[string]any{"page_default": core.DefaultPage, "page_max": core.MaxPage, "path_max_utf8_bytes": core.MaxPathBytes, "path_max_segments": core.MaxPathSegments, "task_records_max": h.options.MaxTasks, "json_request_max_bytes": h.options.MaxJSONBytes, "input_journal_max_bytes": inputBytes, "input_append_max_bytes": inputAppend, "input_records_max": inputCount, "input_blocks_max": inputBlocks}})
 		return
 	}
 	switch r.URL.Path {

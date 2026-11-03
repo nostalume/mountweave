@@ -1,4 +1,4 @@
-// Package alipan implements rooted reads using Aliyun Drive Open's public API.
+// Package alipan implements rooted file access using Aliyun Drive Open's public API.
 package alipan
 
 import (
@@ -18,6 +18,7 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/alipan/credential"
+	"github.com/nostalume/mountweave/internal/upload"
 )
 
 const Endpoint = "https://openapi.alipan.com"
@@ -31,6 +32,11 @@ type Options struct {
 	// Zero leaves these optional host policies unset.
 	MaxResolvePages  int
 	MaxResponseBytes int64
+	// Both values are required to enable known-length new-file uploads.
+	PartSize, MaxBufferedBytes int64
+	PartConcurrency            int
+	// Zero selects a one-second interval between running deletion-task queries.
+	DeletionPollInterval time.Duration
 }
 type Driver struct {
 	opts         Options
@@ -39,6 +45,7 @@ type Driver struct {
 	mu           sync.Mutex
 	failedBodies []io.Closer
 	closeErr     error
+	buffer       *upload.Budget
 }
 
 func New(opts Options) (*Driver, error) {
@@ -51,7 +58,18 @@ func New(opts Options) (*Driver, error) {
 	if err := validEndpoint(opts.Endpoint); err != nil {
 		return nil, err
 	}
-	return &Driver{opts: opts, client: isolatedClient(opts.Client)}, nil
+	if opts.PartSize < 0 || opts.MaxBufferedBytes < 0 || opts.PartConcurrency < 0 || opts.DeletionPollInterval < 0 || (opts.PartSize == 0) != (opts.MaxBufferedBytes == 0) || opts.PartSize > 5<<30 {
+		return nil, core.Fail(core.InvalidRequest, nil)
+	}
+	d := &Driver{opts: opts, client: isolatedClient(opts.Client)}
+	if opts.PartSize != 0 {
+		var err error
+		d.buffer, err = upload.New(opts.PartSize, opts.MaxBufferedBytes, opts.PartConcurrency)
+		if err != nil {
+			return nil, core.Fail(core.InvalidRequest, err)
+		}
+	}
+	return d, nil
 }
 func isolatedClient(client *http.Client) *http.Client {
 	copy := *client
@@ -165,36 +183,40 @@ func (d *Driver) resolve(ctx context.Context, p string) (nativeFile, error) {
 		if current.Type != "folder" {
 			return nativeFile{}, core.Fail(core.NotDirectory, nil)
 		}
-		var found *nativeFile
-		marker := ""
-		for pages := 0; ; pages++ {
-			if d.opts.MaxResolvePages > 0 && pages >= d.opts.MaxResolvePages {
-				return nativeFile{}, core.Fail(core.ResolutionBudgetExceeded, nil)
-			}
-			batch, next, err := d.page(ctx, current.ID, marker, 100)
-			if err != nil {
-				return nativeFile{}, err
-			}
-			for _, f := range batch {
-				if f.Name == part {
-					if found != nil {
-						return nativeFile{}, core.Fail(core.PathAmbiguous, nil)
-					}
-					candidate := f
-					found = &candidate
-				}
-			}
-			if next == "" {
-				break
-			}
-			marker = next
+		found, exists, err := d.child(ctx, current.ID, part)
+		if err != nil {
+			return nativeFile{}, err
 		}
-		if found == nil {
+		if !exists {
 			return nativeFile{}, core.Fail(core.NotFound, nil)
 		}
-		current = *found
+		current = found
 	}
 	return current, nil
+}
+func (d *Driver) child(ctx context.Context, parent, name string) (found nativeFile, exists bool, err error) {
+	marker := ""
+	for pages := 0; ; pages++ {
+		if d.opts.MaxResolvePages > 0 && pages >= d.opts.MaxResolvePages {
+			return found, exists, core.Fail(core.ResolutionBudgetExceeded, nil)
+		}
+		batch, next, e := d.page(ctx, parent, marker, 100)
+		if e != nil {
+			return found, exists, e
+		}
+		for _, f := range batch {
+			if f.Name == name {
+				if exists {
+					return found, exists, core.Fail(core.PathAmbiguous, nil)
+				}
+				found, exists = f, true
+			}
+		}
+		if next == "" {
+			return
+		}
+		marker = next
+	}
 }
 func (d *Driver) Stat(ctx context.Context, p string) (core.Metadata, error) {
 	f, err := d.resolve(ctx, p)
@@ -321,48 +343,59 @@ func decode(body io.Reader, max int64, out any) error {
 	return nil
 }
 func (d *Driver) post(ctx context.Context, route string, input, out any) error {
+	_, err := d.call(ctx, route, input, out, true)
+	return err
+}
+
+// call distinguishes reads, which may replay an auth rejection, from mutations.
+// A rejected mutation refreshes credentials for the next call without replaying.
+func (d *Driver) call(ctx context.Context, route string, input, out any, replay bool) (rejected bool, err error) {
 	payload, err := json.Marshal(input)
 	if err != nil {
-		return err
+		return true, err
 	}
 	access, err := d.opts.Credentials.Access(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+			return true, err
 		}
-		return core.Fail(core.UpstreamAccessDenied, err)
+		return true, core.Fail(core.UpstreamAccessDenied, err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(d.opts.Endpoint, "/")+route, bytes.NewReader(payload))
 		if err != nil {
-			return err
+			return true, err
 		}
 		req.Header.Set("Authorization", "Bearer "+access)
 		req.Header.Set("Content-Type", "application/json")
 		response, err := d.client.Do(req)
 		if err != nil {
-			return networkError(err)
+			return false, networkError(err)
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			err = decode(response.Body, d.opts.MaxResponseBytes, out)
-			return errors.Join(err, d.closeBody(response.Body))
+			return false, errors.Join(err, d.closeBody(response.Body))
 		}
 		var failure nativeError
 		decodeErr := decode(response.Body, d.opts.MaxResponseBytes, &failure)
 		closeErr := d.closeBody(response.Body)
+		rejected = response.StatusCode == 400 || response.StatusCode == 401 || response.StatusCode == 403 || response.StatusCode == 404 || response.StatusCode == 409 || response.StatusCode == 429
 		if closeErr != nil {
-			return errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), closeErr)
+			return rejected, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), closeErr)
 		}
 		if attempt == 0 && (failure.Code == "AccessTokenExpired" || failure.Code == "AccessTokenInvalid") {
 			access, err = d.opts.Credentials.Reject(ctx, access)
 			if err != nil {
-				return core.Fail(core.UpstreamAccessDenied, err)
+				return true, core.Fail(core.UpstreamAccessDenied, err)
+			}
+			if !replay {
+				return true, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), ctx.Err())
 			}
 			continue
 		}
-		return statusError(response.StatusCode, failure.Code, decodeErr)
+		return rejected, statusError(response.StatusCode, failure.Code, decodeErr)
 	}
-	return core.Fail(core.UpstreamAccessDenied, nil)
+	return true, core.Fail(core.UpstreamAccessDenied, nil)
 }
 func rangeHeader(r *core.Range) string {
 	if r.Suffix {

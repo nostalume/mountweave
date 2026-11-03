@@ -1,4 +1,4 @@
-# Aliyun Drive Open read adapter
+# Aliyun Drive Open adapter
 
 This independent Go module resolves a host-prepared drive and folder root through
 Aliyun Drive Open, then implements github.com/nostalume/mountweave.Driver. It uses the standard
@@ -18,7 +18,7 @@ enumeration verifies child-name uniqueness, retaining IDs only in that scope.
 OpenFile uses the selected ID and the existing isolated download path without
 rescanning ancestors. Close clears this lookup; it is not a global cache,
 content snapshot, version condition or source-delete capability. Core.CopyTree
-can use this adapter as a source; writes remain unsupported.
+can use this adapter as a source or a configured new-file destination.
 
 ## Name and content semantics
 
@@ -36,10 +36,64 @@ budget. Benchmark numbers provide no defaults.
 
 Temporary download URLs remain private. Downloads use fresh HTTPS requests with
 no provider bearer header or cookie jar. API and download redirects are rejected.
-Only GET download targets are admitted. Full responses remain full, unknown
+Only GET download targets are admitted. Upload URLs use isolated HTTPS PUT
+requests with the same bearer/cookie/redirect separation. Full responses remain full, unknown
 length remains unknown, and partial responses need matching actual ranges.
 Failures return any opened body for the core to close. A failed internal API
 body close remains owned by the driver and prevents successful retirement.
+
+## Native mutations and uploads
+
+Core.Write, Copy, CopyTree, Mkdir, Remove, RemoveTree and Move remain the application APIs.
+The Driver implements these existing optional capabilities:
+
+| Capability | Supported modes |
+| --- | --- |
+| DirectoryMaker | New directory with native name-conflict refusal |
+| FileCreator | Known-length new file, when upload options are configured |
+| Remover | Files only |
+| SubtreeRemover | Explicit RemoveTree subtree scope, native directory-ID deletion and completion query |
+| Relocator | Same-parent file/directory rename; same-name file move to another parent |
+| FilePublisher / scoped ChildRemover | Unsupported |
+
+Set Options.PartSize and MaxBufferedBytes together to enable upload; the budget
+must hold one part. PartConcurrency defaults to one. Native upload planning uses
+known length, up to 10,000 parts and at most 5 GiB per part. No machine-derived
+buffer allowance is assumed. Each call reserves at most its part count or worker
+window; the Driver shares total payload capacity and part-request concurrency
+across calls. Excess admission returns CapacityExceeded before input consumption.
+SDK/JSON metadata is outside this payload budget.
+
+The upload retains one resolved parent ID, creates the exact name with
+check_name_mode=refuse, uploads bounded buffers to private signed URLs and completes
+only after normal EOF and exact length. Small inputs are validated before creation;
+larger failed inputs may leave a visible Incomplete file. This logical file belongs
+to the caller and is not automatically deleted. Input is borrowed sequentially,
+never closed or replayed. Cancellation waits for actual reads and native requests
+before releasing buffers; arbitrary blocked I/O may delay retirement. Request-body
+access is revoked before buffer reuse, including after early HTTP rejection.
+
+Mutation requests are never automatically replayed. An explicit token rejection
+refreshes credentials for the next explicit operation while the rejected operation
+returns Unchanged. Uncertain completion stays Unknown without retry or deletion.
+The host transport must preserve this no-replay boundary. Existing read refresh
+and durable credential ownership remain unchanged.
+
+Unknown-length upload and complete replacement are refused before reading input.
+The inspected Aliyun Drive Open creation contract does not establish PDS-style
+file_id replacement; related PDS APIs are not substituted. Combined rename and
+parent change, cross-parent directory movement and asynchronous move completion
+are not supplied. Remove(directory) and default RemoveTree Discovered scope remain
+unsupported: a prior listing cannot establish an atomic empty-directory condition.
+Explicit DirectoryRemoveOptions{Scope: core.Subtree} instead authorizes deletion of
+the captured directory ID and descendants through Core's remove_tree action.
+Synchronous acknowledgement or native task state Succeed confirms completion;
+Running is queried, Failed retains partial/uncertain effects. DeletionPollInterval
+defaults to one second and is host-configurable. Cancellation stops client polling
+and returns Unknown; remote deletion may continue. The native task ID remains in
+the internal error cause for host diagnosis, not public wire responses. Native
+execution returns a root receipt; client plan budgets do not cap native descendants.
+There is no new public upload session or durable multipart resume API.
 
 ## Rotating credentials
 
@@ -65,7 +119,7 @@ if _, err := reader.Install("/cloud", storage); err != nil {
 Use a separate Source per ownership scope; do not transfer the same Source to
 two drivers or create competing sources for the same rotating credential.
 A canceled waiter does not cancel shared refresh. Native access-token
-invalid/expired errors permit one replay after refresh. A stale rejection uses
+invalid/expired errors permit one replay of reads after refresh. A stale rejection uses
 the already-updated access token. Refresh and save deadlines belong to the
 host's callbacks and prepared client.
 
@@ -120,4 +174,6 @@ unverified.
 The native contract was inspected in Alibaba's official
 [SDK at revision 66cdb2679e9cbacd7f682e43e784cf481f200a5a](https://github.com/alibaba/aliyunpan-ios-sdk/tree/66cdb2679e9cbacd7f682e43e784cf481f200a5a/Sources/AliyunpanSDK).
 The module identity is github.com/nostalume/mountweave/drivers/alipan.
-Version v0.1.0 depends on Mountweave core v0.1.0. The relative replace is for checkout development only.
+The relative replace is for checkout development only. This working-tree upload
+implementation requires the matching core revision containing the shared internal
+chunker; it is not yet part of the published v0.1.0 modules.

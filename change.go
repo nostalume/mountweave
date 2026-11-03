@@ -48,7 +48,10 @@ type FileCreator interface {
 
 // WriteOptions leaves existing targets untouched unless Replace is explicit.
 // Replace publishes complete input at a name, creating it when absent.
-type WriteOptions struct{ Replace bool }
+type WriteOptions struct {
+	Replace      bool
+	Continuation *WriteContinuation
+}
 
 // FilePublisher is optional. Publish validates complete input before changing
 // the target name, creates or replaces it, and borrows input only until return.
@@ -67,49 +70,37 @@ func writeOptions(options []WriteOptions) (WriteOptions, error) {
 	return WriteOptions{}, nil
 }
 
-func (c *Core) beginChangeAt(ctx context.Context, p Principal, action Action, target string, expected *location) (*use, string, error) {
-	u, _, err := c.admit(ctx, p, action, target, expected)
+func (c *Core) beginChange(ctx context.Context, p Principal, action Action, target string) (*use, error) {
+	u, _, err := c.admit(ctx, p, action, target)
+	return changeUse(u, err)
+}
+func (c *Core) beginChangeAt(ctx context.Context, p Principal, action Action, at *location) (*use, error) {
+	return changeUse(c.admitAt(ctx, p, action, at))
+}
+func changeUse(u *use, err error) (*use, error) {
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if u == nil {
-		return nil, "", Fail(InvalidRequest, errors.New("a real mounted target is required"))
+		return nil, Fail(InvalidRequest, errors.New("a real mounted target is required"))
 	}
-	rel := u.path
-	if err := checkChangeTarget(target, rel, u.binding.prefix); err != nil {
+	if err = checkChangeTarget(u.visible(), u.path, u.prefix); err != nil {
 		u.release()
-		return nil, "", err
+		return nil, err
 	}
-	return u, rel, nil
+	return u, nil
 }
 
-// preflightChange checks the current grant and binding, not future permission.
-// Execution must still acquire its own use and revalidate admission.
-func (c *Core) preflightChange(ctx context.Context, p Principal, action Action, target string, expected *location) error {
-	if c == nil {
-		return Fail(InvalidRequest, nil)
-	}
-	if err := c.authorizePath(ctx, p, action, target); err != nil {
+// Preflight renews authority without borrowing resources. Execution still owns
+// its admission, using exactly this captured location.
+func (c *Core) preflightAt(ctx context.Context, p Principal, action Action, at *location) error {
+	if err := c.authorizeChecked(ctx, p, action, at.visible()); err != nil {
 		return err
 	}
-	var err error
-	expected, err = c.constrained(ctx, target, expected)
-	if err != nil {
+	if err := c.authorizeBinding(ctx, p, action, at); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	at, _, err := c.resolveLocked(target, expected)
-	c.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if at == nil {
-		return Fail(InvalidRequest, errors.New("a real mounted target is required"))
-	}
-	if err := c.authorizeBinding(ctx, p, action, at.binding, at.path); err != nil {
-		return err
-	}
-	return checkChangeTarget(target, at.path, at.binding.prefix)
+	return checkChangeTarget(at.visible(), at.path, at.prefix)
 }
 
 func checkChangeTarget(target, relative, prefix string) error {
@@ -120,10 +111,12 @@ func checkChangeTarget(target, relative, prefix string) error {
 }
 
 func (c *Core) Mkdir(ctx context.Context, p Principal, target string) (Change, error) {
-	return c.mkdir(ctx, p, target, nil)
+	return c.mkdirUse(c.beginChange(ctx, p, CreateAction, target))
 }
-func (c *Core) mkdir(ctx context.Context, p Principal, target string, expected *location) (Change, error) {
-	u, rel, err := c.beginChangeAt(ctx, p, CreateAction, target, expected)
+func (c *Core) mkdirAt(ctx context.Context, p Principal, at *location) (Change, error) {
+	return c.mkdirUse(c.beginChangeAt(ctx, p, CreateAction, at))
+}
+func (c *Core) mkdirUse(u *use, err error) (Change, error) {
 	if err != nil {
 		return Change{Unchanged}, err
 	}
@@ -135,15 +128,16 @@ func (c *Core) mkdir(ctx context.Context, p Principal, target string, expected *
 	if err = u.ctx.Err(); err != nil {
 		return Change{Unchanged}, err
 	}
-	result, err := maker.Mkdir(u.ctx, rel)
+	result, err := maker.Mkdir(u.ctx, u.path)
 	return c.finishChange(u, result, err)
 }
-
 func (c *Core) Remove(ctx context.Context, p Principal, target string) (Change, error) {
-	return c.remove(ctx, p, target, nil)
+	return c.removeUse(c.beginChange(ctx, p, RemoveAction, target))
 }
-func (c *Core) remove(ctx context.Context, p Principal, target string, expected *location) (Change, error) {
-	u, rel, err := c.beginChangeAt(ctx, p, RemoveAction, target, expected)
+func (c *Core) removeAt(ctx context.Context, p Principal, at *location) (Change, error) {
+	return c.removeUse(c.beginChangeAt(ctx, p, RemoveAction, at))
+}
+func (c *Core) removeUse(u *use, err error) (Change, error) {
 	if err != nil {
 		return Change{Unchanged}, err
 	}
@@ -155,7 +149,7 @@ func (c *Core) remove(ctx context.Context, p Principal, target string, expected 
 	if err = u.ctx.Err(); err != nil {
 		return Change{Unchanged}, err
 	}
-	result, err := remover.Remove(u.ctx, rel)
+	result, err := remover.Remove(u.ctx, u.path)
 	return c.finishChange(u, result, err)
 }
 
@@ -172,26 +166,57 @@ func (c *Core) Write(ctx context.Context, p Principal, target string, input io.R
 	if err != nil {
 		return Change{Unchanged}, err
 	}
-	return c.write(ctx, p, target, input, length, write, nil)
-}
-
-func (c *Core) write(ctx context.Context, p Principal, target string, input io.Reader, length *int64, write WriteOptions, expected *location) (Change, error) {
 	if input == nil || (length != nil && *length < 0) {
 		return Change{Unchanged}, Fail(InvalidRequest, nil)
 	}
-	if length != nil {
-		n := *length
-		length = &n
+	u, err := c.beginChange(ctx, p, write.action(), target)
+	return c.writeUse(u, input, length, write, err)
+}
+
+func (o WriteOptions) action() Action {
+	if o.Replace {
+		return WriteAction
 	}
-	action := CreateAction
-	if write.Replace {
-		action = WriteAction
-	}
-	u, rel, err := c.beginChangeAt(ctx, p, action, target, expected)
+	return CreateAction
+}
+func (c *Core) writeAt(ctx context.Context, p Principal, at *location, input io.Reader, length *int64, write WriteOptions) (Change, error) {
+	u, err := c.beginChangeAt(ctx, p, write.action(), at)
+	return c.writeUse(u, input, length, write, err)
+}
+func (c *Core) writeUse(u *use, input io.Reader, length *int64, write WriteOptions, err error) (Change, error) {
 	if err != nil {
 		return Change{Unchanged}, err
 	}
 	defer u.release()
+	if length != nil {
+		n := *length
+		length = &n
+	}
+	rel := u.path
+	if write.Continuation != nil {
+		writer, ok := u.mount.driver.(ContinuableWriter)
+		if !ok {
+			return Change{Unchanged}, Fail(UnsupportedOperation, nil)
+		}
+		source, ok := input.(Replayable)
+		if !ok || length == nil || write.Continuation.Append == nil || source.SourceVersion() == "" {
+			return Change{Unchanged}, Fail(InvalidRequest, nil)
+		}
+		continuation := *write.Continuation
+		continuation.Checkpoint = append([]byte(nil), continuation.Checkpoint...)
+		if err = u.ctx.Err(); err != nil {
+			return Change{Unchanged}, err
+		}
+		result, err := writer.ContinueWrite(u.ctx, rel, source, *length, write.Replace, continuation)
+		if continuation.Abort && result.Effect == Unchanged && err == nil {
+			return result, u.ctx.Err()
+		}
+		if result.Effect == Incomplete {
+			result.Effect = Unknown
+			err = Fail(InvalidUpstreamResponse, errors.Join(err, errors.New("continuation reported a partial target")))
+		}
+		return c.finishChange(u, result, err)
+	}
 	if write.Replace {
 		publisher, ok := u.mount.driver.(FilePublisher)
 		if !ok {

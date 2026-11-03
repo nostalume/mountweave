@@ -57,10 +57,13 @@ func (c *Core) Install(p string, d Driver) (*Mount, error) {
 	return m, nil
 }
 func (c *Core) authorizePath(ctx context.Context, p Principal, a Action, target string) error {
-	if err := ctx.Err(); err != nil {
+	if err := ValidatePath(target); err != nil {
 		return err
 	}
-	if err := ValidatePath(target); err != nil {
+	return c.authorizeChecked(ctx, p, a, target)
+}
+func (c *Core) authorizeChecked(ctx context.Context, p Principal, a Action, target string) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if p == "" {
@@ -74,17 +77,12 @@ func (c *Core) authorizePath(ctx context.Context, p Principal, a Action, target 
 
 // locateLocked registers a use in the same critical section as resolution.
 func (c *Core) locateLocked(ctx context.Context, p string, expected *location) (*use, []string, error) {
-	expected, err := c.constrained(ctx, p, expected)
-	if err != nil {
-		return nil, nil, err
-	}
 	at, names, err := c.resolveLocked(p, expected)
 	if err != nil || at == nil {
 		return nil, names, err
 	}
-	u := at.binding.mount.borrowLocked(ctx)
-	u.binding, u.path = at.binding, at.path
-	return u, nil, nil
+	u, err := c.borrowAtLocked(ctx, at)
+	return u, nil, err
 }
 
 // resolveLocked checks captured locations without borrowing runtime resources.
@@ -92,22 +90,17 @@ func (c *Core) resolveLocked(p string, expected *location) (*location, []string,
 	if c.closed {
 		return nil, nil, Fail(MountUnavailable, nil)
 	}
-	at := expected
-	if at == nil || !at.binding.active || c.bindings[at.binding.prefix] != at.binding ||
-		!Within(p, at.binding.prefix) || at.path != joinPath(at.binding.base, relative(p, at.binding.prefix)) {
-		at = c.locationLocked(p)
-	}
-	if at != nil {
-		if at.binding.mount.retiring {
+	if expected != nil {
+		if expected.visible() != p || !expected.active || expected.mount.retiring || c.bindings[expected.prefix] != expected.binding {
 			return nil, nil, Fail(MountUnavailable, nil)
 		}
-		if expected != nil && (expected.binding != at.binding || expected.path != at.path) {
+		return expected, nil, nil
+	}
+	if at := c.locationLocked(p); at != nil {
+		if at.mount.retiring {
 			return nil, nil, Fail(MountUnavailable, nil)
 		}
 		return at, nil, nil
-	}
-	if expected != nil {
-		return nil, nil, Fail(MountUnavailable, nil)
 	}
 	names := make(map[string]bool)
 	for root, b := range c.bindings {
@@ -144,7 +137,7 @@ func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target s
 	if action != StatAction && action != ListAction && action != ReadAction {
 		return Entry{}, Fail(InvalidRequest, nil)
 	}
-	u, _, err := c.admit(ctx, p, action, target, nil)
+	u, _, err := c.admit(ctx, p, action, target)
 	if err != nil {
 		return Entry{}, err
 	}

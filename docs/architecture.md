@@ -12,10 +12,12 @@ mandatory stack of forwarding layers.
 | Driver | Native root/IDs, protocol, connection, credentials and native effects | Core contracts; optional SDKs in separate modules |
 | Control | Desired definitions, revisions and explicit prepare/activate/restore | Core plus host Store and Factories |
 | Task | Admission, bounded scheduling, cancellation and finalization of arbitrary functions | Standard library; no file/configuration dependency |
+| Input | Durable received bytes, confirmed offsets, immutable versions and pins | Standard library; independent of Core and Task |
+| Transfer | Durable upload intent, source retention and protected native checkpoints | Core, Input and host Store/binding policy; no SDK or scheduler |
 | HTTP | Wire representation, request lifetime and safe error projection | Core and optional injected control/task consumers |
 | Host | Identity sources, storage, factories, clients, listeners and shutdown | Selected components |
 
-The root module contains core, local, control, task and httpapi. S3, Alipan and
+The root module contains core, local, control, task, input, transfer and httpapi. S3, Alipan and
 Pool each have their own module. Core imports no SDK, configuration system,
 database or frontend. Driver package imports do not register global instances.
 
@@ -24,6 +26,15 @@ database or frontend. Driver package imports do not register global instances.
 Core maps visible paths onto one live binding table, including fixed aliases.
 Drivers receive strict root-relative logical paths. Local paths, S3 prefixes
 and provider root IDs share a responsibility but not a universal representation.
+
+Internally one captured location carries the binding generation and rooted address.
+Visible and primary authorization paths project from it. Selection retains these
+locations; use adds execution lifetime, and an owned directory binds the parent
+location to its native scope. Children are derived from that parent. Prepared
+operations consume locations directly instead of pairing raw paths with optional
+expected locations/scopes or resolving the same selection again. Dynamic grants,
+retirement and native-object conditions are still checked at actual use. This
+address is not a persistent object ID or a content version.
 
 Optional mutation interfaces express native capability without expanding the
 mandatory read interface. Core owns Copy, Move, batch and tree composition;
@@ -48,6 +59,21 @@ closures or decide retry semantics. A durable consumer owns versioned intent,
 receipts and safe continuation rules. Pool maintenance is one such consumer:
 its bbolt ledger owns manifests and private shard receipts while task only runs
 the work. This does not make Pool a prerequisite for other durable jobs.
+
+The input Store is another independent consumer. Its journal owns receipt and
+sealed-source facts; acquiring a reference retains no mount use or open file.
+HTTP prepares fs.write by pinning that source and capturing the target binding,
+then invokes Core.Write at execution. Release waits for accepted references and
+bodies and durable holds. Durable input does not serialize queue closures or
+automatically replay file publication after restart. Transfer is the separate
+checkpoint consumer: it persists an idempotent preparation before retaining a
+sealed source, resolves a fresh verified binding for execution, then passes an
+explicit continuation through Core.Write. Terminal intent precedes releasing its
+source hold. Store commits metadata revisions with incremental native records;
+queries load metadata, while recovery reads the committed log at a specified
+revision. S3 owns native part receipts and commit/abort proof; a missing native
+upload does not prove a lost publication outcome. Ordinary writes need neither
+input nor transfer, and task itself remains process-local.
 
 ## Pool is storage, not a mount view
 

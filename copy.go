@@ -9,46 +9,61 @@ import (
 // Copy synchronously writes target from the complete source body. The parent
 // must exist; replacement is explicit. It does not remove source.
 // The returned Change describes the target even when error is non-nil.
-func (c *Core) Copy(ctx context.Context, principal Principal, source, target string, options ...WriteOptions) (Change, error) {
+func (c *Core) Copy(ctx context.Context, principal Principal, source, target string, options ...WriteOptions) (change Change, err error) {
 	write, err := writeOptions(options)
 	if err != nil {
 		return Change{Unchanged}, err
 	}
-	return c.copy(ctx, principal, source, target, write, nil, nil)
-}
-func (c *Core) copy(ctx context.Context, principal Principal, source, target string, write WriteOptions, from, to *location) (change Change, err error) {
-	change.Effect = Unchanged
 	if c == nil {
-		return change, Fail(InvalidRequest, errors.New("core is required"))
+		return Change{Unchanged}, Fail(InvalidRequest, nil)
+	}
+	if write.Continuation != nil {
+		return Change{Unchanged}, Fail(UnsupportedOperation, nil)
 	}
 	if err = ValidatePath(source); err != nil {
-		return change, fmt.Errorf("source path: %w", err)
+		return Change{Unchanged}, err
 	}
 	if err = ValidatePath(target); err != nil {
-		return change, fmt.Errorf("target path: %w", err)
+		return Change{Unchanged}, err
 	}
-	if from == nil {
-		from = c.capture(source)
+	if source == target {
+		return Change{Unchanged}, Fail(InvalidRequest, nil)
 	}
-	if to == nil {
-		to = c.capture(target)
+	from, to := c.captureChecked(ctx, source), c.captureChecked(ctx, target)
+	if from != nil && to != nil {
+		return c.copyAt(ctx, principal, from, to, write)
 	}
-	if source == target || (from != nil && to != nil && from.binding.mount == to.binding.mount && from.path == to.path) {
-		return change, Fail(InvalidRequest, errors.New("source and target must differ"))
+	defer func() { err = observedCause(ctx, err) }()
+	var opened Content
+	if from != nil {
+		opened, err = c.openAt(ctx, principal, from, nil)
+	} else {
+		opened, err = c.Open(ctx, principal, source, nil)
 	}
-	defer func() {
-		if cause := ctx.Err(); cause != nil && !errors.Is(err, cause) {
-			err = errors.Join(err, cause)
-		}
-	}()
-	opened, err := c.open(ctx, principal, source, nil, from, nil)
 	if err != nil {
-		return change, fmt.Errorf("open source: %w", err)
+		return Change{Unchanged}, err
 	}
-	return c.copyContent(ctx, principal, target, opened, write, to)
+	if to != nil {
+		return c.copyContent(ctx, principal, to, opened, write)
+	}
+	return c.copyContentRequest(ctx, principal, target, opened, write)
+}
+func (c *Core) copyAt(ctx context.Context, p Principal, from, to *location, write WriteOptions) (change Change, err error) {
+	if write.Continuation != nil {
+		return Change{Unchanged}, Fail(UnsupportedOperation, nil)
+	}
+	if from.mount == to.mount && from.path == to.path {
+		return Change{Unchanged}, Fail(InvalidRequest, nil)
+	}
+	defer func() { err = observedCause(ctx, err) }()
+	opened, err := c.openAt(ctx, p, from, nil)
+	if err != nil {
+		return Change{Unchanged}, fmt.Errorf("open source: %w", err)
+	}
+	return c.copyContent(ctx, p, to, opened, write)
 }
 
-func (c *Core) copyContent(ctx context.Context, principal Principal, target string, opened Content, write WriteOptions, expected *location) (change Change, err error) {
+func (c *Core) copyContent(ctx context.Context, principal Principal, at *location, opened Content, write WriteOptions) (change Change, err error) {
 	change.Effect = Unchanged
 	defer func() {
 		if cause := ctx.Err(); cause != nil && !errors.Is(err, cause) {
@@ -61,9 +76,16 @@ func (c *Core) copyContent(ctx context.Context, principal Principal, target stri
 		}
 	}()
 
-	change, err = c.write(ctx, principal, target, opened.Body, opened.Length, write, expected)
+	change, err = c.writeAt(ctx, principal, at, opened.Body, opened.Length, write)
 	if err != nil {
 		err = fmt.Errorf("write target: %w", err)
 	}
 	return change, err
+}
+
+// The request fallback preserves authorization/error ordering for absent or
+// unavailable targets; prepared composite work uses its captured location.
+func (c *Core) copyContentRequest(ctx context.Context, p Principal, target string, opened Content, write WriteOptions) (change Change, err error) {
+	defer func() { err = errors.Join(err, opened.Body.Close()) }()
+	return c.Write(ctx, p, target, opened.Body, opened.Length, write)
 }

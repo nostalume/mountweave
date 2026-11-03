@@ -14,8 +14,18 @@ type binding struct {
 }
 
 type location struct {
-	binding *binding
-	path    string
+	*binding
+	path string
+}
+
+// A location is one immutable captured access route and its rooted address.
+// Visible and primary policy paths are projections, never independent inputs.
+func (at *location) visible() string { return joinPath(at.prefix, relative(at.path, at.base)) }
+func (at *location) primary() string { return joinPath(at.mount.path, at.path) }
+
+// descend receives a relative path admitted by selection or bounded discovery.
+func (at *location) descend(rel string) *location {
+	return &location{binding: at.binding, path: joinPath(at.path, rel)}
 }
 
 func joinPath(root, rel string) string {
@@ -48,7 +58,7 @@ func (c *Core) BindAlias(ctx context.Context, prefix string, mount *Mount, base 
 		c.mu.Unlock()
 		return Fail(MountUnavailable, nil)
 	}
-	u := mount.borrowLocked(ctx)
+	u := mount.borrowLocked(ctx, &location{binding: c.bindings[mount.path], path: base})
 	c.mu.Unlock()
 	defer u.release()
 	meta, err := mount.driver.Stat(u.ctx, base)
@@ -128,17 +138,24 @@ func (c *Core) locationLocked(target string) *location {
 	return nil
 }
 
-func (c *Core) capture(target string) *location {
+func (c *Core) capture(ctx context.Context, target string) *location {
 	if c == nil || ValidatePath(target) != nil {
 		return nil
 	}
+	return c.captureChecked(ctx, target)
+}
+func (c *Core) captureChecked(ctx context.Context, target string) *location {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil
 	}
-	at := c.locationLocked(target)
-	if at != nil && at.binding.mount.retiring {
+	expected, err := c.constrained(ctx, target, nil)
+	if err != nil {
+		return nil
+	}
+	at, _, err := c.resolveLocked(target, expected)
+	if err != nil {
 		return nil
 	}
 	return at
@@ -149,32 +166,30 @@ func (c *Core) authorize(ctx context.Context, p Principal, action Action, target
 	if err := c.authorizePath(ctx, p, action, target); err != nil {
 		return err
 	}
-	at := c.capture(target)
-	if _, constrained := ctx.Value(selectionKey{}).(*Selection); constrained {
-		c.mu.Lock()
-		expected, err := c.constrained(ctx, target, nil)
-		if err == nil {
-			at, _, err = c.resolveLocked(target, expected)
-		}
-		c.mu.Unlock()
-		if err != nil {
-			return err
-		}
+	expected, err := c.constrained(ctx, target, nil)
+	if err != nil {
+		return err
 	}
-	if at != nil && at.binding.prefix != at.binding.mount.path {
-		return c.authorizePath(ctx, p, action, joinPath(at.binding.mount.path, at.path))
+	c.mu.Lock()
+	at, _, err := c.resolveLocked(target, expected)
+	c.mu.Unlock()
+	if err != nil {
+		return err
 	}
-	return nil
+	if at != nil {
+		return c.authorizeBinding(ctx, p, action, at)
+	}
+	return ctx.Err()
 }
 
-func (c *Core) authorizeBinding(ctx context.Context, p Principal, action Action, b *binding, relative string) error {
-	if b.prefix != b.mount.path {
-		if err := c.authorizePath(ctx, p, action, joinPath(b.mount.path, relative)); err != nil {
+func (c *Core) authorizeBinding(ctx context.Context, p Principal, action Action, at *location) error {
+	if at.prefix != at.mount.path {
+		if err := c.authorizePath(ctx, p, action, at.primary()); err != nil {
 			return err
 		}
 	}
 	c.mu.Lock()
-	valid := !c.closed && !b.mount.retiring && b.active && c.bindings[b.prefix] == b
+	valid := !c.closed && !at.mount.retiring && at.active && c.bindings[at.prefix] == at.binding
 	c.mu.Unlock()
 	if !valid {
 		return Fail(MountUnavailable, nil)
@@ -182,11 +197,15 @@ func (c *Core) authorizeBinding(ctx context.Context, p Principal, action Action,
 	return ctx.Err()
 }
 
-func (c *Core) admit(ctx context.Context, p Principal, action Action, target string, expected *location) (*use, []string, error) {
+func (c *Core) admit(ctx context.Context, p Principal, action Action, target string) (*use, []string, error) {
 	if c == nil {
 		return nil, nil, Fail(InvalidRequest, nil)
 	}
 	if err := c.authorizePath(ctx, p, action, target); err != nil {
+		return nil, nil, err
+	}
+	expected, err := c.constrained(ctx, target, nil)
+	if err != nil {
 		return nil, nil, err
 	}
 	c.mu.Lock()
@@ -195,9 +214,40 @@ func (c *Core) admit(ctx context.Context, p Principal, action Action, target str
 	if err != nil || u == nil {
 		return u, names, err
 	}
-	if err = c.authorizeBinding(ctx, p, action, u.binding, u.path); err != nil {
+	if err = c.authorizeBinding(ctx, p, action, u.location); err != nil {
 		u.release()
 		return nil, nil, err
 	}
 	return u, names, nil
+}
+
+// admitAt renews dynamic authority for the captured address without resolving
+// paths or consulting a second selection. A stale generation cannot retarget.
+func (c *Core) admitAt(ctx context.Context, p Principal, action Action, at *location) (*use, error) {
+	if c == nil || at == nil {
+		return nil, Fail(InvalidRequest, nil)
+	}
+	if err := c.authorizeChecked(ctx, p, action, at.visible()); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	u, err := c.borrowAtLocked(ctx, at)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if err = c.authorizeBinding(ctx, p, action, at); err != nil {
+		u.release()
+		return nil, err
+	}
+	return u, nil
+}
+func (c *Core) borrowAtLocked(ctx context.Context, at *location) (*use, error) {
+	if c.closed || at.mount.core != c || at.mount.retiring || !at.active || c.bindings[at.prefix] != at.binding {
+		return nil, Fail(MountUnavailable, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return at.mount.borrowLocked(ctx, at), nil
 }

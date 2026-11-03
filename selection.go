@@ -13,9 +13,8 @@ type PathAccess struct {
 }
 
 type selectedPath struct {
-	visible string
-	at      location
-	write   bool
+	at    location
+	write bool
 }
 
 // Selection records process-local bindings without borrowing their resources.
@@ -52,7 +51,7 @@ func (c *Core) Capture(ctx context.Context, accesses ...PathAccess) (*Selection,
 		if at == nil {
 			return nil, Fail(UnsupportedOperation, nil)
 		}
-		s.paths = append(s.paths, selectedPath{access.Path, *at, access.Write})
+		s.paths = append(s.paths, selectedPath{*at, access.Write})
 	}
 	return s, nil
 }
@@ -91,14 +90,14 @@ func (c *Core) constrained(ctx context.Context, target string, expected *locatio
 	var chosen *selectedPath
 	for i := range s.paths {
 		candidate := &s.paths[i]
-		if Within(target, candidate.visible) && (chosen == nil || len(candidate.visible) > len(chosen.visible)) {
+		if Within(target, candidate.at.visible()) && (chosen == nil || len(candidate.at.visible()) > len(chosen.at.visible())) {
 			chosen = candidate
 		}
 	}
 	if chosen == nil {
 		return nil, Fail(InvalidRequest, errors.New("path is outside the selected ranges"))
 	}
-	at := &location{binding: chosen.at.binding, path: joinPath(chosen.at.path, relative(target, chosen.visible))}
+	at := chosen.at.descend(relative(target, chosen.at.visible()))
 	if expected != nil && (expected.binding != at.binding || expected.path != at.path) {
 		return nil, Fail(MountUnavailable, nil)
 	}

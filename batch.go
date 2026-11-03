@@ -31,9 +31,15 @@ func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []string, o
 	}
 	return execute(ctx, len(targets), limit, nil, func(i int) work[ItemResult] {
 		target := targets[i]
-		at := c.capture(target)
+		at := c.capture(ctx, target)
 		return work[ItemResult]{accesses: []access{{at: at, write: true}}, run: func() (ItemResult, error) {
-			change, err := c.remove(ctx, p, target, at)
+			var change Change
+			var err error
+			if at == nil {
+				change, err = c.Remove(ctx, p, target)
+			} else {
+				change, err = c.removeAt(ctx, p, at)
+			}
 			return ItemResult{Change: change, Err: err}, err
 		}}
 	})
@@ -52,9 +58,15 @@ func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyReques
 	}
 	return execute(ctx, len(requests), limit, nil, func(i int) work[ItemResult] {
 		request := requests[i]
-		from, to := c.capture(request.Source), c.capture(request.Target)
+		from, to := c.capture(ctx, request.Source), c.capture(ctx, request.Target)
 		return work[ItemResult]{accesses: []access{{at: from}, {at: to, write: true}}, run: func() (ItemResult, error) {
-			change, err := c.copy(ctx, p, request.Source, request.Target, request.WriteOptions, from, to)
+			var change Change
+			var err error
+			if from == nil || to == nil {
+				change, err = c.Copy(ctx, p, request.Source, request.Target, request.WriteOptions)
+			} else {
+				change, err = c.copyAt(ctx, p, from, to, request.WriteOptions)
+			}
 			return ItemResult{Change: change, Err: err}, err
 		}}
 	})
@@ -83,9 +95,15 @@ func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveReques
 	}
 	return execute(ctx, len(requests), limit, nil, func(i int) work[MoveItemResult] {
 		request := requests[i]
-		from, to := c.capture(request.Source), c.capture(request.Target)
+		from, to := c.capture(ctx, request.Source), c.capture(ctx, request.Target)
 		return work[MoveItemResult]{accesses: []access{{at: from, write: true}, {at: to, write: true}}, run: func() (MoveItemResult, error) {
-			result, err := c.move(ctx, p, request.Source, request.Target, from, to)
+			var result MoveResult
+			var err error
+			if from == nil || to == nil {
+				result, err = c.Move(ctx, p, request.Source, request.Target)
+			} else {
+				result, err = c.moveAt(ctx, p, from, to)
+			}
 			return MoveItemResult{MoveResult: result, Err: err}, err
 		}}
 	})
