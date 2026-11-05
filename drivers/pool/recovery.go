@@ -52,6 +52,6 @@ func (d *Driver) removeShard(ctx context.Context, r shardRecord) (core.Change, e
 	if !ok {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
-	change, err := remover.Remove(u.ctx, r.Path)
+	change, err := remover.Remove(u.ctx, core.NativePath(r.Path))
 	return change, errors.Join(err, u.ctx.Err())
 }

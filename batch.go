@@ -13,15 +13,20 @@ type ItemResult struct {
 }
 
 type CopyRequest struct {
-	Source string
-	Target string
-	WriteOptions
+	Source  Address
+	Target  Address
+	Options CopyOptions
 }
 
 // RemoveBatch retains input order and duplicates. Execution is serial unless an
 // explicit concurrency option is supplied. On failure no more items start;
 // already started items finish and retain their receipts in the returned prefix.
-func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []string, options ...ExecutionOptions) ([]ItemResult, error) {
+func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []Address, options ...ExecutionOptions) (result []ItemResult, err error) {
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { turn.finish(itemsUncertain(result)) }()
 	if c == nil {
 		return nil, Fail(InvalidRequest, errors.New("core is required"))
 	}
@@ -48,7 +53,12 @@ func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []string, o
 // CopyBatch follows RemoveBatch's prefix and stop contract. Its conflict ranges
 // include both source reads and target writes after explicit alias resolution.
 // Unknown physical aliases and external mutations are not transactionally locked.
-func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyRequest, options ...ExecutionOptions) ([]ItemResult, error) {
+func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyRequest, options ...ExecutionOptions) (result []ItemResult, err error) {
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { turn.finish(itemsUncertain(result)) }()
 	if c == nil {
 		return nil, Fail(InvalidRequest, errors.New("core is required"))
 	}
@@ -63,9 +73,13 @@ func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyReques
 			var change Change
 			var err error
 			if from == nil || to == nil {
-				change, err = c.Copy(ctx, p, request.Source, request.Target, request.WriteOptions)
+				change, err = c.Copy(ctx, p, request.Source, request.Target, request.Options)
 			} else {
-				change, err = c.copyAt(ctx, p, from, to, request.WriteOptions)
+				if _, err = writeOptions([]WriteOptions{request.Options.Target}); err == nil {
+					change, err = c.copyAt(ctx, p, from, to, request.Options)
+				} else {
+					change.Effect = Unchanged
+				}
 			}
 			return ItemResult{Change: change, Err: err}, err
 		}}
@@ -73,8 +87,9 @@ func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyReques
 }
 
 type MoveRequest struct {
-	Source string
-	Target string
+	Source  Address
+	Target  Address
+	Options MoveOptions
 }
 
 // MoveItemResult retains both endpoint receipts for one attempted occurrence.
@@ -85,7 +100,20 @@ type MoveItemResult struct {
 
 // MoveBatch follows the same prefix and stop contract as CopyBatch. Both
 // endpoints are writes, including their descendants, within this finite call.
-func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveRequest, options ...ExecutionOptions) ([]MoveItemResult, error) {
+func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveRequest, options ...ExecutionOptions) (result []MoveItemResult, err error) {
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		for _, r := range result {
+			if r.Source.Effect == Unknown || r.Target.Effect == Unknown || r.Removed != nil && r.Removed.Change.Effect == Unknown {
+				turn.finish(true)
+				return
+			}
+		}
+		turn.finish(false)
+	}()
 	if c == nil {
 		return nil, Fail(InvalidRequest, errors.New("core is required"))
 	}
@@ -100,11 +128,20 @@ func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveReques
 			var result MoveResult
 			var err error
 			if from == nil || to == nil {
-				result, err = c.Move(ctx, p, request.Source, request.Target)
+				result, err = c.Move(ctx, p, request.Source, request.Target, request.Options)
 			} else {
-				result, err = c.moveAt(ctx, p, from, to)
+				result, err = c.moveAt(ctx, p, from, to, request.Options)
 			}
 			return MoveItemResult{MoveResult: result, Err: err}, err
 		}}
 	})
+}
+
+func itemsUncertain(items []ItemResult) bool {
+	for _, item := range items {
+		if item.Change.Effect == Unknown {
+			return true
+		}
+	}
+	return false
 }

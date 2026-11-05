@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
@@ -19,7 +20,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/internal/upload"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 // Driver borrows its SDK client. The host owns transports and credential providers.
@@ -88,25 +89,73 @@ func (d *Driver) Close() error {
 	}
 	return nil
 }
-func (d *Driver) admit(ctx context.Context, p string) error {
+func (d *Driver) admit(ctx context.Context, p core.NativeAddress) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := core.ValidatePath(p); err != nil {
-		return err
+	if p.Namespace() == core.TreeNamespace {
+		if err := core.ValidatePath(p.Value()); err != nil {
+			return err
+		}
+	} else if p.Namespace() != core.KeyNamespace || p.Value() == "" || !utf8.ValidString(p.Value()) {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	length := len(p.Value())
+	if p.Namespace() == core.TreeNamespace {
+		length--
+	}
+	if len(d.prefix)+length > 1024 {
+		return core.Fail(core.InvalidRequest, nil)
 	}
 	if d.closed.Load() {
 		return core.Fail(core.MountUnavailable, nil)
 	}
 	return nil
 }
-func name(p string) string            { return p[strings.LastIndexByte(p, '/')+1:] }
-func (d *Driver) key(p string) string { return d.prefix + strings.TrimPrefix(p, "/") }
+func name(p core.NativeAddress) string {
+	if p.Namespace() == core.KeyNamespace {
+		return p.Value()
+	}
+	return p.Value()[strings.LastIndexByte(p.Value(), '/')+1:]
+}
+func (d *Driver) key(p core.NativeAddress) string {
+	if p.Namespace() == core.KeyNamespace {
+		return d.prefix + p.Value()
+	}
+	return d.prefix + strings.TrimPrefix(p.Value(), "/")
+}
+
+func (*Driver) SupportsNamespace(n core.Namespace) bool {
+	return n == core.TreeNamespace || n == core.KeyNamespace
+}
+func (*Driver) KeyRoot(p core.NativeAddress) (string, bool) {
+	if p.Namespace() != core.TreeNamespace {
+		return "", false
+	}
+	prefix := strings.TrimPrefix(p.Value(), "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	return prefix, true
+}
+func (*Driver) KeyExtent(p core.NativeAddress) core.KeyExtent {
+	key := strings.TrimPrefix(p.Value(), "/")
+	if p.Namespace() == core.KeyNamespace {
+		return core.KeyExtent{Exact: p.Value(), HasExact: true}
+	}
+	if key == "" {
+		return core.KeyExtent{Prefix: "", HasPrefix: true}
+	}
+	return core.KeyExtent{Exact: key, HasExact: true, Prefix: key + "/", HasPrefix: true}
+}
 
 // Ancestors must be directories under the same namespace interpretation as Stat.
 // A direct object-key GET alone would bypass an ambiguous ancestor.
-func (d *Driver) ancestors(ctx context.Context, p string) error {
-	parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
+func (d *Driver) ancestors(ctx context.Context, p core.NativeAddress) error {
+	if p.Namespace() == core.KeyNamespace {
+		return nil
+	}
+	parts := strings.Split(strings.TrimPrefix(p.Value(), "/"), "/")
 	key := d.prefix
 	for _, part := range parts[:len(parts)-1] {
 		key += part
@@ -143,10 +192,16 @@ func (d *Driver) hasDirectory(ctx context.Context, key string) (bool, error) {
 	}
 	return len(out.Contents) > 0 || len(out.CommonPrefixes) > 0, nil
 }
-func (d *Driver) statKey(ctx context.Context, key, n string) (core.Metadata, error) {
-	out, err := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(key)})
-	if err != nil && core.CodeOf(translate(err)) != core.NotFound {
-		return core.Metadata{}, translate(err)
+func (d *Driver) directoryAt(ctx context.Context, p core.NativeAddress) (bool, error) {
+	if p.Namespace() == core.KeyNamespace {
+		return false, nil
+	}
+	return d.hasDirectory(ctx, d.key(p))
+}
+func (d *Driver) statKey(ctx context.Context, key, n string, versions ...core.Version) (core.Metadata, error) {
+	meta, err := d.head(ctx, key, n, versions...)
+	if err != nil && core.CodeOf(err) != core.NotFound {
+		return core.Metadata{}, err
 	}
 	directory, dirErr := d.hasDirectory(ctx, key)
 	if dirErr != nil {
@@ -158,24 +213,75 @@ func (d *Driver) statKey(ctx context.Context, key, n string) (core.Metadata, err
 	if directory {
 		return core.Metadata{Name: n, Kind: core.Directory}, nil
 	}
+	return meta, err
+}
+
+func (d *Driver) head(ctx context.Context, key, n string, versions ...core.Version) (core.Metadata, error) {
+	request := &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(key)}
+	if len(versions) == 1 && versions[0] != "" {
+		request.VersionId = aws.String(string(versions[0]))
+	}
+	out, err := d.client.HeadObject(ctx, request)
 	if err != nil {
 		return core.Metadata{}, translate(err)
 	}
-	return core.Metadata{Name: n, Kind: core.File, Size: out.ContentLength, ModifiedAt: out.LastModified}, nil
+	return core.Metadata{Name: n, Kind: core.File, Size: out.ContentLength, ModifiedAt: out.LastModified, Evidence: evidence(out.ETag, out.VersionId)}, nil
 }
-func (d *Driver) Stat(ctx context.Context, p string) (core.Metadata, error) {
+func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
+	if len(selections) > 1 {
+		return meta, core.Fail(core.InvalidRequest, nil)
+	}
+	var selection core.ReadSelection
+	if len(selections) == 1 {
+		selection = selections[0]
+	}
+	if selection.Version == "null" {
+		return meta, core.Fail(core.UnsupportedOperation, nil)
+	}
+	defer func() {
+		if err == nil {
+			if selection.Version != "" && meta.Kind != core.File {
+				err = core.Fail(core.UnsupportedOperation, nil)
+				return
+			}
+			if selection.Version != "" && meta.Evidence.Version != selection.Version {
+				err = core.Fail(core.InvalidUpstreamResponse, nil)
+				return
+			}
+			err = selection.Check(meta.Evidence)
+		}
+	}()
 	if err := d.admit(ctx, p); err != nil {
 		return core.Metadata{}, err
 	}
-	if p == "/" {
+	if p.Namespace() == core.KeyNamespace {
+		return d.head(ctx, d.key(p), p.Value(), selection.Version)
+	}
+	if p.Value() == "/" {
 		return core.Metadata{Kind: core.Directory}, nil
 	}
 	if err := d.ancestors(ctx, p); err != nil {
 		return core.Metadata{}, err
 	}
-	return d.statKey(ctx, d.key(p), name(p))
+	return d.statKey(ctx, d.key(p), name(p), selection.Version)
 }
-func (d *Driver) Enumerate(ctx context.Context, p string) (core.Iterator, error) {
+func (d *Driver) Enumerate(ctx context.Context, query core.NativeQuery) (core.Iterator, error) {
+	p := query.Address()
+	if p.Namespace() == core.KeyNamespace {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if d.closed.Load() {
+			return nil, core.Fail(core.MountUnavailable, nil)
+		}
+		if !utf8.ValidString(p.Value()) || !utf8.ValidString(query.Delimiter()) || !utf8.ValidString(query.StartAfter()) || len(d.prefix+p.Value()) > 1024 {
+			return nil, core.Fail(core.InvalidRequest, nil)
+		}
+		return &iterator{driver: d, prefix: d.prefix + p.Value(), delimiter: query.Delimiter(), after: query.StartAfter(), keys: true}, nil
+	}
+	if query.Delimiter() != "" || query.StartAfter() != "" {
+		return nil, core.Fail(core.InvalidRequest, nil)
+	}
 	meta, err := d.Stat(ctx, p)
 	if err != nil {
 		return nil, err
@@ -184,17 +290,19 @@ func (d *Driver) Enumerate(ctx context.Context, p string) (core.Iterator, error)
 		return nil, core.Fail(core.NotDirectory, nil)
 	}
 	prefix := d.prefix
-	if p != "/" {
+	if p.Value() != "/" {
 		prefix = d.key(p) + "/"
 	}
-	return &iterator{driver: d, prefix: prefix}, nil
+	return &iterator{driver: d, prefix: prefix, delimiter: "/"}, nil
 }
 
 type iterator struct {
-	driver         *Driver
-	prefix, marker string
-	done, closed   bool
-	files          map[string]core.Metadata
+	driver           *Driver
+	prefix, marker   string
+	delimiter, after string
+	keys             bool
+	done, closed     bool
+	files            map[string]core.Metadata
 }
 
 func (i *iterator) Close() error { i.closed = true; i.files = nil; return nil }
@@ -217,7 +325,13 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 	if n > 1000 {
 		n = 1000
 	}
-	input := &sdk.ListObjectsV2Input{Bucket: aws.String(i.driver.bucket), Prefix: aws.String(i.prefix), Delimiter: aws.String("/"), MaxKeys: aws.Int32(int32(n)), EncodingType: types.EncodingTypeUrl}
+	input := &sdk.ListObjectsV2Input{Bucket: aws.String(i.driver.bucket), Prefix: aws.String(i.prefix), MaxKeys: aws.Int32(int32(n)), EncodingType: types.EncodingTypeUrl}
+	if i.delimiter != "" {
+		input.Delimiter = aws.String(i.delimiter)
+	}
+	if i.marker == "" && i.after != "" {
+		input.StartAfter = aws.String(i.driver.prefix + i.after)
+	}
 	if i.marker != "" {
 		input.ContinuationToken = aws.String(i.marker)
 	}
@@ -247,28 +361,36 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 		if err != nil {
 			return nil, core.Fail(core.InvalidUpstreamResponse, err)
 		}
-		if key == i.prefix {
+		if !i.keys && key == i.prefix {
 			continue
 		} // The current directory marker is not its own child.
 		if !strings.HasPrefix(key, i.prefix) {
 			return nil, core.Fail(core.InvalidUpstreamResponse, nil)
 		}
 		n := strings.TrimPrefix(key, i.prefix)
-		if !core.ValidName(n) {
+		if i.keys {
+			n = strings.TrimPrefix(key, i.driver.prefix)
+		}
+		if (!i.keys && !core.ValidName(n)) || (i.keys && (n == "" || !utf8.ValidString(n))) {
 			return nil, core.Fail(core.UnrepresentableName, nil)
 		}
-		items = append(items, core.Metadata{Name: n, Kind: core.File, Size: o.Size, ModifiedAt: o.LastModified})
+		items = append(items, core.Metadata{Name: n, Kind: core.File, Size: o.Size, ModifiedAt: o.LastModified, Evidence: evidence(o.ETag, nil)})
 	}
 	for _, o := range out.CommonPrefixes {
 		key, err := decode(aws.ToString(o.Prefix))
-		if err != nil || !strings.HasPrefix(key, i.prefix) || !strings.HasSuffix(key, "/") {
+		if err != nil || i.delimiter == "" || !strings.HasPrefix(key, i.prefix) || !strings.HasSuffix(key, i.delimiter) {
 			return nil, core.Fail(core.InvalidUpstreamResponse, err)
 		}
 		n := strings.TrimSuffix(strings.TrimPrefix(key, i.prefix), "/")
-		if !core.ValidName(n) {
+		kind := core.Directory
+		if i.keys {
+			n = strings.TrimPrefix(key, i.driver.prefix)
+			kind = core.PrefixGroup
+		}
+		if (!i.keys && !core.ValidName(n)) || (i.keys && (n == "" || !utf8.ValidString(n))) {
 			return nil, core.Fail(core.UnrepresentableName, nil)
 		}
-		items = append(items, core.Metadata{Name: n, Kind: core.Directory})
+		items = append(items, core.Metadata{Name: n, Kind: kind})
 	}
 	if i.files != nil {
 		for _, meta := range items {
@@ -294,20 +416,33 @@ func rangeHeader(r *core.Range) string {
 	}
 	return fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
 }
-func (d *Driver) Open(ctx context.Context, p string, wanted *core.Range) (core.Opened, error) {
+func (d *Driver) Open(ctx context.Context, p core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
+	if options.Mode == core.LiveEdit {
+		return core.Opened{Change: core.Change{Effect: core.Unchanged}}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := options.Validate(); err != nil {
+		return core.Opened{}, err
+	}
+	if options.Mode == core.BoundRead {
+		return d.bindFile(ctx, p, options.Selection)
+	}
+	wanted := options.Range
 	if err := d.admit(ctx, p); err != nil {
 		return core.Opened{}, err
 	}
 	if wanted != nil && !wanted.Valid() {
 		return core.Opened{}, core.Fail(core.InvalidRange, nil)
 	}
-	if p == "/" {
+	if p.Namespace() == core.TreeNamespace && p.Value() == "/" {
 		return core.Opened{}, core.Fail(core.NotFile, nil)
 	}
 	if err := d.ancestors(ctx, p); err != nil {
 		return core.Opened{}, err
 	}
 	key := d.key(p)
+	if p.Namespace() == core.KeyNamespace {
+		return d.get(ctx, key, name(p), wanted, options.Selection)
+	}
 	directory, err := d.hasDirectory(ctx, key)
 	if err != nil {
 		return core.Opened{}, err
@@ -322,19 +457,37 @@ func (d *Driver) Open(ctx context.Context, p string, wanted *core.Range) (core.O
 		}
 		return core.Opened{}, core.Fail(core.NotFile, nil)
 	}
-	return d.get(ctx, key, name(p), wanted)
+	return d.get(ctx, key, name(p), wanted, options.Selection)
 }
 
-func (d *Driver) get(ctx context.Context, key, leaf string, wanted *core.Range) (core.Opened, error) {
+func (d *Driver) get(ctx context.Context, key, leaf string, wanted *core.Range, selections ...core.ReadSelection) (core.Opened, error) {
+	var selection core.ReadSelection
+	if len(selections) == 1 {
+		selection = selections[0]
+	}
+	match, none, err := nativeCondition(selection.When, true)
+	if err != nil {
+		return core.Opened{}, err
+	}
+	if selection.Version == "null" {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
 	input := &sdk.GetObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(key)}
+	input.IfMatch, input.IfNoneMatch = match, none
+	if selection.Version != "" {
+		input.VersionId = aws.String(string(selection.Version))
+	}
 	if wanted != nil {
 		input.Range = aws.String(rangeHeader(wanted))
 	}
 	out, err := d.client.GetObject(ctx, input, func(o *sdk.Options) { o.APIOptions = append(o.APIOptions, awsmiddleware.AddRawResponseToMetadata) })
 	if err != nil {
-		return core.Opened{}, translate(err)
+		return core.Opened{}, readFailure(err)
 	}
-	opened := core.Opened{Metadata: core.Metadata{Name: leaf, Kind: core.File, Size: out.ContentLength, ModifiedAt: out.LastModified}, Length: out.ContentLength, Body: out.Body}
+	opened := core.Opened{Metadata: core.Metadata{Name: leaf, Kind: core.File, Size: out.ContentLength, ModifiedAt: out.LastModified, Evidence: evidence(out.ETag, out.VersionId)}, Length: out.ContentLength, Body: out.Body}
+	if selection.Version != "" && opened.Metadata.Evidence.Version != selection.Version {
+		return opened, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
 	response, ok := awsmiddleware.GetRawResponse(out.ResultMetadata).(*smithyhttp.Response)
 	if !ok || (response.StatusCode != 200 && response.StatusCode != 206) || ((response.StatusCode == 206) != (out.ContentRange != nil)) {
 		return opened, core.Fail(core.InvalidUpstreamResponse, nil)
@@ -368,7 +521,7 @@ func translate(err error) error {
 	var api smithy.APIError
 	if errors.As(err, &api) {
 		switch api.ErrorCode() {
-		case "NoSuchKey", "NotFound":
+		case "NoSuchKey", "NoSuchVersion", "NotFound":
 			code = core.NotFound
 		case "NoSuchBucket":
 			code = core.MountUnavailable

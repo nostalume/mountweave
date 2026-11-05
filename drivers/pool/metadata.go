@@ -367,7 +367,7 @@ func metadata(name string, e entryRecord, f fileRecord) core.Metadata {
 		return core.Metadata{Name: name, Kind: core.Directory}
 	}
 	n := f.Length
-	return core.Metadata{Name: name, Kind: core.File, Size: &n}
+	return core.Metadata{Name: name, Kind: core.File, Size: &n, Evidence: core.Evidence{Validator: core.Validator{Domain: "pool-generation", Tag: `"` + f.ID + `"`}, Version: core.Version(f.ID)}}
 }
 func (d *Driver) stripe(f fileRecord, index int64) (s stripeRecord, err error) {
 	err = d.db.View(func(tx *bolt.Tx) error {

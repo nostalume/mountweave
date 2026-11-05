@@ -3,8 +3,6 @@ package core
 import (
 	"context"
 	"errors"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +14,7 @@ type Options struct {
 	MaxCursors  int
 	OpenTimeout time.Duration
 }
+
 type Core struct {
 	mu       sync.Mutex
 	opts     Options
@@ -33,6 +32,7 @@ func New(opts Options) (*Core, error) {
 	}
 	return &Core{opts: opts, mounts: make(map[string]*Mount), bindings: make(map[string]*binding), tokens: make(map[string]*session), sessions: make(map[*session]struct{})}, nil
 }
+
 func (c *Core) Install(p string, d Driver) (*Mount, error) {
 	if err := ValidatePath(p); err != nil {
 		return nil, err
@@ -52,124 +52,13 @@ func (c *Core) Install(p string, d Driver) (*Mount, error) {
 	}
 	c.version++
 	m := &Mount{core: c, path: p, driver: d, uses: make(map[*use]struct{}), done: make(chan struct{})}
+	m.keys = supportsNamespace(d, KeyNamespace)
+	m.projection, _ = d.(KeyProjection)
 	c.mounts[p] = m
-	c.bindings[p] = &binding{prefix: p, mount: m, base: "/", active: true}
+	c.bindings[p] = &binding{prefix: p, mount: m, base: "/", active: true, keySpace: m.keys}
 	return m, nil
 }
-func (c *Core) authorizePath(ctx context.Context, p Principal, a Action, target string) error {
-	if err := ValidatePath(target); err != nil {
-		return err
-	}
-	return c.authorizeChecked(ctx, p, a, target)
-}
-func (c *Core) authorizeChecked(ctx context.Context, p Principal, a Action, target string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if p == "" {
-		return Fail(Unauthenticated, nil)
-	}
-	if err := c.opts.Authorize(ctx, p, a, target); err != nil {
-		return Fail(PermissionDenied, err)
-	}
-	return nil
-}
 
-// locateLocked registers a use in the same critical section as resolution.
-func (c *Core) locateLocked(ctx context.Context, p string, expected *location) (*use, []string, error) {
-	at, names, err := c.resolveLocked(p, expected)
-	if err != nil || at == nil {
-		return nil, names, err
-	}
-	u, err := c.borrowAtLocked(ctx, at)
-	return u, nil, err
-}
-
-// resolveLocked checks captured locations without borrowing runtime resources.
-func (c *Core) resolveLocked(p string, expected *location) (*location, []string, error) {
-	if c.closed {
-		return nil, nil, Fail(MountUnavailable, nil)
-	}
-	if expected != nil {
-		if expected.visible() != p || !expected.active || expected.mount.retiring || c.bindings[expected.prefix] != expected.binding {
-			return nil, nil, Fail(MountUnavailable, nil)
-		}
-		return expected, nil, nil
-	}
-	if at := c.locationLocked(p); at != nil {
-		if at.mount.retiring {
-			return nil, nil, Fail(MountUnavailable, nil)
-		}
-		return at, nil, nil
-	}
-	names := make(map[string]bool)
-	for root, b := range c.bindings {
-		if !b.active || b.mount.retiring {
-			continue
-		}
-		prefix := p
-		if prefix != "/" {
-			prefix += "/"
-		}
-		if strings.HasPrefix(root, prefix) {
-			rest := strings.TrimPrefix(root, prefix)
-			if rest != "" {
-				names[strings.SplitN(rest, "/", 2)[0]] = true
-			}
-		}
-	}
-	if p != "/" && len(names) == 0 {
-		return nil, nil, Fail(NotFound, nil)
-	}
-	children := make([]string, 0, len(names))
-	for name := range names {
-		children = append(children, name)
-	}
-	sort.Strings(children)
-	return nil, children, nil
-}
-func (c *Core) Stat(ctx context.Context, p Principal, target string) (Entry, error) {
-	return c.Inspect(ctx, p, StatAction, target)
-}
-
-// Inspect checks metadata under the requested action without opening content.
-func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target string) (Entry, error) {
-	if action != StatAction && action != ListAction && action != ReadAction {
-		return Entry{}, Fail(InvalidRequest, nil)
-	}
-	u, _, err := c.admit(ctx, p, action, target)
-	if err != nil {
-		return Entry{}, err
-	}
-	if u == nil {
-		return virtualEntry(target), nil
-	}
-	defer u.release()
-	rel := u.path
-	meta, err := u.mount.driver.Stat(u.ctx, rel)
-	if err != nil {
-		return Entry{}, err
-	}
-	if err = u.ctx.Err(); err != nil {
-		return Entry{}, err
-	}
-	if err = checkName(meta, rel); err != nil {
-		return Entry{}, err
-	}
-	return project(target, meta)
-}
-func checkName(m Metadata, rel string) error {
-	if rel != "/" {
-		name := rel[strings.LastIndexByte(rel, '/')+1:]
-		if !ValidName(m.Name) {
-			return Fail(UnrepresentableName, nil)
-		}
-		if name != m.Name {
-			return Fail(InvalidUpstreamResponse, errors.New("resolved name differs from the requested name"))
-		}
-	}
-	return nil
-}
 func (c *Core) Close(ctx context.Context) error {
 	c.mu.Lock()
 	c.closed = true

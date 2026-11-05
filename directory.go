@@ -10,7 +10,7 @@ import (
 // opened without following native links or redirects; "/" is the prepared root.
 // Opening does not require Next. The returned scope is owned even on error.
 type DirectoryReader interface {
-	OpenDirectory(context.Context, string) (DirectoryScope, error)
+	OpenDirectory(context.Context, NativeAddress) (DirectoryScope, error)
 }
 
 // DirectoryScope enumerates one bound directory. Only after normal EOF may
@@ -50,6 +50,7 @@ func (d *directory) close() error {
 	d.owner.release()
 	return nil
 }
+
 func (c *Core) openDirectory(ctx context.Context, p Principal, at *location) (*directory, error) {
 	u, err := c.admitAt(ctx, p, ListAction, at)
 	if err != nil {
@@ -57,6 +58,7 @@ func (c *Core) openDirectory(ctx context.Context, p Principal, at *location) (*d
 	}
 	return openDirectoryAt(u, false)
 }
+
 func openDirectoryAt(u *use, parent bool) (*directory, error) {
 	reader, ok := u.mount.driver.(DirectoryReader)
 	if !ok {
@@ -67,7 +69,7 @@ func openDirectoryAt(u *use, parent bool) (*directory, error) {
 	if parent {
 		at = &location{binding: at.binding, path: path.Dir(at.path)}
 	}
-	native, err := reader.OpenDirectory(u.ctx, at.path)
+	native, err := reader.OpenDirectory(u.ctx, at.native())
 	if err == nil {
 		err = u.ctx.Err()
 	}
@@ -86,35 +88,26 @@ func openDirectoryAt(u *use, parent bool) (*directory, error) {
 	}
 	return &directory{owner: u, at: at, native: native}, nil
 }
-func (d *directory) child(name string) (*location, error) {
-	if !ValidName(name) {
-		return nil, Fail(UnrepresentableName, nil)
-	}
-	at := d.at.descend("/" + name)
-	if err := ValidatePath(at.visible()); err != nil {
-		return nil, err
-	}
-	return at, nil
-}
-func (d *directory) openFile(ctx context.Context, p Principal, name string) (Content, error) {
-	at, err := d.child(name)
-	if err != nil {
-		return Content{}, err
+
+func (d *directory) openFile(ctx context.Context, p Principal, at *location) (Content, error) {
+	if at.binding != d.at.binding || path.Dir(at.path) != d.at.path {
+		return Content{}, Fail(InvalidRequest, nil)
 	}
 	c := at.mount.core
 	u, err := c.admitAt(ctx, p, ReadAction, at)
-	return c.openUse(u, nil, err, func(call context.Context) (Opened, error) { return d.native.OpenFile(call, name) })
+	return c.openUse(ctx, p, u, OpenOptions{}, err, func(call context.Context) (Opened, error) { return d.native.OpenFile(call, path.Base(at.path)) })
 }
+
 func (d *directory) removeChild(u *use, kind Kind) (Change, error) {
 	if u.binding != d.at.binding || path.Dir(u.path) != d.at.path {
-		return Change{Unchanged}, Fail(InvalidRequest, nil)
+		return Change{Effect: Unchanged}, Fail(InvalidRequest, nil)
 	}
 	remover, ok := d.native.(ChildRemover)
 	if !ok {
-		return Change{Unchanged}, Fail(UnsupportedOperation, nil)
+		return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)
 	}
 	if err := u.ctx.Err(); err != nil {
-		return Change{Unchanged}, err
+		return Change{Effect: Unchanged}, err
 	}
 	result, err := remover.RemoveChild(u.ctx, path.Base(u.path), kind)
 	return u.mount.core.finishChange(u, result, err)
@@ -122,11 +115,37 @@ func (d *directory) removeChild(u *use, kind Kind) (Change, error) {
 
 // executeDirectories owns bounded batches of prepared scopes around execute.
 // open cleans up its failed acquisition; an empty group returns no scope.
+// A resource-free group may return a positive count with no directory scope.
 // prepare follows group order and is called once per started or pending item.
+type directoryFailure struct {
+	index int
+	cause error
+}
+
+func (e *directoryFailure) Error() string { return e.cause.Error() }
+
+func (e *directoryFailure) Unwrap() error { return e.cause }
+
+func directoryFailures(err error, visit func(int, error)) {
+	if err == nil {
+		return
+	}
+	if failure, ok := err.(*directoryFailure); ok {
+		visit(failure.index, failure.cause)
+		return
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, cause := range joined.Unwrap() {
+			directoryFailures(cause, visit)
+		}
+	} else {
+		directoryFailures(errors.Unwrap(err), visit)
+	}
+}
+
 func executeDirectories[T any](ctx context.Context, count, limit int, results []T,
 	open func(int) (*directory, int, error),
-	prepare func(int, *directory, int) work[T],
-) ([]T, error) {
+	prepare func(int, *directory, int) work[T]) ([]T, error) {
 	type group struct {
 		index, count int
 		scope        *directory
@@ -143,7 +162,7 @@ func executeDirectories[T any](ctx context.Context, count, limit int, results []
 			next++
 			scope, n, err := open(index)
 			if err != nil {
-				prepareErr = err
+				prepareErr = &directoryFailure{index: index, cause: err}
 				break
 			}
 			if n != 0 {
@@ -167,7 +186,11 @@ func executeDirectories[T any](ctx context.Context, count, limit int, results []
 		}
 		var closeErr error
 		for _, current := range groups {
-			closeErr = errors.Join(closeErr, current.scope.close())
+			if current.scope != nil {
+				if err := current.scope.close(); err != nil {
+					closeErr = errors.Join(closeErr, &directoryFailure{index: current.index, cause: err})
+				}
+			}
 		}
 		if err := errors.Join(prepareErr, runErr, closeErr); err != nil {
 			return results, err

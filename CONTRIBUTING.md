@@ -11,7 +11,9 @@ go vet ./...
 go test -race ./...
 ```
 
-Local Driver replacements are for checkout development. Keep optional dependencies
+The root checks include drivers/local and protocols/httpapi, protocols/webdav
+and their shared internal packages. Local module replacements are for checkout
+development. Keep optional dependencies
 in their owning modules. Do not add a global registry or require every consumer
 to import every Driver. A root-only change should not need a remote account.
 

@@ -2,6 +2,10 @@ package pool
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 
 	core "github.com/nostalume/mountweave"
@@ -25,11 +29,41 @@ type MaintenanceRequest struct {
 // Last is not an exactly-once cumulative counter: a crash may repeat a batch.
 // Done marks one finite pass, not a promise that future writes need no repair.
 type MaintenanceJob struct {
-	ID      string
-	Request MaintenanceRequest
-	Done    bool
-	Last    Maintenance
+	ID         string
+	Generation string
+	Request    MaintenanceRequest
+	Done       bool
+	Last       Maintenance
 }
+
+// MaintenanceOptions fences delayed commands against a forgotten/reused ID.
+// It is neither authorization nor a lease across multiple Pool owners.
+type MaintenanceOptions struct{ ExpectedGeneration string }
+
+func (r *maintenanceRecord) validate() error {
+	if r.Version != 1 && r.Version != 2 {
+		return core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	if r.Generation == "" {
+		data, _ := json.Marshal(struct {
+			ID      string
+			Request MaintenanceRequest
+		}{r.ID, r.Request})
+		sum := sha256.Sum256(data)
+		r.Generation = "legacy-" + hex.EncodeToString(sum[:])
+	}
+	return nil
+}
+func (r *maintenanceRecord) expect(options []MaintenanceOptions) error {
+	if len(options) > 1 || (len(options) == 1 && options[0].ExpectedGeneration == "") {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	if len(options) == 1 && options[0].ExpectedGeneration != r.Generation {
+		return core.Fail(core.AlreadyExists, nil)
+	}
+	return nil
+}
+
 type maintenanceRecord struct {
 	Version int
 	MaintenanceJob
@@ -59,7 +93,10 @@ func (d *Driver) PlanMaintenance(ctx context.Context, id string, request Mainten
 			if err := decode(raw, &old); err != nil {
 				return err
 			}
-			if old.Version != 1 || old.Request != request {
+			if err := old.validate(); err != nil {
+				return err
+			}
+			if old.Request != request {
 				return core.Fail(core.AlreadyExists, nil)
 			}
 			repeated = true
@@ -78,7 +115,7 @@ func (d *Driver) PlanMaintenance(ctx context.Context, id string, request Mainten
 				return core.Fail(core.MountUnavailable, nil)
 			}
 		}
-		job := maintenanceRecord{Version: 1, MaintenanceJob: MaintenanceJob{ID: id, Request: request}}
+		job := maintenanceRecord{Version: 2, MaintenanceJob: MaintenanceJob{ID: id, Generation: rand.Text(), Request: request}}
 		return b.Put([]byte(id), encode(job))
 	})
 	if repeated && change.Effect == core.Applied {
@@ -101,12 +138,15 @@ func (d *Driver) MaintenanceJobs(ctx context.Context, after string, limit int) (
 	defer o.finish()
 	err = d.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(jobsKey)
-		key := []byte(after)
+		cursor := b.Cursor()
+		k, raw := cursor.Seek([]byte(after))
+		if string(k) == after {
+			k, raw = cursor.Next()
+		}
 		for len(jobs) < limit {
 			if err := o.ctx.Err(); err != nil {
 				return err
 			}
-			k, raw := nextAfter(b, key)
 			if k == nil {
 				break
 			}
@@ -114,21 +154,48 @@ func (d *Driver) MaintenanceJobs(ctx context.Context, after string, limit int) (
 			if err := decode(raw, &record); err != nil {
 				return err
 			}
-			if record.Version != 1 {
-				return core.Fail(core.InvalidUpstreamResponse, nil)
+			if err := record.validate(); err != nil {
+				return err
 			}
 			jobs = append(jobs, record.MaintenanceJob)
-			key = k
+			k, raw = cursor.Next()
 		}
 		return nil
 	})
 	return
 }
 
+func (d *Driver) maintenanceRecord(tx *bolt.Tx, id string) (r maintenanceRecord, err error) {
+	raw := tx.Bucket(jobsKey).Get([]byte(id))
+	if raw == nil {
+		return r, core.Fail(core.NotFound, nil)
+	}
+	if err = decode(raw, &r); err != nil {
+		return r, err
+	}
+	err = r.validate()
+	return r, err
+}
+
+// MaintenanceStatus reads the latest committed intent without loading shard data.
+func (d *Driver) MaintenanceStatus(ctx context.Context, id string) (job MaintenanceJob, err error) {
+	o, err := d.begin(ctx)
+	if err != nil {
+		return job, err
+	}
+	defer o.finish()
+	err = d.db.View(func(tx *bolt.Tx) error {
+		r, e := d.maintenanceRecord(tx, id)
+		job = r.MaintenanceJob
+		return e
+	})
+	return job, err
+}
+
 // RunMaintenance resumes one bounded batch from its persisted checkpoint. Native
 // receipts are saved before progress. A crash between them replays only safe,
 // conditional work; it never publishes an incomplete borrowed user stream.
-func (d *Driver) RunMaintenance(ctx context.Context, id string, limit int) (job MaintenanceJob, err error) {
+func (d *Driver) RunMaintenance(ctx context.Context, id string, limit int, options ...MaintenanceOptions) (job MaintenanceJob, err error) {
 	o, err := d.maintenanceStart(ctx, limit)
 	if err != nil {
 		return job, err
@@ -137,17 +204,15 @@ func (d *Driver) RunMaintenance(ctx context.Context, id string, limit int) (job 
 	defer d.maintenance.Unlock()
 	var record maintenanceRecord
 	err = d.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(jobsKey).Get([]byte(id))
-		if raw == nil {
-			return core.Fail(core.NotFound, nil)
-		}
-		return decode(raw, &record)
+		var e error
+		record, e = d.maintenanceRecord(tx, id)
+		return e
 	})
 	if err != nil {
 		return job, err
 	}
-	if record.Version != 1 {
-		return job, core.Fail(core.InvalidUpstreamResponse, nil)
+	if err = record.expect(options); err != nil {
+		return job, err
 	}
 	if record.Done {
 		return record.MaintenanceJob, nil
@@ -163,6 +228,7 @@ func (d *Driver) RunMaintenance(ctx context.Context, id string, limit int) (job 
 		return record.MaintenanceJob, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	record.Done = err == nil && !record.Last.More
+	record.Version = 2
 	d.state.Lock()
 	saveErr := d.update(func(tx *bolt.Tx) error { return tx.Bucket(jobsKey).Put([]byte(id), encode(record)) })
 	d.state.Unlock()
@@ -172,7 +238,7 @@ func (d *Driver) RunMaintenance(ctx context.Context, id string, limit int) (job 
 // ForgetMaintenance drops an inactive intent/receipt without undoing effects.
 // Private object ownership remains in the shard ledger. A running batch must
 // first acknowledge cancellation/return. Reusing the ID creates a new pass.
-func (d *Driver) ForgetMaintenance(ctx context.Context, id string) (core.Change, error) {
+func (d *Driver) ForgetMaintenance(ctx context.Context, id string, options ...MaintenanceOptions) (core.Change, error) {
 	o, err := d.maintenanceStart(ctx, 1)
 	if err != nil {
 		return core.Change{Effect: core.Unchanged}, err
@@ -181,16 +247,12 @@ func (d *Driver) ForgetMaintenance(ctx context.Context, id string) (core.Change,
 	defer d.maintenance.Unlock()
 	return d.commit(o.ctx, func(tx *bolt.Tx) error {
 		b := tx.Bucket(jobsKey)
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return core.Fail(core.NotFound, nil)
-		}
-		var record maintenanceRecord
-		if err := decode(raw, &record); err != nil {
+		record, err := d.maintenanceRecord(tx, id)
+		if err != nil {
 			return err
 		}
-		if record.Version != 1 {
-			return core.Fail(core.InvalidUpstreamResponse, nil)
+		if err = record.expect(options); err != nil {
+			return err
 		}
 		return b.Delete([]byte(id))
 	})

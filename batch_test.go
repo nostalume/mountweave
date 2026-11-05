@@ -13,7 +13,7 @@ import (
 	"time"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 )
 
 func TestBatchStopAndCancellation(t *testing.T) {
@@ -37,8 +37,8 @@ func TestBatchStopAndCancellation(t *testing.T) {
 				return core.Change{Effect: core.Applied}, fault
 			}})
 			results, err := c.CopyBatch(ctx, "caller", []core.CopyRequest{
-				{Source: "/from/a", Target: "/to/a"},
-				{Source: "/from/a", Target: "/to/b"},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/a")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/b")},
 			})
 			if len(results) != 1 || calls != 1 || body.closes.Load() != 1 ||
 				results[0].Change.Effect != core.Applied || !errors.Is(results[0].Err, fault) || !errors.Is(err, fault) {
@@ -49,7 +49,7 @@ func TestBatchStopAndCancellation(t *testing.T) {
 			}
 		})
 	}
-	c := newCore(t, core.Options{Authorize: func(context.Context, core.Principal, core.Action, string) error {
+	c := newCore(t, core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
 		t.Fatal("empty or canceled batch attempted authorization")
 		return nil
 	}})
@@ -65,17 +65,17 @@ func TestBatchStopAndCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	for _, requests := range [][]core.MoveRequest{nil, {{Source: "/a", Target: "/b"}}} {
+	for _, requests := range [][]core.MoveRequest{nil, {{Source: core.Path("/a"), Target: core.Path("/b")}}} {
 		if results, err := c.MoveBatch(ctx, "alice", requests); len(results) != 0 || !errors.Is(err, context.Canceled) {
 			t.Fatal(results, err)
 		}
 	}
-	for _, targets := range [][]string{nil, {"/not-started"}} {
+	for _, targets := range [][]core.Address{nil, {core.Path("/not-started")}} {
 		if results, err := c.RemoveBatch(ctx, "alice", targets); len(results) != 0 || !errors.Is(err, context.Canceled) {
 			t.Fatal(results, err)
 		}
 	}
-	for _, requests := range [][]core.CopyRequest{nil, {{Source: "/a", Target: "/b"}}} {
+	for _, requests := range [][]core.CopyRequest{nil, {{Source: core.Path("/a"), Target: core.Path("/b")}}} {
 		if results, err := c.CopyBatch(ctx, "alice", requests); len(results) != 0 || !errors.Is(err, context.Canceled) {
 			t.Fatal(results, err)
 		}
@@ -115,7 +115,7 @@ func TestBoundedBatches(t *testing.T) {
 				close(second)
 				<-releaseSecond
 			}
-			change, err := target.Create(ctx, name, input, length)
+			change, err := target.Create(ctx, core.NativePath(name), input, length)
 			if name == "/y" {
 				close(secondDone)
 			}
@@ -131,11 +131,11 @@ func TestBoundedBatches(t *testing.T) {
 		done := make(chan outcome, 1)
 		go func() {
 			rows, err := c.CopyBatch(context.Background(), "caller", []core.CopyRequest{
-				{Source: "/from/a", Target: "/to/x"},
-				{Source: "/from/a", Target: "/to/y"},
-				{Source: "/from/a", Target: "/alias/x"},
-				{Source: "/from/a", Target: "/to/x"},
-				{Source: "/from/a", Target: "/to/not-started"},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/x")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/y")},
+				{Source: core.Path("/from/a"), Target: core.Path("/alias/x")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/x")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/not-started")},
 			}, core.ExecutionOptions{Concurrency: 2})
 			done <- outcome{rows, err}
 		}()
@@ -178,7 +178,7 @@ func TestBoundedBatches(t *testing.T) {
 		installCopyMount(t, c, "/from", source)
 		acknowledged := make(chan struct{}, 2)
 		installCopyMount(t, c, "/to", &copyWriter{Driver: target, create: func(ctx context.Context, name string, input io.Reader, length *int64) (core.Change, error) {
-			change, err := target.Create(ctx, name, input, length)
+			change, err := target.Create(ctx, core.NativePath(name), input, length)
 			acknowledged <- struct{}{}
 			<-ctx.Done()
 			return change, errors.Join(err, ctx.Err())
@@ -192,9 +192,9 @@ func TestBoundedBatches(t *testing.T) {
 		done := make(chan outcome, 1)
 		go func() {
 			rows, err := c.CopyBatch(ctx, "caller", []core.CopyRequest{
-				{Source: "/from/a", Target: "/to/x"},
-				{Source: "/from/a", Target: "/to/y"},
-				{Source: "/from/a", Target: "/to/not-started"},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/x")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/y")},
+				{Source: core.Path("/from/a"), Target: core.Path("/to/not-started")},
 			}, core.ExecutionOptions{Concurrency: 2})
 			done <- outcome{rows, err}
 		}()
@@ -271,10 +271,10 @@ func TestBoundedBatches(t *testing.T) {
 			done := make(chan outcome, 1)
 			go func() {
 				rows, err := c.MoveBatch(ctx, "alice", []core.MoveRequest{
-					{Source: "/files/tree", Target: "/files/moved"},
-					{Source: "/files/other", Target: "/files/independent"},
-					{Source: "/alias/" + child, Target: "/files/late"},
-					{Source: "/files/tail", Target: "/files/bypassed"},
+					{Source: core.Path("/files/tree"), Target: core.Path("/files/moved")},
+					{Source: core.Path("/files/other"), Target: core.Path("/files/independent")},
+					{Source: core.Path("/alias/" + child), Target: core.Path("/files/late")},
+					{Source: core.Path("/files/tail"), Target: core.Path("/files/bypassed")},
 				}, core.ExecutionOptions{Concurrency: 2})
 				done <- outcome{rows, err}
 			}()

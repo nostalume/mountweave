@@ -9,16 +9,43 @@ transfers Driver ownership; Close never closes the borrowed client or transport.
 
 ## Namespace and reads
 
-A key and a directory prefix of the same name are ambiguous, including ancestors.
+`core.Path(...)` selects the tree view. A key and a directory prefix of the same
+name are ambiguous in this view, including ancestors.
 Proving absence requires successful HEAD/prefix observations; denied access is
 never absence. The root represents the prepared namespace, not proof of a bucket.
 Listings preserve native order/continuations and decode URI-encoded keys once.
 They retain one batch, not a snapshot. Open validates actual lengths and ranges;
 a full response to a range request remains full. The Core owns returned bodies.
 
+`core.Key("/cloud", rawKey)` selects the native key view of the same installed
+Driver. `a`, `a/b`, `a/`, `a//b`, leading slashes and dot components remain distinct.
+The prepared prefix is concatenated once; no path cleaning, ancestor HEAD or
+directory probe occurs. Stat uses one HEAD and StreamRead Open one GET. The native limit
+includes the configured prefix (1,024 UTF-8 bytes). Tree-only operations refuse
+keys before effects; an object ending in `/` remains a file.
+
+List accepts `core.Keys(space, prefix, delimiter).After(startAfter)`. Prefix and
+delimiter are literal; an empty delimiter lists keys without groups. Returned
+key addresses are complete keys relative to the prepared prefix, not basenames.
+CommonPrefixes become explicit PrefixGroup selectors. Core cursors bind the full
+query; native continuations remain opaque. Both views share the same Driver,
+buffer budget and retirement owner, with pure exact-key/prefix conflict projection.
+
 OpenDirectory retains enumerated child names in that call's prefix. OpenFile
 reuses this membership without repeating ancestor probes. Close clears the scope;
 it is neither a snapshot nor a version-bound delete capability.
+
+`OpenOptions{Mode: core.BoundRead}` uses the same Open entry. An initial metadata
+observation must return a non-null native VersionId; unversioned objects are
+refused even if they have ETags. The returned File has `PinnedVersion` strength.
+ReadAt issues one exact Range GET per nonempty in-bounds call and closes its body;
+Stat issues HEAD. Both address the captured literal key and VersionId, without
+tree/ancestor probes or current-key fallback. A deleted historical version fails.
+The opening context does not survive handoff; each method has its own context,
+and Close cancels and joins active native requests. Failed body cleanup remains
+owned by that File and prevents successful retirement. No entire-file cache or
+download is needed. Native permissions must allow access to the selected version;
+see [GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
 
 ## Mutations and transfer options
 
@@ -104,12 +131,25 @@ checkpoints or client resume tokens. No public live upload session is introduced
 
 ## Durable continuation
 
+Complete ordinary publication uses `WriteOptions{Policy: core.Publish()}` or
+`core.Publish(core.IfAbsent())`, reusing the buffered/multipart pipeline above.
+IfAbsent is enforced on PUT or CompleteMultipartUpload. Optional ObserveTarget
+adds one destination HEAD for unconditional publication and returns Change.Before;
+the observation is not a CAS. Ordinary calls do not acquire that extra metadata.
+Single strong `IfMatch` publication uses the actual PUT/Complete `If-Match`.
+Presence-only replacement, finite negative write tags and multi-tag sets are
+refused before input; they are never approximated by a HEAD followed by PUT.
+Reads forward supported single tag/presence guards to GET and expose its ETag.
+`ReadSelection.Version` sends an explicit non-null VersionId; it does not infer
+object identity from an ETag. Remove supports single strong Match and Present
+through native DeleteObject.IfMatch; directory removal restrictions still apply.
+
 An explicit `Core.Write(..., WriteOptions{Continuation: ...})` selects native
 continuation. It requires a known length, `core.Replayable` source, synchronous
 checkpoint persistence, buffered options and a nonempty `Options.ResumeScope`.
 The host makes ResumeScope a stable account/service identity, without credentials.
 Changing that identity, bucket/key, source version, length, part size or replacement
-mode rejects an old checkpoint before data is sent. Copy/tree options currently
+predicate rejects an old checkpoint before data is sent. Copy/tree options currently
 refuse continuation; one file's checkpoint cannot govern a composite operation.
 
 The optional `transfer` consumer owns the protected record, source hold and host
@@ -117,10 +157,12 @@ configuration ID/revision. It calls the same Core.Write. Direct library consumer
 can supply their own durable ownership. This mode always uses multipart, including
 small/empty input, so a single native session identity governs recovery.
 
-The version-2 recovery log records initialization identity, individual ETag
+The version-3 recovery log records the original predicate once at initialization,
+individual ETag
 receipts and phase transitions. Each acknowledgement appends only its new fact;
 normal N-part receipt encoding/retention is O(N), with O(N) replay/state on resume.
-The host atomically persists the intent revision and appended bytes. Incompatible
+Version-2 boolean checkpoints remain readable and can append new records without
+rewriting old bytes. The host atomically persists the intent revision and appended bytes. Incompatible
 or malformed records are refused before sending data; no implicit new session is
 created from a failed replay. A failed/uncertain append stops further saves in
 that execution until a new Run reloads the revision. Full historical checkpoint

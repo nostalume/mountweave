@@ -16,10 +16,10 @@ import (
 	"time"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 )
 
-func allow(ctx context.Context, p core.Principal, a core.Action, target string) error {
+func allow(ctx context.Context, p core.Principal, a core.Action, targetAddress core.Address) error {
 	if p != "alice" {
 		return errors.New("denied")
 	}
@@ -98,22 +98,22 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
 	mountLocal(t, c, root)
-	parent, err := c.Stat(context.Background(), "alice", "/")
+	parent, err := c.Stat(context.Background(), "alice", core.Path("/"))
 	if err != nil || !parent.Virtual || parent.Kind != core.Directory || parent.Size != nil {
 		t.Fatalf("virtual root: %+v %v", parent, err)
 	}
-	entry, err := c.Stat(context.Background(), "alice", "/files/CaseName.bin")
+	entry, err := c.Stat(context.Background(), "alice", core.Path("/files/CaseName.bin"))
 	if err != nil || entry.Size == nil || *entry.Size != int64(len(data)) {
 		t.Fatalf("stat: %+v %v", entry, err)
 	}
-	_, err = c.Open(context.Background(), "alice", "/files/casename.bin", nil)
+	_, err = c.Open(context.Background(), "alice", core.Path("/files/casename.bin"), core.OpenOptions{})
 	code(t, err, core.NotFound)
 	tests := []struct {
 		r          *core.Range
 		start, end int
 	}{{nil, 0, len(data)}, {&core.Range{Start: 65535, End: 65537}, 65535, 65538}, {&core.Range{Start: len64(data) - 7, End: -1}, len(data) - 7, len(data)}, {&core.Range{Start: 17, End: -1, Suffix: true}, len(data) - 17, len(data)}}
 	for _, test := range tests {
-		o, err := c.Open(context.Background(), "alice", entry.Path, test.r)
+		o, err := c.Open(context.Background(), "alice", core.Path(entry.Address.Value()), core.OpenOptions{Range: test.r})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +128,7 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	empty, err := c.Open(context.Background(), "alice", "/files/empty", nil)
+	empty, err := c.Open(context.Background(), "alice", core.Path("/files/empty"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,10 +136,10 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 	if err != nil || len(b) != 0 {
 		t.Fatalf("empty: %q %v", b, err)
 	}
-	_, err = c.Open(context.Background(), "alice", "/files/empty", &core.Range{Start: 0, End: 0})
+	_, err = c.Open(context.Background(), "alice", core.Path("/files/empty"), core.OpenOptions{Range: &core.Range{Start: 0, End: 0}})
 	code(t, err, core.RangeNotSatisfiable)
 	write(t, root, "CaseName.bin", []byte("new"))
-	o, err := c.Open(context.Background(), "alice", entry.Path, nil)
+	o, err := c.Open(context.Background(), "alice", core.Path(entry.Address.Value()), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 		t.Fatal("used old metadata length")
 	}
 	_ = o.Body.Close()
-	_, err = c.Open(context.Background(), "alice", "/files", nil)
+	_, err = c.Open(context.Background(), "alice", core.Path("/files"), core.OpenOptions{})
 	code(t, err, core.NotFile)
 }
 func len64(b []byte) int64 { return int64(len(b)) }
@@ -169,7 +169,7 @@ func TestLinksAndNames(t *testing.T) {
 	if err := os.Symlink("../outside.txt", filepath.Join(root, "outside-link")); err != nil {
 		t.Fatal(err)
 	}
-	o, err := c.Open(context.Background(), "alice", "/files/inside-link", nil)
+	o, err := c.Open(context.Background(), "alice", core.Path("/files/inside-link"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,13 +177,13 @@ func TestLinksAndNames(t *testing.T) {
 	if err != nil || string(b) != "inside" {
 		t.Fatal(string(b), err)
 	}
-	if _, err := c.Open(context.Background(), "alice", "/files/outside-link", nil); err == nil {
+	if _, err := c.Open(context.Background(), "alice", core.Path("/files/outside-link"), core.OpenOptions{}); err == nil {
 		t.Fatal("outside link opened")
 	}
-	if _, err := c.Stat(context.Background(), "alice", "/files/utf8-\u6d4b\u8bd5.txt"); err != nil {
+	if _, err := c.Stat(context.Background(), "alice", core.Path("/files/utf8-\u6d4b\u8bd5.txt")); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := c.Remove(context.Background(), "alice", "/files/outside-link")
+	changed, err := c.Remove(context.Background(), "alice", core.Path("/files/outside-link"))
 	if err != nil || changed.Effect != core.Applied {
 		t.Fatal(changed, err)
 	}
@@ -200,7 +200,7 @@ func TestPaginationReplayScopeAndRetirement(t *testing.T) {
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
 	m := mountLocal(t, c, root)
-	req := core.ListRequest{Path: "/files", Limit: 70, CursorTTL: time.Minute}
+	req := core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 70, CursorTTL: time.Minute}
 	first, err := c.List(context.Background(), "alice", req)
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestPaginationReplayScopeAndRetirement(t *testing.T) {
 	_, err = c.List(context.Background(), "alice", changed)
 	code(t, err, core.CursorUnavailable)
 	changed = req
-	changed.Path = "/"
+	changed.Query = core.Children(core.Path("/"))
 	_, err = c.List(context.Background(), "alice", changed)
 	code(t, err, core.CursorUnavailable)
 	count := len(first.Items) + len(replay.Items)
@@ -283,18 +283,18 @@ func TestCursorExpiryAndCapacity(t *testing.T) {
 	c := newCore(t, core.Options{MaxCursors: 1})
 	defer closeCore(t, c)
 	mountLocal(t, c, root)
-	first, err := c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: 100 * time.Millisecond})
+	first, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: 100 * time.Millisecond})
+	_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: 100 * time.Millisecond})
 	code(t, err, core.CapacityExceeded)
 	<-time.After(time.Until(*first.CursorExpiresAt) + 20*time.Millisecond)
-	_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *first.NextCursor})
+	_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor})
 	code(t, err, core.CursorUnavailable)
 	deadline := time.Now().Add(time.Second)
 	for {
-		_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: 100 * time.Millisecond})
+		_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: 100 * time.Millisecond})
 		if err == nil {
 			break
 		}
@@ -314,7 +314,17 @@ type fakeDriver struct {
 	closes atomic.Int32
 }
 
-func (d *fakeDriver) Stat(ctx context.Context, p string) (core.Metadata, error) {
+func (d *fakeDriver) Stat(ctx context.Context, pAddress core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
+	defer func() {
+		if err == nil && len(selections) == 1 {
+			err = selections[0].Check(meta.Evidence)
+		}
+	}()
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	d.calls.Add(1)
 	if d.stat != nil {
 		return d.stat(ctx, p)
@@ -322,7 +332,18 @@ func (d *fakeDriver) Stat(ctx context.Context, p string) (core.Metadata, error) 
 	n := int64(3)
 	return core.Metadata{Name: "a", Kind: core.File, Size: &n}, nil
 }
-func (d *fakeDriver) Open(ctx context.Context, p string, r *core.Range) (core.Opened, error) {
+func (d *fakeDriver) Open(ctx context.Context, pAddress core.NativeAddress, options core.OpenOptions) (opened core.Opened, err error) {
+	r := options.Range
+	defer func() {
+		if err == nil {
+			err = options.Selection.Check(opened.Metadata.Evidence)
+		}
+	}()
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	d.calls.Add(1)
 	if d.open != nil {
 		return d.open(ctx, p, r)
@@ -330,7 +351,12 @@ func (d *fakeDriver) Open(ctx context.Context, p string, r *core.Range) (core.Op
 	n := int64(3)
 	return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File, Size: &n}, Length: &n, Body: io.NopCloser(strings.NewReader("abc"))}, nil
 }
-func (d *fakeDriver) Enumerate(ctx context.Context, p string) (core.Iterator, error) {
+func (d *fakeDriver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core.Iterator, error) {
+	if pAddress.Address().Namespace() != core.TreeNamespace || pAddress.Delimiter() != "" || pAddress.StartAfter() != "" {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Address().Value()
+
 	d.calls.Add(1)
 	if d.enum != nil {
 		return d.enum(ctx, p)
@@ -357,13 +383,13 @@ func TestAuthorizationBeforeDriverAndMountIdentity(t *testing.T) {
 	defer closeCore(t, c)
 	d := &fakeDriver{}
 	m := installFake(t, c, d)
-	_, err := c.Open(context.Background(), "bob", "/files/a", nil)
+	_, err := c.Open(context.Background(), "bob", core.Path("/files/a"), core.OpenOptions{})
 	code(t, err, core.PermissionDenied)
 	if d.calls.Load() != 0 {
 		t.Fatal("I/O before authorization")
 	}
-	for _, action := range []func() (core.Change, error){func() (core.Change, error) { return c.Mkdir(context.Background(), "bob", "/files/new") }, func() (core.Change, error) { return c.Remove(context.Background(), "bob", "/files/a") }, func() (core.Change, error) {
-		return c.Create(context.Background(), "bob", "/files/new", strings.NewReader("x"), nil)
+	for _, action := range []func() (core.Change, error){func() (core.Change, error) { return c.Mkdir(context.Background(), "bob", core.Path("/files/new")) }, func() (core.Change, error) { return c.Remove(context.Background(), "bob", core.Path("/files/a")) }, func() (core.Change, error) {
+		return c.Create(context.Background(), "bob", core.Path("/files/new"), strings.NewReader("x"), nil)
 	}} {
 		result, err := action()
 		code(t, err, core.PermissionDenied)
@@ -372,7 +398,7 @@ func TestAuthorizationBeforeDriverAndMountIdentity(t *testing.T) {
 		}
 	}
 	input := strings.NewReader("unread")
-	result, err := c.Create(context.Background(), "alice", "/files/new", input, nil)
+	result, err := c.Create(context.Background(), "alice", core.Path("/files/new"), input, nil)
 	code(t, err, core.UnsupportedOperation)
 	if result.Effect != core.Unchanged || input.Len() != 6 || d.calls.Load() != 0 {
 		t.Fatal("unsupported mutation consumed input or called driver")
@@ -393,7 +419,7 @@ func TestAuthorizationBeforeDriverAndMountIdentity(t *testing.T) {
 	if err = m.Retire(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	o, err := c.Open(context.Background(), "alice", "/files/a", nil)
+	o, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,75 +448,125 @@ func (b *blockingBody) Close() error {
 	}
 	return nil
 }
+
+type blockingFile struct{ *blockingBody }
+
+func (f *blockingFile) WriteAt(ctx context.Context, p []byte, _ int64) (int, core.Change, error) {
+	_, _ = f.Read(p)
+	return 0, core.Change{Effect: core.Unchanged}, ctx.Err()
+}
+func (f *blockingFile) Append(ctx context.Context, p []byte) (int, core.Change, error) {
+	return f.WriteAt(ctx, p, 0)
+}
+func (f *blockingFile) Truncate(context.Context, int64) (core.Change, error) {
+	return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+}
+func (f *blockingFile) Sync(context.Context) error { return nil }
+
+func (f *blockingFile) ReadAt(_ context.Context, p []byte, _ int64) (int, error) { return f.Read(p) }
+func (f *blockingFile) Stat(context.Context) (core.Metadata, error) {
+	return core.Metadata{Name: "a", Kind: core.File}, nil
+}
 func TestRetirementWaitsForReadAcknowledgment(t *testing.T) {
-	b := &blockingBody{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
-	var opened atomic.Int32
-	d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
-		if opened.Add(1) == 1 {
-			return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Body: b}, nil
-		}
-		n := int64(3)
-		return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Length: &n, Body: io.NopCloser(strings.NewReader("abc"))}, nil
-	}}
-	c := newCore(t, core.Options{})
-	defer closeCore(t, c)
-	m := installFake(t, c, d)
-	defer func() {
-		select {
-		case <-b.release:
-		default:
+	for _, mode := range []core.OpenMode{core.StreamRead, core.BoundRead, core.LiveEdit} {
+		t.Run(string(mode), func(t *testing.T) {
+			b := &blockingBody{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+			var opened atomic.Int32
+			d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
+				if opened.Add(1) == 1 {
+					if mode != core.StreamRead {
+						return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, File: &blockingFile{b}, Binding: core.BoundObject, Change: core.Change{Effect: core.Unchanged}}, nil
+					}
+					return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Body: b}, nil
+				}
+				n := int64(3)
+				return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Length: &n, Body: io.NopCloser(strings.NewReader("abc"))}, nil
+			}}
+			c := newCore(t, core.Options{})
+			defer closeCore(t, c)
+			m := installFake(t, c, d)
+			defer func() {
+				select {
+				case <-b.release:
+				default:
+					close(b.release)
+				}
+			}()
+			first, cancelFirst := context.WithCancel(context.Background())
+			defer cancelFirst()
+			o, err := c.Open(first, "alice", core.Path("/files/a"), core.OpenOptions{Mode: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			readDone := make(chan struct{})
+			call, cancelCall := context.WithCancel(context.Background())
+			defer cancelCall()
+			go func() {
+				if mode != core.StreamRead {
+					if mode == core.LiveEdit {
+						_, _, _ = o.File.WriteAt(call, []byte("x"), 0)
+					} else {
+						_, _ = o.File.ReadAt(call, make([]byte, 1), 0)
+					}
+				} else {
+					_, _ = o.Body.Read(make([]byte, 1))
+				}
+				close(readDone)
+			}()
+			await(t, b.started)
+			peer, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancelFirst()
+			if mode == core.StreamRead {
+				await(t, b.closed)
+			} else {
+				cancelCall()
+				select {
+				case <-b.closed:
+					t.Fatal("call cancellation closed File")
+				default:
+				}
+			}
+			data, err := io.ReadAll(peer.Body)
+			if err != nil || string(data) != "abc" {
+				t.Fatalf("independent read canceled: %q %v", data, err)
+			}
+			if d.closes.Load() != 0 {
+				t.Fatal("shared driver closed before blocked read acknowledged")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			if err = m.Retire(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("retire: %v", err)
+			}
+			await(t, b.closed)
+			if d.closes.Load() != 0 {
+				t.Fatal("driver closed while read was still executing")
+			}
+			_, err = c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{})
+			code(t, err, core.MountUnavailable)
+			_, err = c.Install("/files", &fakeDriver{})
+			code(t, err, core.PathAmbiguous)
+			if b.closes.Load() != 1 {
+				t.Fatal("duplicate close")
+			}
 			close(b.release)
-		}
-	}()
-	first, cancelFirst := context.WithCancel(context.Background())
-	defer cancelFirst()
-	o, err := c.Open(first, "alice", "/files/a", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	readDone := make(chan struct{})
-	go func() { _, _ = o.Body.Read(make([]byte, 1)); close(readDone) }()
-	await(t, b.started)
-	peer, err := c.Open(context.Background(), "alice", "/files/a", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancelFirst()
-	await(t, b.closed)
-	data, err := io.ReadAll(peer.Body)
-	if err != nil || string(data) != "abc" {
-		t.Fatalf("independent read canceled: %q %v", data, err)
-	}
-	if d.closes.Load() != 0 {
-		t.Fatal("shared driver closed before blocked read acknowledged")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	if err = m.Retire(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("retire: %v", err)
-	}
-	await(t, b.closed)
-	if d.closes.Load() != 0 {
-		t.Fatal("driver closed while read was still executing")
-	}
-	_, err = c.Open(context.Background(), "alice", "/files/a", nil)
-	code(t, err, core.MountUnavailable)
-	_, err = c.Install("/files", &fakeDriver{})
-	code(t, err, core.PathAmbiguous)
-	if b.closes.Load() != 1 {
-		t.Fatal("duplicate close")
-	}
-	close(b.release)
-	await(t, readDone)
-	ctx2, stop := context.WithTimeout(context.Background(), time.Second)
-	defer stop()
-	if err = m.Retire(ctx2); err != nil {
-		t.Fatal(err)
-	}
-	if d.closes.Load() != 1 {
-		t.Fatal("driver was not closed exactly once")
+			await(t, readDone)
+			ctx2, stop := context.WithTimeout(context.Background(), time.Second)
+			defer stop()
+			if err = m.Retire(ctx2); err != nil {
+				t.Fatal(err)
+			}
+			if d.closes.Load() != 1 {
+				t.Fatal("driver was not closed exactly once")
+			}
+
+		})
 	}
 }
+
 func TestRetirementDoesNotDuplicateBlockedDriverClose(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	d := &fakeDriver{close: func() error { close(started); <-release; return nil }}
@@ -518,7 +594,7 @@ func TestOpenTimerDoesNotKillAdoptedBody(t *testing.T) {
 	c := newCore(t, core.Options{OpenTimeout: 20 * time.Millisecond})
 	defer closeCore(t, c)
 	installFake(t, c, &fakeDriver{})
-	o, err := c.Open(context.Background(), "alice", "/files/a", nil)
+	o, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -529,20 +605,29 @@ func TestOpenTimerDoesNotKillAdoptedBody(t *testing.T) {
 	}
 }
 func TestOpenTimeoutCleansLateBody(t *testing.T) {
-	closed := atomic.Int32{}
-	d := &fakeDriver{open: func(ctx context.Context, _ string, _ *core.Range) (core.Opened, error) {
-		<-ctx.Done()
-		return core.Opened{Body: &countedBody{Reader: strings.NewReader("late"), closed: &closed}}, ctx.Err()
-	}}
-	c := newCore(t, core.Options{OpenTimeout: 10 * time.Millisecond})
-	defer closeCore(t, c)
-	installFake(t, c, d)
-	_, err := c.Open(context.Background(), "alice", "/files/a", nil)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal(err)
-	}
-	if closed.Load() != 1 {
-		t.Fatal("late body was not closed")
+	for _, mode := range []core.OpenMode{core.StreamRead, core.BoundRead} {
+		t.Run(string(mode), func(t *testing.T) {
+			closed := atomic.Int32{}
+			d := &fakeDriver{open: func(ctx context.Context, _ string, _ *core.Range) (core.Opened, error) {
+				<-ctx.Done()
+				resource := &countedBody{Reader: strings.NewReader("late"), closed: &closed}
+				if mode == core.BoundRead {
+					return core.Opened{File: &countedFile{resource}}, ctx.Err()
+				}
+				return core.Opened{Body: resource}, ctx.Err()
+			}}
+			c := newCore(t, core.Options{OpenTimeout: 10 * time.Millisecond})
+			defer closeCore(t, c)
+			installFake(t, c, d)
+			_, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{Mode: mode})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal(err)
+			}
+			if closed.Load() != 1 {
+				t.Fatal("late body was not closed")
+			}
+
+		})
 	}
 }
 
@@ -553,37 +638,70 @@ type countedBody struct {
 }
 
 func (b *countedBody) Close() error { b.closed.Add(1); return b.err }
+
+type countedFile struct{ *countedBody }
+
+func (f *countedFile) ReadAt(_ context.Context, p []byte, offset int64) (int, error) {
+	return f.Reader.(io.ReaderAt).ReadAt(p, offset)
+}
+func (f *countedFile) Stat(context.Context) (core.Metadata, error) {
+	return core.Metadata{Name: "a", Kind: core.File}, nil
+}
 func TestShortReadAndCleanupErrorSurvive(t *testing.T) {
-	cleanup := errors.New("cleanup failed")
-	closed := atomic.Int32{}
-	d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
-		n := int64(9)
-		return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Length: &n, Body: &countedBody{Reader: strings.NewReader("abc"), closed: &closed, err: cleanup}}, nil
-	}}
-	c := newCore(t, core.Options{})
-	m := installFake(t, c, d)
-	o, err := c.Open(context.Background(), "alice", "/files/a", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = io.Copy(io.Discard, o.Body)
-	if !errors.Is(err, io.ErrUnexpectedEOF) || !errors.Is(err, cleanup) {
-		t.Fatalf("lost failure: %v", err)
-	}
-	_ = o.Body.Close()
-	if closed.Load() != 1 {
-		t.Fatal("duplicate close")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	err = m.Retire(ctx)
-	if !errors.Is(err, cleanup) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("unacknowledged cleanup: %v", err)
-	}
-	if d.closes.Load() != 0 {
-		t.Fatal("closed driver after unconfirmed cleanup")
+	for _, mode := range []core.OpenMode{core.StreamRead, core.BoundRead} {
+		t.Run(string(mode), func(t *testing.T) {
+			cleanup := errors.New("cleanup failed")
+			closed := atomic.Int32{}
+			d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
+				n := int64(9)
+				resource := &countedBody{Reader: strings.NewReader("abc"), closed: &closed, err: cleanup}
+				if mode == core.BoundRead {
+					return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, File: &countedFile{resource}, Binding: core.BoundObject}, nil
+				}
+				return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Length: &n, Body: resource}, nil
+			}}
+			c := newCore(t, core.Options{})
+			m := installFake(t, c, d)
+			o, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{Mode: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			short := io.ErrUnexpectedEOF
+			if mode == core.BoundRead {
+				n, readErr := o.File.ReadAt(context.Background(), make([]byte, 9), 0)
+				if n != 3 || readErr != io.EOF || closed.Load() != 0 {
+					t.Fatal(n, readErr, closed.Load())
+				}
+				short = io.EOF
+				err = errors.Join(readErr, o.File.Close())
+			} else {
+				_, err = io.Copy(io.Discard, o.Body)
+			}
+			if !errors.Is(err, short) || !errors.Is(err, cleanup) {
+				t.Fatalf("lost failure: %v", err)
+			}
+			if mode == core.BoundRead {
+				_ = o.File.Close()
+			} else {
+				_ = o.Body.Close()
+			}
+			if closed.Load() != 1 {
+				t.Fatal("duplicate close")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			err = m.Retire(ctx)
+			if !errors.Is(err, cleanup) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unacknowledged cleanup: %v", err)
+			}
+			if d.closes.Load() != 0 {
+				t.Fatal("closed driver after unconfirmed cleanup")
+			}
+
+		})
 	}
 }
+
 func TestRanges(t *testing.T) {
 	tests := []struct {
 		r    core.Range
@@ -626,7 +744,7 @@ func TestCancellationIsNotSuccessfulEOF(t *testing.T) {
 			installFake(t, c, d)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			o, err := c.Open(ctx, "alice", "/files/a", nil)
+			o, err := c.Open(ctx, "alice", core.Path("/files/a"), core.OpenOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -688,7 +806,7 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 			if installErr != nil {
 				t.Fatal(installErr)
 			}
-			first, err := c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute})
+			first, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -696,16 +814,16 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 			defer cancelRequest()
 			nextDone := make(chan error, 1)
 			go func() {
-				_, err := c.List(requestCtx, "alice", core.ListRequest{Path: "/files", Cursor: *first.NextCursor})
+				_, err := c.List(requestCtx, "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor})
 				nextDone <- err
 			}()
 			await(t, iterator.nextStarted)
-			_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *first.NextCursor})
+			_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor})
 			code(t, err, core.CapacityExceeded)
 			if trigger == "request" {
 				cancelRequest()
 			} else {
-				result, changeErr := c.Mkdir(context.Background(), "alice", "/files/new")
+				result, changeErr := c.Mkdir(context.Background(), "alice", core.Path("/files/new"))
 				if changeErr != nil || result.Effect != core.Applied {
 					t.Fatal(result, changeErr)
 				}
@@ -719,8 +837,8 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 				t.Fatal("Next did not observe cancellation")
 			}
 			await(t, iterator.closeStarted)
-			code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *first.NextCursor}), core.CursorUnavailable)
-			_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/", Limit: 1, CursorTTL: time.Minute})
+			code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor}), core.CursorUnavailable)
+			_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/")), Limit: 1, CursorTTL: time.Minute})
 			code(t, err, core.CapacityExceeded)
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			err = m.Retire(ctx)
@@ -748,7 +866,7 @@ func TestInvalidRangeResponseIsClosed(t *testing.T) {
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
 	installFake(t, c, d)
-	_, err := c.Open(context.Background(), "alice", "/files/a", &core.Range{Start: 0, End: 1})
+	_, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{Range: &core.Range{Start: 0, End: 1}})
 	code(t, err, core.InvalidUpstreamResponse)
 	if closes.Load() != 1 {
 		t.Fatal("invalid response body leaked")
@@ -789,7 +907,7 @@ func TestExplicitCursorRelease(t *testing.T) {
 	write(t, root, "a", nil)
 	write(t, root, "b", nil)
 	var revoked atomic.Bool
-	c := newCore(t, core.Options{MaxCursors: 1, Authorize: func(context.Context, core.Principal, core.Action, string) error {
+	c := newCore(t, core.Options{MaxCursors: 1, Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
 		if revoked.Load() {
 			return errors.New("revoked")
 		}
@@ -797,7 +915,7 @@ func TestExplicitCursorRelease(t *testing.T) {
 	}})
 	defer closeCore(t, c)
 	mountLocal(t, c, root)
-	first, err := c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute})
+	first, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,9 +925,9 @@ func TestExplicitCursorRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	revoked.Store(false)
-	_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *first.NextCursor})
+	_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor})
 	code(t, err, core.CursorUnavailable)
-	if _, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute}); err != nil {
+	if _, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute}); err != nil {
 		t.Fatal("released cursor still occupied capacity", err)
 	}
 }
@@ -835,14 +953,14 @@ func TestRenamedRootRemainsAnchored(t *testing.T) {
 	if err := os.Symlink(outside, root); err != nil {
 		t.Skipf("root replacement link unavailable: %v", err)
 	}
-	page, err := c.List(context.Background(), "alice", core.ListRequest{Path: "/files", CursorTTL: time.Minute})
+	page, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), CursorTTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Items) != 1 || page.Items[0].Size == nil || *page.Items[0].Size != 4 {
 		t.Fatalf("metadata escaped the opened root: %+v", page)
 	}
-	o, err := c.Open(context.Background(), "alice", "/files/item", nil)
+	o, err := c.Open(context.Background(), "alice", core.Path("/files/item"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,10 +975,10 @@ func TestCursorLifetimeBelongsToEnumeration(t *testing.T) {
 	defer closeCore(t, c)
 	d := &fakeDriver{}
 	installFake(t, c, d)
-	if _, err := c.Stat(context.Background(), "alice", "/files/a"); err != nil {
+	if _, err := c.Stat(context.Background(), "alice", core.Path("/files/a")); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := c.Open(context.Background(), "alice", "/files/a", nil)
+	opened, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +986,7 @@ func TestCursorLifetimeBelongsToEnumeration(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := d.calls.Load()
-	_, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files"})
+	_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files"))})
 	code(t, err, core.InvalidRequest)
 	if d.calls.Load() != before {
 		t.Fatal("missing enumeration lifetime reached driver")
@@ -880,11 +998,11 @@ func TestCursorLifetimeBelongsToEnumeration(t *testing.T) {
 	other := newCore(t, core.Options{})
 	defer closeCore(t, other)
 	mountLocal(t, other, root)
-	page, err := other.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute})
+	page, err := other.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
 	if err != nil || page.NextCursor == nil {
 		t.Fatalf("first page: %v %v", page, err)
 	}
-	req := core.ListRequest{Path: "/files", Cursor: *page.NextCursor, CursorTTL: time.Second}
+	req := core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor, CursorTTL: time.Second}
 	_, err = other.List(context.Background(), "alice", req)
 	code(t, err, core.CursorUnavailable)
 	if err = other.CheckCursor(context.Background(), "alice", req); core.CodeOf(err) != core.CursorUnavailable {

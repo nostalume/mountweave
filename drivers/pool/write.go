@@ -13,16 +13,32 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
-	return d.write(ctx, p, input, length, false)
+func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation,
+			nil)
+	}
+	p := pAddress.Value()
+
+	return d.write(ctx, p, input, length, core.PublicationOptions{When: core.IfAbsent()})
 }
-func (d *Driver) Publish(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
-	return d.write(ctx, p, input, length, true)
+func (d *Driver) Publish(ctx context.Context, pAddress core.NativeAddress, input io.Reader, length *int64, options core.PublicationOptions) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation,
+			nil)
+	}
+	p := pAddress.Value()
+
+	return d.write(ctx, p, input, length, options)
 }
 
 // The parent identity is captured before input. The final name is resolved in
 // that same directory, even after a rename; an unlinked parent cannot publish.
-func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *int64, replace bool) (result core.Change, err error) {
+func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *int64, options core.PublicationOptions) (result core.Change, err error) {
+	replace := !options.When.IsAbsent()
+	if err := options.When.ForDomain("pool-generation"); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
 	result.Effect = core.Unchanged
 	if err = core.ValidatePath(p); err != nil {
 		return
@@ -134,12 +150,16 @@ func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *i
 	if length != nil && f.Length != *length {
 		return result, io.ErrUnexpectedEOF
 	}
-	return d.commit(o.ctx, func(tx *bolt.Tx) error {
+	before := core.TargetUnknown
+	result, err = d.commit(o.ctx, func(tx *bolt.Tx) error {
 		if tx.Bucket(dirsKey).Get([]byte(parent)) == nil {
 			return core.Fail(core.NotFound, nil)
 		}
 		entry := entryRecord{ID: f.ID, Generation: f.ID}
+		before = core.TargetMissing
+		var previous core.Evidence
 		if raw := tx.Bucket(entriesKey).Get([]byte(key)); raw != nil {
+			before = core.TargetPresent
 			var old entryRecord
 			if e := decode(raw, &old); e != nil {
 				return e
@@ -150,10 +170,16 @@ func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *i
 			if !replace {
 				return core.Fail(core.AlreadyExists, nil)
 			}
+			previous = metadata(name, old, fileRecord{ID: old.Generation}).Evidence
+			if err := options.When.Check(previous, true); err != nil {
+				return err
+			}
 			entry.ID = old.ID
 			if e := markUnreferenced(tx, old.Generation); e != nil {
 				return e
 			}
+		} else if err := options.When.Check(previous, false); err != nil {
+			return err
 		}
 		if e := tx.Bucket(filesKey).Put([]byte(f.ID), encode(f)); e != nil {
 			return e
@@ -175,6 +201,11 @@ func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *i
 		}
 		return queueGarbage(tx, f.ID, u)
 	})
+	result.Before = before
+	if result.Effect == core.Applied {
+		result.Evidence = metadata(name, entryRecord{}, f).Evidence
+	}
+	return
 }
 
 func readStripe(ctx context.Context, input io.Reader, data [][]byte) (total int, err error) {

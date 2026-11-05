@@ -17,24 +17,67 @@ mandatory stack of forwarding layers.
 | HTTP | Wire representation, request lifetime and safe error projection | Core and optional injected control/task consumers |
 | Host | Identity sources, storage, factories, clients, listeners and shutdown | Selected components |
 
-The root module contains core, local, control, task, input, transfer and httpapi. S3, Alipan and
-Pool each have their own module. Core imports no SDK, configuration system,
-database or frontend. Driver package imports do not register global instances.
+The root package is Core. Storage implementations live under drivers/; protocol
+exports live under protocols/. Local, JSON HTTP and WebDAV remain packages in the
+standard-library-only root module. S3, Alipan and Pool keep separate modules.
+control, task, input and transfer remain independently composable packages.
+Core imports no implementation, protocol, configuration system, database or frontend.
+Driver imports do not register global instances.
+
+drivers/internal/upload is private shared upload machinery for Driver implementations;
+protocols/internal/httpwire owns shared HTTP condition/range translation. Pool's
+optional delivery package combines Pool with protocols/httpapi and task. The base
+Pool package has no HTTP dependency, and the root module never imports Pool.
+
+The Local, JSON HTTP and WebDAV import paths are now
+github.com/nostalume/mountweave/drivers/local,
+github.com/nostalume/mountweave/protocols/httpapi and
+github.com/nostalume/mountweave/protocols/webdav. Update former /local, /httpapi
+and /webdav imports to these paths. Their package names and public methods, the
+root Core import path, and HTTP URLs/wire schema are unchanged.
+
+## Finding Core behavior
+
+| Responsibility | Source owners |
+| --- | --- |
+| Runtime construction, install and shutdown | core.go; mount.go owns use/retirement |
+| Addresses and binding projection | address.go, binding.go |
+| Captured selections, conflicts and execution admission | selection.go, admission.go |
+| Metadata observations and projection | metadata.go |
+| Opening policy, results and resource adoption | open.go |
+| Stream body / persistent bound file / parent directory lifetime | content.go / file.go / directory.go |
+| Basic name changes, effects and result confirmation | change.go |
+| Body writes, complete publication and continuation | write.go, publication.go, continuation.go |
+| Shared tree discovery | tree.go |
+| Copy, Move and batch composition | copy.go, move.go, batch.go |
+| Tree copy / removal and shared receipts | copy_tree.go / remove_tree.go; tree_result.go |
+| Finite bounded execution / cross-call receive order | execution.go / order.go |
+
+These are file owners within one Core package. Captured locations, mount uses and
+native resource scopes retain their existing ownership; organizing them adds no
+runtime dispatch or check. Stream EOF cleanup and persistent File lifetime remain
+separate. New protocol handlers consume these same public operations and resources.
 
 ## Locating and changing files
 
-Core maps visible paths onto one live binding table, including fixed aliases.
-Drivers receive strict root-relative logical paths. Local paths, S3 prefixes
-and provider root IDs share a responsibility but not a universal representation.
+Core maps typed tree/key addresses onto one live binding table, including fixed
+aliases. Drivers receive root-relative NativeAddress/NativeQuery values. Tree
+paths and literal keys have different invariants; provider IDs stay native.
+Space identifies an existing binding, without a second resource registry.
 
 Internally one captured location carries the binding generation and rooted address.
-Visible and primary authorization paths project from it. Selection retains these
+Visible and primary authorization addresses project from it. Selection retains these
 locations; use adds execution lifetime, and an owned directory binds the parent
 location to its native scope. Children are derived from that parent. Prepared
 operations consume locations directly instead of pairing raw paths with optional
 expected locations/scopes or resolving the same selection again. Dynamic grants,
 retirement and native-object conditions are still checked at actual use. This
 address is not a persistent object ID or a content version.
+
+List uses one query/cursor owner for children or prefix/delimiter results. A
+prefix group is not a directory. Optional pure key projections let tree/key views
+share conflict scheduling without metadata probes; unknown overlap is conservative
+for that owner. Ordinary stream bodies have no per-buffer namespace dispatch.
 
 Optional mutation interfaces express native capability without expanding the
 mandatory read interface. Core owns Copy, Move, batch and tree composition;

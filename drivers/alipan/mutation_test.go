@@ -17,7 +17,7 @@ import (
 	core "github.com/nostalume/mountweave"
 	driver "github.com/nostalume/mountweave/drivers/alipan"
 	"github.com/nostalume/mountweave/drivers/alipan/credential"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 )
 
 type idEntry struct {
@@ -230,7 +230,7 @@ func (r brokenEOF) Read(p []byte) (int, error) {
 }
 func readIDFile(t *testing.T, c *core.Core, p string, wanted *core.Range) []byte {
 	t.Helper()
-	o, err := c.Open(context.Background(), "writer", p, wanted)
+	o, err := c.Open(context.Background(), "writer", core.Path(p), core.OpenOptions{Range: wanted})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,29 +252,29 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 		o.PartConcurrency = 2
 		o.DeletionPollInterval = time.Microsecond
 	})
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/dir"); err != nil {
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/dir")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/dir"); core.CodeOf(err) != core.AlreadyExists {
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/dir")); core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(err)
 	}
 	input := &moveOnRead{Reader: strings.NewReader("abcdefg"), move: func() {
-		if _, err := c.Move(ctx, "writer", "/cloud/dir", "/cloud/renamed"); err != nil {
+		if _, err := c.Move(ctx, "writer", core.Path("/cloud/dir"), core.Path("/cloud/renamed")); err != nil {
 			t.Error(err)
 		}
 	}}
 	n := int64(7)
-	if change, err := c.Write(ctx, "writer", "/cloud/dir/file", input, &n); err != nil || change.Effect != core.Applied || input.closed {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/dir/file"), input, &n); err != nil || change.Effect != core.Applied || input.closed {
 		t.Fatal(change, err)
 	}
 	if got := readIDFile(t, c, "/cloud/renamed/file", &core.Range{Start: 2, End: 5}); string(got) != "cdef" {
 		t.Fatal(string(got))
 	}
 	untouched := strings.NewReader("abcdefg")
-	if change, err := c.Write(ctx, "writer", "/cloud/renamed/file", untouched, &n, core.WriteOptions{Replace: true}); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged || untouched.Len() != 7 {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/file"), untouched, &n, core.WriteOptions{Policy: core.Publish()}); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged || untouched.Len() != 7 {
 		t.Fatal(change, err)
 	}
-	if change, err := c.Write(ctx, "writer", "/cloud/renamed/unknown", untouched, nil); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged || untouched.Len() != 7 {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/unknown"), untouched, nil); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged || untouched.Len() != 7 {
 		t.Fatal(change, err)
 	}
 	native, err := local.New(localRoot)
@@ -284,61 +284,61 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	if _, err := c.Install("/local", native); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Copy(ctx, "writer", "/cloud/renamed/file", "/local/copied"); err != nil {
+	if _, err := c.Copy(ctx, "writer", core.Path("/cloud/renamed/file"), core.Path("/local/copied")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Copy(ctx, "writer", "/local/copied", "/cloud/renamed/copied"); err != nil {
+	if _, err := c.Copy(ctx, "writer", core.Path("/local/copied"), core.Path("/cloud/renamed/copied")); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.CopyTree(ctx, "writer", "/cloud/renamed", "/local/tree", core.TreeCopyOptions{MaxEntries: 10, MaxPlanBytes: 1024})
-	if err != nil || len(rows) != 3 {
+	rows, err := c.CopyTree(ctx, "writer", core.Path("/cloud/renamed"), core.Path("/local/tree"), core.TreeCopyOptions{MaxEntries: 10, MaxPlanBytes: 1024})
+	if err != nil || len(rows.Items) != 3 {
 		t.Fatal(rows, err)
 	}
-	if _, err := c.Move(ctx, "writer", "/cloud/renamed/file", "/cloud/renamed/new-name"); err != nil {
+	if _, err := c.Move(ctx, "writer", core.Path("/cloud/renamed/file"), core.Path("/cloud/renamed/new-name")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/other"); err != nil {
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/other")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Move(ctx, "writer", "/cloud/renamed/new-name", "/cloud/other/new-name"); err != nil {
+	if _, err := c.Move(ctx, "writer", core.Path("/cloud/renamed/new-name"), core.Path("/cloud/other/new-name")); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := c.Move(ctx, "writer", "/cloud/other/new-name", "/cloud/renamed/another-name"); core.CodeOf(err) != core.UnsupportedOperation || result.Source.Effect != core.Unchanged {
+	if result, err := c.Move(ctx, "writer", core.Path("/cloud/other/new-name"), core.Path("/cloud/renamed/another-name")); core.CodeOf(err) != core.UnsupportedOperation || result.Source.Effect != core.Unchanged {
 		t.Fatal(result, err)
 	}
-	if change, err := c.Remove(ctx, "writer", "/cloud/other"); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged {
+	if change, err := c.Remove(ctx, "writer", core.Path("/cloud/other")); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
-	if _, err := c.Remove(ctx, "writer", "/cloud/other/new-name"); err != nil {
+	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/other/new-name")); err != nil {
 		t.Fatal(err)
 	}
 	fault := errors.New("failed input EOF")
-	if change, err := c.Write(ctx, "writer", "/cloud/renamed/partial", brokenEOF{strings.NewReader("abcdefg"), fault}, &n); !errors.Is(err, fault) || change.Effect != core.Incomplete {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/partial"), brokenEOF{strings.NewReader("abcdefg"), fault}, &n); !errors.Is(err, fault) || change.Effect != core.Incomplete {
 		t.Fatal(change, err)
 	}
-	if _, err := c.Stat(ctx, "writer", "/cloud/renamed/partial"); err != nil {
+	if _, err := c.Stat(ctx, "writer", core.Path("/cloud/renamed/partial")); err != nil {
 		t.Fatal("incomplete native object was hidden", err)
 	}
-	if _, err := c.Remove(ctx, "writer", "/cloud/renamed/partial"); err != nil {
+	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/renamed/partial")); err != nil {
 		t.Fatal(err)
 	}
 	server.rejectPart = true
-	if change, err := c.Write(ctx, "writer", "/cloud/renamed/rejected", strings.NewReader("abcdefg"), &n); err == nil || change.Effect != core.Incomplete {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/rejected"), strings.NewReader("abcdefg"), &n); err == nil || change.Effect != core.Incomplete {
 		t.Fatal(change, err)
 	}
 	if n, _ := server.rejectedBody.Read(make([]byte, 1)); n != 0 {
 		t.Fatal("late upload read retained a released payload buffer")
 	}
-	if _, err := c.Remove(ctx, "writer", "/cloud/renamed/rejected"); err != nil {
+	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/renamed/rejected")); err != nil {
 		t.Fatal(err)
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	server.afterCreate = cancel
-	if change, err := c.Write(cancelCtx, "writer", "/cloud/renamed/cancelled", strings.NewReader("abcdefg"), &n); !errors.Is(err, context.Canceled) || change.Effect != core.Incomplete {
+	if change, err := c.Write(cancelCtx, "writer", core.Path("/cloud/renamed/cancelled"), strings.NewReader("abcdefg"), &n); !errors.Is(err, context.Canceled) || change.Effect != core.Incomplete {
 		t.Fatal("creation acknowledgement is not upload completion", change, err)
 	}
-	if _, err := c.Remove(ctx, "writer", "/cloud/renamed/cancelled"); err != nil {
+	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/renamed/cancelled")); err != nil {
 		t.Fatal(err)
 	}
 	server.mu.Lock()
@@ -346,7 +346,7 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	before := server.calls["/adrive/v1.0/openFile/complete"]
 	deletes := server.calls["/adrive/v1.0/openFile/delete"]
 	server.mu.Unlock()
-	if change, err := c.Write(ctx, "writer", "/cloud/renamed/lost", strings.NewReader("abcdefg"), &n); err == nil || change.Effect != core.Unknown {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/lost"), strings.NewReader("abcdefg"), &n); err == nil || change.Effect != core.Unknown {
 		t.Fatal(change, err)
 	}
 	server.mu.Lock()
@@ -359,27 +359,27 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	}
 	policy := core.DirectoryRemoveOptions{Scope: core.Subtree}
 	limits := core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 1024}
-	if _, err := c.RemoveTree(ctx, "writer", "/cloud/renamed", limits); core.CodeOf(err) != core.UnsupportedOperation {
+	if _, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/renamed"), limits); core.CodeOf(err) != core.UnsupportedOperation {
 		t.Fatal(err)
 	}
 	server.asyncDelete = true
 	beforeDelete := server.calls["/adrive/v1.0/openFile/delete"]
-	if rows, err := c.RemoveTree(ctx, "writer", "/cloud/renamed", limits, policy); err != nil || len(rows) != 1 || rows[0].Change.Effect != core.Applied || server.deletePolls != 2 || server.calls["/adrive/v1.0/openFile/delete"] != beforeDelete+1 {
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/renamed"), limits, policy); err != nil || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Applied || server.deletePolls != 2 || server.calls["/adrive/v1.0/openFile/delete"] != beforeDelete+1 {
 		t.Fatal(rows, err, server.deletePolls)
 	}
-	if _, err := c.Stat(ctx, "writer", "/cloud/renamed"); core.CodeOf(err) != core.NotFound {
+	if _, err := c.Stat(ctx, "writer", core.Path("/cloud/renamed")); core.CodeOf(err) != core.NotFound {
 		t.Fatal(err)
 	}
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/cancel-tree"); err != nil {
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/cancel-tree")); err != nil {
 		t.Fatal(err)
 	}
 	pollCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	server.cancelQuery = stop
-	if rows, err := c.RemoveTree(pollCtx, "writer", "/cloud/cancel-tree", limits, policy); !errors.Is(err, context.Canceled) || len(rows) != 1 || rows[0].Change.Effect != core.Unknown {
+	if rows, err := c.RemoveTree(pollCtx, "writer", core.Path("/cloud/cancel-tree"), limits, policy); !errors.Is(err, context.Canceled) || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Unknown {
 		t.Fatal(rows, err)
 	}
-	if _, err := c.Stat(ctx, "writer", "/cloud/cancel-tree"); err != nil {
+	if _, err := c.Stat(ctx, "writer", core.Path("/cloud/cancel-tree")); err != nil {
 		t.Fatal("acceptance was mistaken for completion", err)
 	}
 }
@@ -408,10 +408,10 @@ func TestMutationAuthRejectionRefreshesWithoutReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	if change, err := d.Mkdir(ctx, "/dir"); core.CodeOf(err) != core.UpstreamAccessDenied || change.Effect != core.Unchanged || creates != 1 || refreshes != 1 {
+	if change, err := d.Mkdir(ctx, core.NativePath("/dir")); core.CodeOf(err) != core.UpstreamAccessDenied || change.Effect != core.Unchanged || creates != 1 || refreshes != 1 {
 		t.Fatal(change, err, creates, refreshes)
 	}
-	if change, err := d.Mkdir(ctx, "/dir"); err != nil || change.Effect != core.Applied || creates != 2 || refreshes != 1 {
+	if change, err := d.Mkdir(ctx, core.NativePath("/dir")); err != nil || change.Effect != core.Applied || creates != 2 || refreshes != 1 {
 		t.Fatal(change, err, creates, refreshes)
 	}
 }

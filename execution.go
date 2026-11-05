@@ -7,7 +7,9 @@ import (
 
 // ExecutionOptions applies within one finite call, not across independent
 // requests or external writers. Zero and one select serial execution.
-type ExecutionOptions struct{ Concurrency int }
+type ExecutionOptions struct {
+	Concurrency int `json:"concurrency,omitempty"`
+}
 
 func concurrency(options []ExecutionOptions) (int, error) {
 	if len(options) > 1 {
@@ -29,6 +31,7 @@ type access struct {
 	at    *location
 	write bool
 }
+
 type work[T any] struct {
 	accesses []access
 	run      func() (T, error)
@@ -40,8 +43,7 @@ func conflict(a, b []access) bool {
 			if x.at == nil || y.at == nil {
 				return true
 			}
-			if x.at.binding.mount == y.at.binding.mount && (x.write || y.write) &&
-				(Within(x.at.path, y.at.path) || Within(y.at.path, x.at.path)) {
+			if (x.write || y.write) && locationsOverlap(x.at, y.at) {
 				return true
 			}
 		}

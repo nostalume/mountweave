@@ -14,11 +14,11 @@ import (
 	"time"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 	"github.com/nostalume/mountweave/task"
 )
 
-func copyPermit(_ context.Context, p core.Principal, a core.Action, _ string) error {
+func copyPermit(_ context.Context, p core.Principal, a core.Action, _ core.Address) error {
 	if p == "caller" && (a == core.ReadAction || a == core.CreateAction) {
 		return nil
 	}
@@ -47,11 +47,21 @@ type copyWriter struct {
 	publish func(context.Context, string, io.Reader, *int64) (core.Change, error)
 }
 
-func (d *copyWriter) Create(ctx context.Context, p string, r io.Reader, n *int64) (core.Change, error) {
+func (d *copyWriter) Create(ctx context.Context, pAddress core.NativeAddress, r io.Reader, n *int64) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	return d.create(ctx, p, r, n)
 }
 
-func (d *copyWriter) Publish(ctx context.Context, p string, r io.Reader, n *int64) (core.Change, error) {
+func (d *copyWriter) Publish(ctx context.Context, pAddress core.NativeAddress, r io.Reader, n *int64, _ core.PublicationOptions) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if d.publish == nil {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -87,11 +97,12 @@ func copySource(b *copyBody, length *int64) *fakeDriver {
 
 func TestCopyLocal(t *testing.T) {
 	from, to := t.TempDir(), t.TempDir()
-	c := copyCore(t, func(ctx context.Context, p core.Principal, a core.Action, target string) error {
+	c := copyCore(t, func(ctx context.Context, p core.Principal, a core.Action, targetAddress core.Address) error {
+		target := targetAddress.Value()
 		if p == "writer" && (a == core.ReadAction || a == core.CreateAction || a == core.WriteAction) {
 			return nil
 		}
-		return copyPermit(ctx, p, a, target)
+		return copyPermit(ctx, p, a, core.Path(target))
 	})
 	for _, binding := range []struct{ path, directory string }{{"/from", from}, {"/to", to}} {
 		d, err := local.New(binding.directory, local.Options{StagingDirectory: t.TempDir(), MaxStagingBytes: 32})
@@ -104,11 +115,11 @@ func TestCopyLocal(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(from, name), []byte(data), 0600); err != nil {
 			t.Fatal(err)
 		}
-		change, err := c.Copy(context.Background(), "caller", "/from/"+name, "/to/"+name)
+		change, err := c.Copy(context.Background(), "caller", core.Path("/from/"+name), core.Path("/to/"+name))
 		if err != nil || change.Effect != core.Applied {
 			t.Fatal(change, err)
 		}
-		change, err = c.Copy(context.Background(), "caller", "/from/"+name, "/to/"+name)
+		change, err = c.Copy(context.Background(), "caller", core.Path("/from/"+name), core.Path("/to/"+name))
 		if change.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists {
 			t.Fatal(change, err)
 		}
@@ -119,15 +130,15 @@ func TestCopyLocal(t *testing.T) {
 			}
 		}
 	}
-	if change, err := c.Copy(context.Background(), "caller", "/to/a", "/to/another"); err != nil || change.Effect != core.Applied {
+	if change, err := c.Copy(context.Background(), "caller", core.Path("/to/a"), core.Path("/to/another")); err != nil || change.Effect != core.Applied {
 		t.Fatal(change, err)
 	}
 	results, err := c.CopyBatch(context.Background(), "caller", []core.CopyRequest{
-		{Source: "/to/a", Target: "/to/batch-b"},
-		{Source: "/to/batch-b", Target: "/to/batch-c"},
-		{Source: "/to/a", Target: "/to/batch-b"},
-		{Source: "/to/a", Target: "/to/batch-b"},
-		{Source: "/to/a", Target: "/to/not-started"},
+		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
+		{Source: core.Path("/to/batch-b"), Target: core.Path("/to/batch-c")},
+		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
+		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
+		{Source: core.Path("/to/a"), Target: core.Path("/to/not-started")},
 	}, core.ExecutionOptions{Concurrency: 2})
 	if len(results) != 3 || core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(results, err)
@@ -152,13 +163,13 @@ func TestCopyLocal(t *testing.T) {
 		return // The preceding default-create checks apply on other platforms too.
 	}
 	write(t, from, "a", []byte("updated"))
-	replace := core.WriteOptions{Replace: true}
-	if change, err := c.Copy(context.Background(), "writer", "/from/a", "/to/a", replace); err != nil || change.Effect != core.Applied {
+	replace := core.WriteOptions{Policy: core.Publish()}
+	if change, err := c.Copy(context.Background(), "writer", core.Path("/from/a"), core.Path("/to/a"), core.CopyOptions{Target: replace}); err != nil || change.Effect != core.Applied {
 		t.Fatal(change, err)
 	}
 	published, err := c.CopyBatch(context.Background(), "writer", []core.CopyRequest{
-		{Source: "/from/a", Target: "/to/a", WriteOptions: replace},
-		{Source: "/to/a", Target: "/to/upsert", WriteOptions: replace},
+		{Source: core.Path("/from/a"), Target: core.Path("/to/a"), Options: core.CopyOptions{Target: replace}},
+		{Source: core.Path("/to/a"), Target: core.Path("/to/upsert"), Options: core.CopyOptions{Target: replace}},
 	}, core.ExecutionOptions{Concurrency: 2})
 	if err != nil || len(published) != 2 || published[0].Change.Effect != core.Applied || published[1].Change.Effect != core.Applied {
 		t.Fatal(published, err)
@@ -181,7 +192,7 @@ func TestCopyValidation(t *testing.T) {
 		{c, "/from/../a", "/to/a", core.InvalidPath},
 		{c, "/from/a", "/to/../a", core.InvalidPath},
 	} {
-		change, err := tc.core.Copy(context.Background(), "caller", tc.source, tc.target)
+		change, err := tc.core.Copy(context.Background(), "caller", core.Path(tc.source), core.Path(tc.target))
 		if change.Effect != core.Unchanged || core.CodeOf(err) != tc.code {
 			t.Fatal(change, err)
 		}
@@ -205,7 +216,7 @@ func TestCopyOpenedLength(t *testing.T) {
 				t.Fatal(err)
 			}
 			installCopyMount(t, c, "/to", d)
-			change, err := c.Copy(context.Background(), "caller", "/from/a", "/to/new")
+			change, err := c.Copy(context.Background(), "caller", core.Path("/from/a"), core.Path("/to/new"))
 			if change.Effect != tc.effect || (tc.effect == core.Applied && err != nil) ||
 				(tc.effect == core.Incomplete && !errors.Is(err, io.ErrUnexpectedEOF)) {
 				t.Fatal(change, err)
@@ -224,11 +235,12 @@ func TestCopyRefusalClosesSource(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			authorize := func(ctx context.Context, p core.Principal, a core.Action, target string) error {
+			authorize := func(ctx context.Context, p core.Principal, a core.Action, targetAddress core.Address) error {
+				target := targetAddress.Value()
 				if mode == "permission" && a == core.CreateAction {
 					return errors.New("target denied")
 				}
-				return copyPermit(ctx, p, a, target)
+				return copyPermit(ctx, p, a, core.Path(target))
 			}
 			c := copyCore(t, authorize)
 			b := &copyBody{Reader: strings.NewReader("abc")}
@@ -245,7 +257,7 @@ func TestCopyRefusalClosesSource(t *testing.T) {
 			}
 			installCopyMount(t, c, "/from", d)
 			installCopyMount(t, c, "/to", copySource(&copyBody{Reader: strings.NewReader("")}, nil))
-			change, err := c.Copy(ctx, "caller", "/from/a", "/to/new")
+			change, err := c.Copy(ctx, "caller", core.Path("/from/a"), core.Path("/to/new"))
 			if mode == "source" && (!errors.Is(err, fault) || !errors.Is(err, context.Canceled)) {
 				t.Fatal("source failure lost its concurrent cancellation", err)
 			}
@@ -275,7 +287,7 @@ func TestCopyPreservesTargetReceipt(t *testing.T) {
 				}
 				return core.Change{Effect: effect}, fault
 			}})
-			change, err := c.Copy(context.Background(), "caller", "/from/a", "/to/new")
+			change, err := c.Copy(context.Background(), "caller", core.Path("/from/a"), core.Path("/to/new"))
 			if change.Effect != effect || !errors.Is(err, fault) || b.closes.Load() != 1 {
 				t.Fatal(change, err, b.closes.Load())
 			}
@@ -286,7 +298,7 @@ func TestCopyPreservesTargetReceipt(t *testing.T) {
 	installCopyMount(t, c, "/invalid", &copyWriter{Driver: &fakeDriver{}, publish: func(context.Context, string, io.Reader, *int64) (core.Change, error) {
 		return core.Change{Effect: core.Incomplete}, core.Fail(core.UpstreamFailure, fault)
 	}})
-	change, err := c.Write(context.Background(), "alice", "/invalid/file", strings.NewReader("x"), ptr(1), core.WriteOptions{Replace: true})
+	change, err := c.Write(context.Background(), "alice", core.Path("/invalid/file"), strings.NewReader("x"), ptr(1), core.WriteOptions{Policy: core.Publish()})
 	if change.Effect != core.Unknown || core.CodeOf(err) != core.InvalidUpstreamResponse || !errors.Is(err, fault) {
 		t.Fatal("partial publication did not preserve the contract violation and cause", change, err)
 	}
@@ -326,7 +338,7 @@ func TestCopyWaitsForSourceClose(t *testing.T) {
 	}
 	t.Cleanup(func() { unblock(); _ = jobs.Close(context.Background()) })
 	h, err := jobs.Submit(context.Background(), task.Work{Run: func(ctx context.Context, _ func(any)) (any, error) {
-		return c.Copy(ctx, "caller", "/from/a", "/to/new")
+		return c.Copy(ctx, "caller", core.Path("/from/a"), core.Path("/to/new"))
 	}})
 	if err != nil {
 		t.Fatal(err)

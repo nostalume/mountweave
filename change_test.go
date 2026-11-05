@@ -13,7 +13,7 @@ import (
 	"time"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 )
 
 type directoryDriver struct {
@@ -21,7 +21,12 @@ type directoryDriver struct {
 	mkdir func(context.Context, string) (core.Change, error)
 }
 
-func (d *directoryDriver) Mkdir(ctx context.Context, p string) (core.Change, error) {
+func (d *directoryDriver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	d.calls.Add(1)
 	return d.mkdir(ctx, p)
 }
@@ -32,16 +37,16 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	defer closeCore(t, c)
 	mountLocal(t, c, root)
 	ctx := context.Background()
-	changed, err := c.Mkdir(ctx, "alice", "/files/folder")
+	changed, err := c.Mkdir(ctx, "alice", core.Path("/files/folder"))
 	if err != nil || changed.Effect != core.Applied {
 		t.Fatal(changed, err)
 	}
-	changed, err = c.Mkdir(ctx, "alice", "/files/folder")
+	changed, err = c.Mkdir(ctx, "alice", core.Path("/files/folder"))
 	code(t, err, core.AlreadyExists)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
-	changed, err = c.Mkdir(ctx, "alice", "/files/missing/child")
+	changed, err = c.Mkdir(ctx, "alice", core.Path("/files/missing/child"))
 	code(t, err, core.NotFound)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
@@ -58,7 +63,7 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 		{"long", "abcd", ptr(3), core.Incomplete},
 	}
 	for _, tc := range cases {
-		changed, err = c.Create(ctx, "alice", "/files/folder/"+tc.name, strings.NewReader(tc.data), tc.length)
+		changed, err = c.Create(ctx, "alice", core.Path("/files/folder/"+tc.name), strings.NewReader(tc.data), tc.length)
 		if changed.Effect != tc.effect {
 			t.Fatalf("%s: %+v %v", tc.name, changed, err)
 		}
@@ -73,13 +78,13 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	changed, err = c.Create(ctx, "alice", "/files/folder/complete", strings.NewReader("replacement"), nil)
+	changed, err = c.Create(ctx, "alice", core.Path("/files/folder/complete"), strings.NewReader("replacement"), nil)
 	code(t, err, core.AlreadyExists)
 	after, readErr := os.ReadFile(filepath.Join(root, "folder", "complete"))
 	if changed.Effect != core.Unchanged || readErr != nil || string(after) != string(original) {
 		t.Fatal(changed, string(after), readErr)
 	}
-	changed, err = c.Create(ctx, "alice", "/files/folder/failed", io.MultiReader(strings.NewReader("prefix"), iotest.ErrReader(io.ErrNoProgress)), nil)
+	changed, err = c.Create(ctx, "alice", core.Path("/files/folder/failed"), io.MultiReader(strings.NewReader("prefix"), iotest.ErrReader(io.ErrNoProgress)), nil)
 	if changed.Effect != core.Incomplete || !errors.Is(err, io.ErrNoProgress) {
 		t.Fatal(changed, err)
 	}
@@ -87,27 +92,27 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	if err != nil || string(partial) != "prefix" {
 		t.Fatal(string(partial), err)
 	}
-	changed, err = c.Remove(ctx, "alice", "/files/folder")
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder"))
 	code(t, err, core.DirectoryNotEmpty)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
-	changed, err = c.Remove(ctx, "alice", "/files/folder/complete")
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"))
 	if err != nil || changed.Effect != core.Applied {
 		t.Fatal(changed, err)
 	}
-	changed, err = c.Remove(ctx, "alice", "/files/folder/complete")
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"))
 	code(t, err, core.NotFound)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
-	changed, err = c.Remove(ctx, "alice", "/files")
+	changed, err = c.Remove(ctx, "alice", core.Path("/files"))
 	code(t, err, core.InvalidRequest)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
-	results, err := c.RemoveBatch(ctx, "alice", []string{
-		"/files/folder/exact", "/files/folder/exact", "/files/folder/empty",
+	results, err := c.RemoveBatch(ctx, "alice", []core.Address{
+		core.Path("/files/folder/exact"), core.Path("/files/folder/exact"), core.Path("/files/folder/empty"),
 	})
 	if len(results) != 2 || core.CodeOf(err) != core.NotFound ||
 		results[0].Change.Effect != core.Applied || results[0].Err != nil ||
@@ -136,7 +141,7 @@ func TestChangeReceiptsSurviveErrorsAndCancellation(t *testing.T) {
 			if _, err := c.Install("/files", d); err != nil {
 				t.Fatal(err)
 			}
-			result, err := c.Mkdir(ctx, "alice", "/files/new")
+			result, err := c.Mkdir(ctx, "alice", core.Path("/files/new"))
 			if result.Effect != effect || !errors.Is(err, fault) || !errors.Is(err, context.Canceled) {
 				t.Fatal(result, err)
 			}
@@ -162,7 +167,7 @@ func TestMutationKeepsOtherMountsAndOpenedBodiesIndependent(t *testing.T) {
 	}
 	ctx := context.Background()
 	first := func(target string, limit int) core.ListRequest {
-		r := core.ListRequest{Path: target, Limit: limit, CursorTTL: time.Minute}
+		r := core.ListRequest{Query: core.Children(core.Path(target)), Limit: limit, CursorTTL: time.Minute}
 		page, e := c.List(ctx, "alice", r)
 		if e != nil || page.NextCursor == nil {
 			t.Fatal(page, e)
@@ -183,12 +188,12 @@ func TestMutationKeepsOtherMountsAndOpenedBodiesIndependent(t *testing.T) {
 		eofReplay.Cursor = *final.NextCursor
 	}
 	peerCursor := first("/other", 1)
-	opened, err := c.Open(ctx, "alice", "/files/a", nil)
+	opened, err := c.Open(ctx, "alice", core.Path("/files/a"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer opened.Body.Close()
-	result, err := c.Mkdir(ctx, "alice", "/files/new")
+	result, err := c.Mkdir(ctx, "alice", core.Path("/files/new"))
 	if err != nil || result.Effect != core.Applied {
 		t.Fatal(result, err)
 	}
@@ -205,12 +210,12 @@ func TestMutationKeepsOtherMountsAndOpenedBodiesIndependent(t *testing.T) {
 		t.Fatal(string(bytes), err)
 	}
 	fresh := first("/files", 1)
-	_, err = c.Mkdir(ctx, "alice", "/files/new")
+	_, err = c.Mkdir(ctx, "alice", core.Path("/files/new"))
 	code(t, err, core.AlreadyExists)
 	if err = c.CheckCursor(ctx, "alice", fresh); err != nil {
 		t.Fatal(err)
 	}
-	result, err = c.Create(ctx, "alice", "/files/partial", strings.NewReader("x"), ptr(2))
+	result, err = c.Create(ctx, "alice", core.Path("/files/partial"), strings.NewReader("x"), ptr(2))
 	if result.Effect != core.Incomplete {
 		t.Fatal(result, err)
 	}
@@ -255,15 +260,15 @@ func TestMutationWaitsForBorrowedReadAcknowledgment(t *testing.T) {
 				var r core.Change
 				var e error
 				if replace {
-					r, e = c.Write(ctx, "alice", "/files/new", input, nil, core.WriteOptions{Replace: true})
+					r, e = c.Write(ctx, "alice", core.Path("/files/new"), input, nil, core.WriteOptions{Policy: core.Publish()})
 				} else {
-					r, e = c.Create(ctx, "alice", "/files/new", input, nil)
+					r, e = c.Create(ctx, "alice", core.Path("/files/new"), input, nil)
 				}
 				done <- outcome{r, e}
 			}()
 			await(t, input.started)
 			cancel()
-			peer, err := c.Open(context.Background(), "alice", "/files/peer", nil)
+			peer, err := c.Open(context.Background(), "alice", core.Path("/files/peer"), core.OpenOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -325,7 +330,7 @@ func TestCompletePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newCore(t, core.Options{Authorize: func(_ context.Context, p core.Principal, a core.Action, _ string) error {
+	c := newCore(t, core.Options{Authorize: func(_ context.Context, p core.Principal, a core.Action, _ core.Address) error {
 		if p == "creator" && a == core.WriteAction {
 			return errors.New("replacement denied")
 		}
@@ -336,7 +341,7 @@ func TestCompletePublication(t *testing.T) {
 	if err := c.BindAlias(ctx, "/alias", m, "/"); err != nil {
 		t.Fatal(err)
 	}
-	replace := core.WriteOptions{Replace: true}
+	replace := core.WriteOptions{Policy: core.Publish()}
 	cases := []struct {
 		name, data string
 		length     *int64
@@ -365,7 +370,7 @@ func TestCompletePublication(t *testing.T) {
 				reader = io.MultiReader(reader, iotest.ErrReader(io.ErrNoProgress))
 			}
 			input := &copyBody{Reader: reader}
-			change, err := c.Write(ctx, "alice", "/alias/item", input, tc.length, replace)
+			change, err := c.Write(ctx, "alice", core.Path("/alias/item"), input, tc.length, replace)
 			want := tc.data
 			if tc.want != "" {
 				want = "old"
@@ -388,18 +393,18 @@ func TestCompletePublication(t *testing.T) {
 		})
 	}
 	input := &copyBody{Reader: strings.NewReader("new")}
-	change, err := c.Write(ctx, "creator", "/files/item", input, ptr(3), replace)
+	change, err := c.Write(ctx, "creator", core.Path("/files/item"), input, ptr(3), replace)
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.PermissionDenied || input.reads.Load() != 0 {
 		t.Fatal("create permission granted replacement", change, err)
 	}
-	change, err = c.Write(ctx, "alice", "/files/item", input, ptr(3))
+	change, err = c.Write(ctx, "alice", core.Path("/files/item"), input, ptr(3))
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists || input.reads.Load() != 0 {
 		t.Fatal("default write replaced an existing target", change, err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "directory"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	change, err = c.Write(ctx, "alice", "/files/directory", input, ptr(3), replace)
+	change, err = c.Write(ctx, "alice", core.Path("/files/directory"), input, ptr(3), replace)
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.NotFile || input.reads.Load() != 0 {
 		t.Fatal(change, err)
 	}
@@ -408,11 +413,11 @@ func TestCompletePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	installCopyMount(t, c, "/plain", plain)
-	change, err = c.Write(ctx, "alice", "/plain/new", input, ptr(3), replace)
+	change, err = c.Write(ctx, "alice", core.Path("/plain/new"), input, ptr(3), replace)
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.UnsupportedOperation || input.reads.Load() != 0 {
 		t.Fatal("unconfigured publication consumed input", change, err)
 	}
-	change, err = c.Write(ctx, "alice", "/files/new", input, ptr(3), replace, replace)
+	change, err = c.Write(ctx, "alice", core.Path("/files/new"), input, ptr(3), replace, replace)
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.InvalidRequest {
 		t.Fatal(change, err)
 	}
@@ -420,7 +425,7 @@ func TestCompletePublication(t *testing.T) {
 		actual, err := os.Stat(filepath.Join(root, "item"))
 		if err == nil && os.SameFile(upper, actual) {
 			probe := &copyBody{Reader: strings.NewReader("alias")}
-			change, err := c.Write(ctx, "alice", "/files/ITEM", probe, ptr(5), replace)
+			change, err := c.Write(ctx, "alice", core.Path("/files/ITEM"), probe, ptr(5), replace)
 			if change.Effect != core.Unchanged || probe.reads.Load() != 0 {
 				t.Fatal("a different stored name was replaced", change, err)
 			}
@@ -452,9 +457,9 @@ func TestPublicationCompetitionAndBudget(t *testing.T) {
 	defer closeCore(t, c)
 	installCopyMount(t, c, "/files", d)
 	ctx := context.Background()
-	replace := core.WriteOptions{Replace: true}
+	replace := core.WriteOptions{Policy: core.Publish()}
 	write(t, root, "item", []byte("old"))
-	opened, err := c.Open(ctx, "alice", "/files/item", nil)
+	opened, err := c.Open(ctx, "alice", core.Path("/files/item"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +478,7 @@ func TestPublicationCompetitionAndBudget(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		change, err := c.Write(ctx, "alice", "/files/item", io.MultiReader(strings.NewReader("new"), barrier), ptr(3), replace)
+		change, err := c.Write(ctx, "alice", core.Path("/files/item"), io.MultiReader(strings.NewReader("new"), barrier), ptr(3), replace)
 		done <- outcome{change, err}
 	}()
 	await(t, barrier.started) // All declared bytes arrived, but normal EOF has not.
@@ -484,11 +489,11 @@ func TestPublicationCompetitionAndBudget(t *testing.T) {
 		t.Fatal("private staging entered the served namespace", entries, err)
 	}
 	probe := &copyBody{Reader: strings.NewReader("oversized")}
-	change, err := c.Write(ctx, "alice", "/files/peer", probe, ptr(8), replace)
+	change, err := c.Write(ctx, "alice", core.Path("/files/peer"), probe, ptr(8), replace)
 	if change.Effect != core.Unchanged || core.CodeOf(err) != core.CapacityExceeded || probe.reads.Load() != 0 {
 		t.Fatal("separate calls did not share the byte budget", change, err)
 	}
-	change, err = c.Write(ctx, "alice", "/files/item", strings.NewReader("fast"), ptr(4), replace)
+	change, err = c.Write(ctx, "alice", core.Path("/files/item"), strings.NewReader("fast"), ptr(4), replace)
 	if err != nil || change.Effect != core.Applied {
 		t.Fatal(change, err)
 	}
@@ -517,8 +522,78 @@ func TestPublicationCompetitionAndBudget(t *testing.T) {
 	if data, err := os.ReadFile(outside); err != nil || string(data) != "outside" {
 		t.Fatal("publication followed a raced final link", string(data), err)
 	}
-	change, err = c.Write(ctx, "alice", "/files/peer", strings.NewReader("released"), ptr(8), replace)
+	change, err = c.Write(ctx, "alice", core.Path("/files/peer"), strings.NewReader("released"), ptr(8), replace)
 	if err != nil || change.Effect != core.Applied {
 		t.Fatal("completed calls did not release staging reservations", change, err)
+	}
+}
+
+func TestExclusivePublicationCompetition(t *testing.T) {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		t.Skip("native publication unavailable")
+	}
+	root, staging := t.TempDir(), t.TempDir()
+	d, err := local.New(root, local.Options{StagingDirectory: staging, MaxStagingBytes: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newCore(t, core.Options{})
+	defer closeCore(t, c)
+	m := installCopyMount(t, c, "/files", d)
+	ctx := context.Background()
+	if err := c.BindAlias(ctx, "/alias", m, "/"); err != nil {
+		t.Fatal(err)
+	}
+	policy := core.WriteOptions{Policy: core.Publish(core.IfAbsent()), ObserveTarget: true}
+	barrier := &blockingBody{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+	defer func() {
+		select {
+		case <-barrier.release:
+		default:
+			close(barrier.release)
+		}
+	}()
+	type outcome struct {
+		change core.Change
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		change, err := c.Write(ctx, "alice", core.Path("/alias/new"), io.MultiReader(strings.NewReader("new"), barrier), ptr(3), policy)
+		done <- outcome{change, err}
+	}()
+	await(t, barrier.started)
+	if _, err := os.Stat(filepath.Join(root, "new")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("published before EOF", err)
+	}
+	_, createErr := c.Create(ctx, "alice", core.Path("/files/new"), strings.NewReader("peer"), ptr(4))
+	close(barrier.release)
+	got := <-done
+	if createErr != nil || got.change.Effect != core.Unchanged || core.CodeOf(got.err) != core.PreconditionFailed {
+		t.Fatal(createErr, got)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "new")); err != nil || string(data) != "peer" {
+		t.Fatal(string(data), err)
+	}
+	probe := &copyBody{Reader: strings.NewReader("x")}
+	change, err := c.Write(ctx, "alice", core.Path("/files/new"), probe, ptr(1), policy)
+	if change.Effect != core.Unchanged || core.CodeOf(err) != core.PreconditionFailed || probe.reads.Load() != 0 {
+		t.Fatal(change, err, probe.reads.Load())
+	}
+	if change, err = c.Write(ctx, "alice", core.Path("/files/failed"), strings.NewReader("x"), ptr(2), policy); err == nil || change.Effect != core.Unchanged {
+		t.Fatal(change, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "failed")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("partial exclusive publication", err)
+	}
+	change, err = c.Write(ctx, "alice", core.Path("/files/complete"), strings.NewReader("complete"), ptr(8), policy)
+	if err != nil || change.Effect != core.Applied || change.Before != core.TargetMissing {
+		t.Fatal("reservation or commit leaked", change, err)
+	}
+	if entries, err := os.ReadDir(staging); err != nil || len(entries) != 0 {
+		t.Fatal("private link leaked", entries, err)
+	}
+	if change, err = c.Write(ctx, "alice", core.Path("/files/invalid"), probe, ptr(1), core.WriteOptions{Policy: core.Publish(core.IfAbsent(), core.IfAbsent())}); core.CodeOf(err) != core.InvalidRequest || change.Effect != core.Unchanged || probe.reads.Load() != 0 {
+		t.Fatal(change, err)
 	}
 }

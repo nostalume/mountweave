@@ -10,7 +10,7 @@ import (
 	"sync"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/internal/upload"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 func uploadError(err error) error {
@@ -29,7 +29,12 @@ func uploadError(err error) error {
 // Create uploads a known-length new file, without automatic rename/overwrite.
 // Native creation may expose an incomplete file. Failures after confirmed
 // creation retain that logical file; it is never deleted as path compensation.
-func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
+func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	unchanged := core.Change{Effect: core.Unchanged}
 	if input == nil || (length != nil && *length < 0) {
 		return unchanged, core.Fail(core.InvalidRequest, nil)

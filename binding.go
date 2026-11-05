@@ -3,24 +3,62 @@ package core
 import (
 	"context"
 	"errors"
+	"path"
+	"sort"
+	"strings"
 )
 
 // binding is an immutable directory mapping. active is guarded by Core.mu.
 type binding struct {
-	prefix string
-	mount  *Mount
-	base   string
-	active bool
+	prefix    string
+	mount     *Mount
+	base      string
+	keyPrefix string
+	keySpace  bool
+	active    bool
 }
 
 type location struct {
 	*binding
-	path string
+	path        string
+	namespace   Namespace
+	prefixRange bool
+}
+
+func (b *binding) keyBase() string {
+	return b.keyPrefix
+}
+
+func (at *location) address() Address {
+	if at.namespace == TreeNamespace {
+		return Path(at.visible())
+	}
+	a := Key(at.prefix, strings.TrimPrefix(at.path, at.keyBase()))
+	a.prefix = at.prefixRange
+	return a
+}
+
+func (at *location) primaryAddress() Address {
+	if at.namespace == TreeNamespace {
+		return Path(at.primary())
+	}
+	a := Key(at.mount.path, at.path)
+	a.prefix = at.prefixRange
+	return a
+}
+
+func (at *location) native() NativeAddress {
+	return NativeAddress{namespace: at.namespace, value: at.path}
+}
+
+func (at *location) validExtent() bool {
+	return at.namespace == KeyNamespace || pathExtent(at.primary())
 }
 
 // A location is one immutable captured access route and its rooted address.
 // Visible and primary policy paths are projections, never independent inputs.
 func (at *location) visible() string { return joinPath(at.prefix, relative(at.path, at.base)) }
+
 func (at *location) primary() string { return joinPath(at.mount.path, at.path) }
 
 // descend receives a relative path admitted by selection or bounded discovery.
@@ -61,7 +99,7 @@ func (c *Core) BindAlias(ctx context.Context, prefix string, mount *Mount, base 
 	u := mount.borrowLocked(ctx, &location{binding: c.bindings[mount.path], path: base})
 	c.mu.Unlock()
 	defer u.release()
-	meta, err := mount.driver.Stat(u.ctx, base)
+	meta, err := mount.driver.Stat(u.ctx, NativePath(base))
 	if err != nil {
 		return err
 	}
@@ -84,7 +122,11 @@ func (c *Core) BindAlias(ctx context.Context, prefix string, mount *Mount, base 
 			return Fail(PathAmbiguous, nil)
 		}
 	}
-	c.bindings[prefix] = &binding{prefix: prefix, mount: mount, base: base, active: true}
+	b := &binding{prefix: prefix, mount: mount, base: base, active: true, keySpace: mount.keys && base == "/"}
+	if mount.keys && base != "/" && mount.projection != nil {
+		b.keyPrefix, b.keySpace = mount.projection.KeyRoot(NativePath(base))
+	}
+	c.bindings[prefix] = b
 	c.version++
 	return nil
 }
@@ -130,124 +172,84 @@ func (c *Core) UnbindAlias(ctx context.Context, prefix string) error {
 }
 
 func (c *Core) locationLocked(target string) *location {
-	for prefix, b := range c.bindings {
-		if Within(target, prefix) && b.active {
+	for prefix := target; ; prefix = path.Dir(prefix) {
+		if b := c.bindings[prefix]; b != nil && b.active {
 			return &location{binding: b, path: joinPath(b.base, relative(target, prefix))}
+		}
+		if prefix == "/" {
+			break
 		}
 	}
 	return nil
 }
 
-func (c *Core) capture(ctx context.Context, target string) *location {
-	if c == nil || ValidatePath(target) != nil {
+func (c *Core) capture(ctx context.Context, target Address) *location {
+	if c == nil || c.validateInput(ctx, target) != nil {
 		return nil
 	}
 	return c.captureChecked(ctx, target)
 }
-func (c *Core) captureChecked(ctx context.Context, target string) *location {
+
+func (c *Core) captureChecked(ctx context.Context, target Address) *location {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	expected, err := c.constrained(ctx, target, nil)
-	if err != nil {
-		return nil
-	}
-	at, _, err := c.resolveLocked(target, expected)
-	if err != nil {
+	at, _, err := c.resolveRequestLocked(ctx, target)
+	if err != nil || at == nil || !c.validAtLocked(at) || !at.validExtent() {
 		return nil
 	}
 	return at
 }
 
-// authorize retains the visible grant on continuations and virtual projections.
-func (c *Core) authorize(ctx context.Context, p Principal, action Action, target string) error {
-	if err := c.authorizePath(ctx, p, action, target); err != nil {
-		return err
+// resolveLocked reads the live namespace. Selected requests use their own map.
+func (c *Core) resolveLocked(p string) (*location, []string, error) {
+	if c.closed {
+		return nil, nil, Fail(MountUnavailable, nil)
 	}
-	expected, err := c.constrained(ctx, target, nil)
-	if err != nil {
-		return err
+	if at := c.locationLocked(p); at != nil {
+		if at.mount.retiring {
+			return nil, nil, Fail(MountUnavailable, nil)
+		}
+		return at, nil, nil
 	}
-	c.mu.Lock()
-	at, _, err := c.resolveLocked(target, expected)
-	c.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if at != nil {
-		return c.authorizeBinding(ctx, p, action, at)
-	}
-	return ctx.Err()
-}
-
-func (c *Core) authorizeBinding(ctx context.Context, p Principal, action Action, at *location) error {
-	if at.prefix != at.mount.path {
-		if err := c.authorizePath(ctx, p, action, at.primary()); err != nil {
-			return err
+	names := make(map[string]bool)
+	for root, b := range c.bindings {
+		if !b.active || b.mount.retiring {
+			continue
+		}
+		prefix := p
+		if prefix != "/" {
+			prefix += "/"
+		}
+		if strings.HasPrefix(root, prefix) {
+			rest := strings.TrimPrefix(root, prefix)
+			if rest != "" {
+				names[strings.SplitN(rest, "/", 2)[0]] = true
+			}
 		}
 	}
-	c.mu.Lock()
-	valid := !c.closed && !at.mount.retiring && at.active && c.bindings[at.prefix] == at.binding
-	c.mu.Unlock()
-	if !valid {
-		return Fail(MountUnavailable, nil)
+	if p != "/" && len(names) == 0 {
+		return nil, nil, Fail(NotFound, nil)
 	}
-	return ctx.Err()
+	children := make([]string, 0, len(names))
+	for name := range names {
+		children = append(children, name)
+	}
+	sort.Strings(children)
+	return nil, children, nil
 }
 
-func (c *Core) admit(ctx context.Context, p Principal, action Action, target string) (*use, []string, error) {
-	if c == nil {
-		return nil, nil, Fail(InvalidRequest, nil)
-	}
-	if err := c.authorizePath(ctx, p, action, target); err != nil {
-		return nil, nil, err
-	}
-	expected, err := c.constrained(ctx, target, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	c.mu.Lock()
-	u, names, err := c.locateLocked(ctx, target, expected)
-	c.mu.Unlock()
-	if err != nil || u == nil {
-		return u, names, err
-	}
-	if err = c.authorizeBinding(ctx, p, action, u.location); err != nil {
-		u.release()
-		return nil, nil, err
-	}
-	return u, names, nil
+// BindingInfo is an observation, never an execution credential.
+type BindingInfo struct {
+	Mount *Mount
+	Base  string
 }
 
-// admitAt renews dynamic authority for the captured address without resolving
-// paths or consulting a second selection. A stale generation cannot retarget.
-func (c *Core) admitAt(ctx context.Context, p Principal, action Action, at *location) (*use, error) {
-	if c == nil || at == nil {
-		return nil, Fail(InvalidRequest, nil)
-	}
-	if err := c.authorizeChecked(ctx, p, action, at.visible()); err != nil {
-		return nil, err
-	}
+func (c *Core) Binding(prefix string) (BindingInfo, bool) {
 	c.mu.Lock()
-	u, err := c.borrowAtLocked(ctx, at)
-	c.mu.Unlock()
-	if err != nil {
-		return nil, err
+	defer c.mu.Unlock()
+	b := c.bindings[prefix]
+	if c.closed || b == nil || !b.active || b.mount.retiring {
+		return BindingInfo{}, false
 	}
-	if err = c.authorizeBinding(ctx, p, action, at); err != nil {
-		u.release()
-		return nil, err
-	}
-	return u, nil
-}
-func (c *Core) borrowAtLocked(ctx context.Context, at *location) (*use, error) {
-	if c.closed || at.mount.core != c || at.mount.retiring || !at.active || c.bindings[at.prefix] != at.binding {
-		return nil, Fail(MountUnavailable, nil)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return at.mount.borrowLocked(ctx, at), nil
+	return BindingInfo{Mount: b.mount, Base: b.base}, true
 }

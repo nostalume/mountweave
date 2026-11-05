@@ -12,18 +12,34 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-func (d *Driver) Open(ctx context.Context, p string, wanted *core.Range) (core.Opened, error) {
+func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
+	if options.Mode == core.LiveEdit {
+		return core.Opened{Change: core.Change{Effect: core.Unchanged}}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := options.Validate(); err != nil {
+		return core.Opened{}, err
+	}
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if err := core.ValidatePath(p); err != nil {
 		return core.Opened{}, err
 	}
-	return d.open(ctx, path.Base(p), wanted, func(tx *bolt.Tx) (entryRecord, error) { return lookup(tx, p) })
+	return d.open(ctx, path.Base(p), options, func(tx *bolt.Tx) (entryRecord, error) { return lookup(tx, p) })
 }
 
-func (d *Driver) open(ctx context.Context, name string, wanted *core.Range, resolve func(*bolt.Tx) (entryRecord, error)) (core.Opened, error) {
+func (d *Driver) open(ctx context.Context, name string, options core.OpenOptions, resolve func(*bolt.Tx) (entryRecord, error)) (core.Opened, error) {
+	wanted, selection, bound := options.Range, options.Selection, options.Mode == core.BoundRead
 	if wanted != nil && !wanted.Valid() {
 		return core.Opened{}, core.Fail(core.InvalidRange, nil)
 	}
-	o, err := d.begin(ctx)
+	lifetime := ctx
+	if bound {
+		lifetime = context.WithoutCancel(ctx)
+	}
+	o, err := d.begin(lifetime)
 	if err != nil {
 		return core.Opened{}, err
 	}
@@ -35,10 +51,16 @@ func (d *Driver) open(ctx context.Context, name string, wanted *core.Range, reso
 			return err
 		}
 		f, err = fileAt(tx, e)
+		if err == nil {
+			err = selection.Check(metadata(name, e, f).Evidence)
+		}
 		return err
 	})
 	if err == nil && (!core.ValidName(f.ID) || f.Length < 0 || f.Stripes != stripeCount(f.Length, int64(d.layout.Data)*int64(d.layout.ShardBytes))) {
 		err = core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	if err == nil {
 		d.pins[f.ID]++
@@ -63,6 +85,9 @@ func (d *Driver) open(ctx context.Context, name string, wanted *core.Range, reso
 	b.mu.Lock()
 	b.stop = context.AfterFunc(o.ctx, func() { _ = b.Close() })
 	b.mu.Unlock()
+	if bound {
+		return core.Opened{Metadata: metadata(name, entryRecord{}, f), File: &boundFile{body: b, name: name}, Binding: core.PinnedVersion}, nil
+	}
 	return core.Opened{Metadata: metadata(name, entryRecord{}, f), Body: b, Length: &length, Range: actual}, nil
 }
 
@@ -102,13 +127,68 @@ func (b *body) Close() error {
 	}
 	return nil
 }
+
+type boundFile struct {
+	*body
+	name string
+}
+
+func (f *boundFile) Stat(ctx context.Context) (core.Metadata, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return core.Metadata{}, err
+	}
+	if f.closed {
+		return core.Metadata{}, io.ErrClosedPipe
+	}
+	return metadata(f.name, entryRecord{}, f.file), f.op.ctx.Err()
+}
+
+func (f *boundFile) ReadAt(ctx context.Context, p []byte, offset int64) (n int, err error) {
+	if offset < 0 {
+		return 0, core.Fail(core.InvalidRange, nil)
+	}
+	call, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(f.op.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.op.ctx.Err() != nil {
+		cancel()
+	}
+	f.position, f.end, f.terminal = offset, f.file.Length-1, nil
+	// Reuse the stripe decoder, but do not retain scarce window credits while
+	// a persistent File is idle or at EOF. Its generation pin remains held.
+	defer func() {
+		if f.reserved {
+			f.op.d.release()
+			f.reserved = false
+		}
+		f.buffers, f.shards = nil, nil
+		f.loaded = -1
+	}()
+	for n < len(p) {
+		var count int
+		count, err = f.read(call, p[n:])
+		n += count
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, call.Err()
+}
 func (b *body) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.read(b.op.ctx, p)
+}
+
+func (b *body) read(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if err := b.op.ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	if b.closed {
@@ -122,7 +202,7 @@ func (b *body) Read(p []byte) (int, error) {
 	}
 	d := b.op.d
 	if !b.reserved {
-		if err := d.reserve(b.op.ctx); err != nil {
+		if err := d.reserve(ctx); err != nil {
 			return 0, err
 		}
 		b.reserved = true
@@ -132,7 +212,7 @@ func (b *body) Read(p []byte) (int, error) {
 	stripeBytes := int64(d.layout.Data) * int64(d.layout.ShardBytes)
 	index := b.position / stripeBytes
 	if b.loaded != index {
-		if err := b.load(index); err != nil {
+		if err := b.load(ctx, index); err != nil {
 			b.terminal = err
 			return 0, err
 		}
@@ -145,7 +225,7 @@ func (b *body) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (b *body) load(index int64) error {
+func (b *body) load(ctx context.Context, index int64) error {
 	d := b.op.d
 	s, err := d.stripe(b.file, index)
 	if err != nil {
@@ -160,7 +240,7 @@ func (b *body) load(index int64) error {
 	attempted, failures := make([]bool, len(s.Shards)), make([]error, len(s.Shards))
 	fetch := func(i int) {
 		attempted[i] = true
-		if err := b.fetch(s.Shards[i], b.buffers[i]); err != nil {
+		if err := b.fetch(ctx, s.Shards[i], b.buffers[i]); err != nil {
 			failures[i] = err
 		} else {
 			b.shards[i] = b.buffers[i]
@@ -178,7 +258,7 @@ func (b *body) load(index int64) error {
 		missing = missing || len(b.shards[i]) == 0
 	}
 	if !missing {
-		return b.op.ctx.Err()
+		return ctx.Err()
 	}
 	valid := 0
 	for _, shard := range b.shards {
@@ -203,7 +283,7 @@ func (b *body) load(index int64) error {
 		}
 	}
 	if valid < d.layout.Data {
-		return core.Fail(core.UpstreamFailure, errors.Join(errors.New("insufficient verified shards"), errors.Join(failures...), b.op.ctx.Err()))
+		return core.Fail(core.UpstreamFailure, errors.Join(errors.New("insufficient verified shards"), errors.Join(failures...), ctx.Err()))
 	}
 	if err := d.codec.ReconstructData(b.shards); err != nil {
 		return core.Fail(core.InvalidUpstreamResponse, err)
@@ -213,17 +293,17 @@ func (b *body) load(index int64) error {
 			return core.Fail(core.InvalidUpstreamResponse, errors.New("reconstructed data checksum mismatch"))
 		}
 	}
-	return b.op.ctx.Err()
+	return ctx.Err()
 }
 
-func (b *body) fetch(shard shardRecord, output []byte) error {
+func (b *body) fetch(ctx context.Context, shard shardRecord, output []byte) error {
 	d := b.op.d
-	u, err := d.borrowMember(b.op.ctx, shard.Member)
+	u, err := d.borrowMember(ctx, shard.Member)
 	if err != nil {
 		return err
 	}
 	defer u.finish()
-	opened, openErr := u.native.Open(u.ctx, shard.Path, nil)
+	opened, openErr := u.native.Open(u.ctx, core.NativePath(shard.Path), core.OpenOptions{})
 	if opened.Body == nil {
 		if openErr == nil {
 			openErr = core.Fail(core.InvalidUpstreamResponse, nil)

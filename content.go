@@ -1,144 +1,10 @@
 package core
 
 import (
-	"context"
 	"errors"
 	"io"
 	"sync"
-	"time"
 )
-
-func (c *Core) Open(ctx context.Context, p Principal, target string, wanted *Range) (Content, error) {
-	if wanted != nil && !wanted.Valid() {
-		return Content{}, Fail(InvalidRange, nil)
-	}
-	u, _, err := c.admit(ctx, p, ReadAction, target)
-	return c.openUse(u, wanted, err, nil)
-}
-func (c *Core) openAt(ctx context.Context, p Principal, at *location, wanted *Range) (Content, error) {
-	u, err := c.admitAt(ctx, p, ReadAction, at)
-	return c.openUse(u, wanted, err, nil)
-}
-
-// openUse owns timeout, adoption and cleanup for either a rooted open or a child
-// open from an already bound parent. Only the parent constructs the latter.
-func (c *Core) openUse(u *use, wanted *Range, err error, openChild func(context.Context) (Opened, error)) (Content, error) {
-	if err != nil {
-		return Content{}, err
-	}
-	if u == nil {
-		return Content{}, Fail(NotFile, nil)
-	}
-	var phase sync.Mutex
-	adopted, timedOut := false, false
-	var timer *time.Timer
-	if c.opts.OpenTimeout > 0 {
-		timer = time.AfterFunc(c.opts.OpenTimeout, func() {
-			phase.Lock()
-			defer phase.Unlock()
-			if !adopted {
-				timedOut = true
-				u.cancel()
-			}
-		})
-	}
-	rel := u.path
-	var opened Opened
-	var openErr error
-	if openChild == nil {
-		opened, openErr = u.mount.driver.Open(u.ctx, rel, wanted)
-	} else {
-		opened, openErr = openChild(u.ctx)
-	}
-	phase.Lock()
-	if timer != nil {
-		timer.Stop()
-	}
-	adopted = true
-	expired := timedOut
-	phase.Unlock()
-	if openErr == nil {
-		openErr = u.ctx.Err()
-	}
-	if expired {
-		openErr = errors.Join(context.DeadlineExceeded, openErr)
-	}
-	return c.adoptOpened(u, wanted, opened, openErr)
-}
-
-func (c *Core) adoptOpened(u *use, wanted *Range, opened Opened, openErr error) (Content, error) {
-	if openErr == nil {
-		openErr = u.ctx.Err()
-	}
-	if openErr == nil {
-		openErr = validateOpened(opened, u.path, wanted)
-	}
-	if openErr != nil {
-		if opened.Body != nil {
-			if closeErr := opened.Body.Close(); closeErr != nil {
-				u.failed(closeErr, opened.Body)
-				return Content{}, errors.Join(openErr, closeErr)
-			}
-		}
-		u.release()
-		return Content{}, openErr
-	}
-	entry, err := project(u.visible(), opened.Metadata)
-	if err != nil {
-		closeErr := opened.Body.Close()
-		if closeErr == nil {
-			u.release()
-		} else {
-			u.failed(closeErr, opened.Body)
-		}
-		return Content{}, errors.Join(err, closeErr)
-	}
-	b := &ownedBody{inner: opened.Body, use: u, done: make(chan struct{}), remaining: -1}
-	if opened.Length != nil {
-		b.remaining = *opened.Length
-	}
-	b.mu.Lock()
-	b.stop = context.AfterFunc(u.ctx, func() { _ = b.Close() })
-	b.mu.Unlock()
-	var length *int64
-	if opened.Length != nil {
-		n := *opened.Length
-		length = &n
-	}
-	var actual *ContentRange
-	if opened.Range != nil {
-		r := *opened.Range
-		actual = &r
-	}
-	return Content{Entry: entry, Body: b, Length: length, Range: actual}, nil
-}
-func validateOpened(o Opened, rel string, wanted *Range) error {
-	if o.Body == nil {
-		return Fail(InvalidUpstreamResponse, errors.New("opened content has no body"))
-	}
-	if o.Metadata.Kind == Directory {
-		return Fail(NotFile, nil)
-	}
-	if _, err := project("/", o.Metadata); err != nil {
-		return err
-	}
-	if err := checkName(o.Metadata, rel); err != nil {
-		return err
-	}
-	if o.Length != nil && *o.Length < 0 {
-		return Fail(InvalidUpstreamResponse, nil)
-	}
-	if o.Range != nil {
-		if wanted == nil || o.Length == nil {
-			return Fail(InvalidUpstreamResponse, nil)
-		}
-		expected, err := wanted.Resolve(o.Range.Total)
-		if err != nil || expected != *o.Range || *o.Length != o.Range.End-o.Range.Start+1 {
-			return Fail(InvalidUpstreamResponse, err)
-		}
-	}
-	return nil
-}
 
 // ownedBody is the single owner of the body and mount use. A completed Close
 // alone cannot release that use while a Read is still executing.
@@ -152,6 +18,7 @@ type ownedBody struct {
 	remaining          int64
 	terminal, closeErr error
 	done               chan struct{}
+	order              *OrderTurn
 }
 
 // begin and finish are shared by Read and WriteTo so cancellation, length
@@ -169,6 +36,7 @@ func (b *ownedBody) begin() (int64, error) {
 	b.readers++
 	return b.remaining, nil
 }
+
 func (b *ownedBody) finish(n int64, err error, complete bool) error {
 	if cause := b.use.ctx.Err(); cause != nil {
 		if err == nil || err == io.EOF {
@@ -199,6 +67,7 @@ func (b *ownedBody) finish(n int64, err error, complete bool) error {
 	b.mu.Unlock()
 	if release {
 		b.use.release()
+		b.finishOrder()
 	}
 	if terminal {
 		if closeErr := b.Close(); closeErr != nil {
@@ -207,6 +76,7 @@ func (b *ownedBody) finish(n int64, err error, complete bool) error {
 	}
 	return err
 }
+
 func (b *ownedBody) Read(p []byte) (int, error) {
 	want, err := b.begin()
 	if err != nil {
@@ -226,6 +96,7 @@ func (b *ownedBody) Read(p []byte) (int, error) {
 	}
 	return n, b.finish(int64(n), err, false)
 }
+
 func (b *ownedBody) Close() error {
 	b.mu.Lock()
 	if b.closing {
@@ -262,7 +133,22 @@ func (b *ownedBody) Close() error {
 	} else if release {
 		b.use.release()
 	}
+	b.finishOrder()
 	return err
+}
+
+func (b *ownedBody) finishOrder() {
+	b.mu.Lock()
+	t := b.order
+	ready := b.finished && (b.closeErr != nil || b.readers == 0)
+	uncertain := b.closeErr != nil
+	if ready {
+		b.order = nil
+	}
+	b.mu.Unlock()
+	if ready {
+		t.finish(uncertain)
+	}
 }
 
 // WriteTo preserves compatible native copy paths while retaining the mount use

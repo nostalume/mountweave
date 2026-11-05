@@ -8,7 +8,10 @@ import (
 
 type directoryScope struct{ *iterator }
 
-func (d *Driver) OpenDirectory(ctx context.Context, p string) (core.DirectoryScope, error) {
+func (d *Driver) OpenDirectory(ctx context.Context, p core.NativeAddress) (core.DirectoryScope, error) {
+	if p.Namespace() != core.TreeNamespace {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
 	meta, err := d.Stat(ctx, p)
 	if err != nil {
 		return nil, err
@@ -17,10 +20,10 @@ func (d *Driver) OpenDirectory(ctx context.Context, p string) (core.DirectorySco
 		return nil, core.Fail(core.NotDirectory, nil)
 	}
 	prefix := d.prefix
-	if p != "/" {
+	if p.Value() != "/" {
 		prefix = d.key(p) + "/"
 	}
-	return &directoryScope{iterator: &iterator{driver: d, prefix: prefix, files: make(map[string]core.Metadata)}}, nil
+	return &directoryScope{iterator: &iterator{driver: d, prefix: prefix, delimiter: "/", files: make(map[string]core.Metadata)}}, nil
 }
 
 func (s *directoryScope) OpenFile(ctx context.Context, name string) (core.Opened, error) {
@@ -34,7 +37,7 @@ func (s *directoryScope) OpenFile(ctx context.Context, name string) (core.Opened
 	if meta.Kind != core.File {
 		return core.Opened{}, core.Fail(core.NotFile, nil)
 	}
-	if err := s.driver.admit(ctx, "/"+name); err != nil {
+	if err := s.driver.admit(ctx, core.NativePath("/"+name)); err != nil {
 		return core.Opened{}, err
 	}
 	return s.driver.get(ctx, s.prefix+name, name, nil)

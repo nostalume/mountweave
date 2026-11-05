@@ -26,17 +26,20 @@ func mutationResult(ctx context.Context, err error, conditional bool) (core.Chan
 	}
 	return core.Change{Effect: core.Unknown}, errors.Join(translate(err), ctx.Err())
 }
-func (d *Driver) target(ctx context.Context, p string) error {
+func (d *Driver) target(ctx context.Context, p core.NativeAddress) error {
 	if err := d.admit(ctx, p); err != nil {
 		return err
 	}
-	if p == "/" {
+	if p.Namespace() == core.TreeNamespace && p.Value() == "/" {
 		return core.Fail(core.InvalidRequest, nil)
 	}
 	return d.ancestors(ctx, p)
 }
-func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Mkdir(ctx context.Context, p core.NativeAddress) (core.Change, error) {
 	u := core.Change{Effect: core.Unchanged}
+	if p.Namespace() != core.TreeNamespace {
+		return u, core.Fail(core.UnsupportedOperation, nil)
+	}
 	if err := d.target(ctx, p); err != nil {
 		return u, err
 	}
@@ -48,12 +51,38 @@ func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
 	_, err := d.client.PutObject(ctx, &sdk.PutObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(d.key(p) + "/"), Body: bytes.NewReader(nil), ContentLength: aws.Int64(0), IfNoneMatch: aws.String("*")}, noReplay)
 	return mutationResult(ctx, err, true)
 }
-func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Remove(ctx context.Context, p core.NativeAddress, policies ...core.RemoveOptions) (core.Change, error) {
 	u := core.Change{Effect: core.Unchanged}
+	if len(policies) > 1 {
+		return u, core.Fail(core.InvalidRequest, nil)
+	}
+	var policy core.RemoveOptions
+	if len(policies) == 1 {
+		policy = policies[0]
+	}
+	var match, none *string
+	var conditionErr error
+	if policy.When.IsPresent() {
+		match = aws.String("*")
+	} else {
+		match, none, conditionErr = nativeCondition(policy.When, false)
+	}
+	if conditionErr != nil {
+		return u, conditionErr
+	}
+	if none != nil {
+		return u, core.Fail(core.UnsupportedOperation, nil)
+	}
 	if err := d.target(ctx, p); err != nil {
 		return u, err
 	}
-	meta, err := d.statKey(ctx, d.key(p), name(p))
+	var meta core.Metadata
+	var err error
+	if p.Namespace() == core.KeyNamespace {
+		meta, err = d.Stat(ctx, p)
+	} else {
+		meta, err = d.statKey(ctx, d.key(p), name(p))
+	}
 	if err != nil {
 		return u, err
 	}
@@ -65,17 +94,30 @@ func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
 	if err = ctx.Err(); err != nil {
 		return u, err
 	}
-	_, err = d.client.DeleteObject(ctx, &sdk.DeleteObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(d.key(p))}, noReplay)
-	return mutationResult(ctx, err, false)
+	_, err = d.client.DeleteObject(ctx, &sdk.DeleteObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(d.key(p)), IfMatch: match}, noReplay)
+	result, err := mutationResult(ctx, err, !policy.When.Empty())
+	if core.CodeOf(err) == core.AlreadyExists {
+		err = core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{}, err))
+	}
+	return result, err
 }
 
-func (d *Driver) putBuffer(ctx context.Context, key string, data []byte, replace bool) (core.Change, error) {
-	request := &sdk.PutObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(key), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}
-	if !replace {
-		request.IfNoneMatch = aws.String("*")
+func (d *Driver) putBuffer(ctx context.Context, key string, data []byte, when core.Condition) (core.Change, error) {
+	match, none, err := nativeCondition(when, false)
+	if err != nil {
+		return core.Change{Effect: core.Unchanged}, err
 	}
-	_, err := d.client.PutObject(ctx, request, noReplay)
-	return mutationResult(ctx, err, !replace)
+	request := &sdk.PutObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(key), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}
+	request.IfMatch, request.IfNoneMatch = match, none
+	ack, err := d.client.PutObject(ctx, request, noReplay)
+	result, err := mutationResult(ctx, err, !when.Empty())
+	if ack != nil {
+		result.Evidence = evidence(ack.ETag, ack.VersionId)
+	}
+	if core.CodeOf(err) == core.AlreadyExists && !when.IsAbsent() {
+		err = core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{}, err))
+	}
+	return result, err
 }
 
 var _ core.DirectoryMaker = (*Driver)(nil)

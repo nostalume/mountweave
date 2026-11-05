@@ -3,11 +3,14 @@ package s3_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,8 +20,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	core "github.com/nostalume/mountweave"
+	"github.com/nostalume/mountweave/drivers/local"
 	driver "github.com/nostalume/mountweave/drivers/s3"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/protocols/httpapi"
+	"github.com/nostalume/mountweave/protocols/webdav"
 )
 
 type objectProtocol struct {
@@ -48,6 +53,7 @@ type objectProtocol struct {
 func newProtocol() *objectProtocol {
 	return &objectProtocol{objects: make(map[string][]byte), uploads: make(map[string]map[int][]byte), calls: make(map[string]int), metadata: make(map[string]string), uploadMetadata: make(map[string]string)}
 }
+func objectTag(data []byte) string { return fmt.Sprintf(`"%x"`, sha256.Sum256(data)) }
 func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Host != "s3.example.test" {
 		return nil, errors.New("outside closed protocol")
@@ -69,6 +75,29 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	conditionFailure := func(reading bool) *http.Response {
+		data, exists := s.objects[key]
+		tag := objectTag(data)
+		match, none := r.Header.Get("If-Match"), r.Header.Get("If-None-Match")
+		status := 0
+		if match != "" && (!exists || match != "*" && match != tag) {
+			status = 412
+		}
+		if status == 0 && none != "" && exists && (none == "*" || strings.TrimPrefix(none, "W/") == tag) {
+			status = 412
+			if reading {
+				status = 304
+			}
+		}
+		if status == 0 {
+			return nil
+		}
+		out := response(r, status, "<Error><Code>PreconditionFailed</Code></Error>")
+		if exists {
+			out.Header.Set("ETag", tag)
+		}
+		return out
+	}
 	if _, present := q["delete"]; present && r.Method == "POST" {
 		var request struct {
 			Objects []struct {
@@ -178,10 +207,8 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 			out.Header.Set("ETag", fmt.Sprintf("\"p%d\"", n))
 			return out, nil
 		case "POST":
-			if r.Header.Get("If-None-Match") == "*" {
-				if _, exists := s.objects[key]; exists {
-					return response(r, 412, "<Error><Code>PreconditionFailed</Code></Error>"), nil
-				}
+			if failure := conditionFailure(false); failure != nil {
+				return failure, nil
 			}
 			var request struct {
 				Parts []struct {
@@ -205,7 +232,7 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 			if s.lostComplete {
 				return nil, errors.New("completion response lost")
 			}
-			return response(r, 200, fmt.Sprintf("<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>%s</Key><ETag>\"complete\"</ETag></CompleteMultipartUploadResult>", key)), nil
+			return response(r, 200, fmt.Sprintf("<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>%s</Key><ETag>%s</ETag></CompleteMultipartUploadResult>", key, objectTag(data))), nil
 		case "DELETE":
 			if s.failAbort {
 				return response(r, 403, "<Error><Code>AccessDenied</Code></Error>"), nil
@@ -226,25 +253,30 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 			s.rejectNext, s.rejectedBody = false, r.Body
 			return response(r, 403, "<Error><Code>AccessDenied</Code></Error>"), nil
 		}
-		if _, exists := s.objects[key]; exists && r.Header.Get("If-None-Match") == "*" {
-			return response(r, 412, "<Error><Code>PreconditionFailed</Code></Error>"), nil
+		if failure := conditionFailure(false); failure != nil {
+			return failure, nil
 		}
 		data, err := io.ReadAll(input)
 		if err != nil {
 			return nil, err
 		}
 		s.objects[key] = data
-		return response(r, 200, ""), nil
+		out := response(r, 200, "")
+		out.Header.Set("ETag", objectTag(data))
+		return out, nil
 	case "HEAD", "GET":
 		data, exists := s.objects[key]
 		if !exists {
 			return response(r, 404, "<Error><Code>NoSuchKey</Code></Error>"), nil
 		}
+		if failure := conditionFailure(true); failure != nil {
+			return failure, nil
+		}
 		if r.Method == "HEAD" {
 			out := response(r, 200, "")
 			out.ContentLength = int64(len(data))
 			out.Header.Set("Content-Length", strconv.Itoa(len(data)))
-			out.Header.Set("ETag", "\"complete\"")
+			out.Header.Set("ETag", objectTag(data))
 			if s.metadata[key] != "" {
 				out.Header.Set("X-Amz-Meta-Mountweave-Upload", s.metadata[key])
 			}
@@ -256,12 +288,17 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 			out := response(r, 206, string(data[start:end+1]))
 			out.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
 			out.Header.Set("Content-Length", strconv.Itoa(end-start+1))
+			out.Header.Set("ETag", objectTag(data))
 			return out, nil
 		}
 		out := response(r, 200, string(data))
 		out.Header.Set("Content-Length", strconv.Itoa(len(data)))
+		out.Header.Set("ETag", objectTag(data))
 		return out, nil
 	case "DELETE":
+		if failure := conditionFailure(false); failure != nil {
+			return failure, nil
+		}
 		delete(s.objects, key)
 		return response(r, 204, ""), nil
 	}
@@ -269,7 +306,7 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 }
 func readFile(t *testing.T, c *core.Core, p string, wanted *core.Range) []byte {
 	t.Helper()
-	opened, err := c.Open(context.Background(), "writer", p, wanted)
+	opened, err := c.Open(context.Background(), "writer", core.Path(p), core.OpenOptions{Range: wanted})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,15 +338,15 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	server.hold, server.started, server.retryFirst = server.second, make(chan struct{}), true
 	localRoot := t.TempDir()
 	opts := driver.Options{PartSize: 5 << 20, MaxBufferedBytes: 10 << 20, PartConcurrency: 2, PartAttempts: 2, CleanupTimeout: time.Second}
-	d, c := preparedDriver(t, server.roundTrip, []driver.Options{opts}, func(o *s3.Options) { o.RetryMaxAttempts = 3 })
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/folder"); err != nil {
+	d, c := preparedDriver(t, server.roundTrip, []driver.Options{opts}, nil, func(o *s3.Options) { o.RetryMaxAttempts = 3 })
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/folder")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Mkdir(ctx, "writer", "/cloud/folder"); core.CodeOf(err) != core.AlreadyExists {
+	if _, err := c.Mkdir(ctx, "writer", core.Path("/cloud/folder")); core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte("x"), (5<<20)+13)
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/file", bytes.NewReader(payload), nil); err != nil || change.Effect != core.Applied {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), bytes.NewReader(payload), nil); err != nil || change.Effect != core.Applied {
 		t.Fatal(change, err)
 	}
 	if server.calls["PUT 1 u1"] != 2 || server.calls["PUT 2 u1"] != 1 {
@@ -318,22 +355,141 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	if got := readFile(t, c, "/cloud/folder/file", &core.Range{Start: (5 << 20) - 3, End: (5 << 20) + 4}); !bytes.Equal(got, payload[(5<<20)-3:(5<<20)+5]) {
 		t.Fatal("cross-part range")
 	}
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/file", bytes.NewReader(payload), nil); core.CodeOf(err) != core.AlreadyExists || change.Effect != core.Unchanged {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), bytes.NewReader(payload), nil); core.CodeOf(err) != core.AlreadyExists || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
 	fault := errors.New("input failed after a complete part")
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/file", failedEOF{bytes.NewReader(payload), fault}, nil, core.WriteOptions{Replace: true}); !errors.Is(err, fault) || change.Effect != core.Unchanged {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), failedEOF{bytes.NewReader(payload), fault}, nil, core.WriteOptions{Policy: core.Publish()}); !errors.Is(err, fault) || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
 	if got := readFile(t, c, "/cloud/folder/file", nil); !bytes.Equal(got, payload) {
 		t.Fatal("failed replacement changed old content")
 	}
 	n := int64(3)
-	if _, err := c.Write(ctx, "writer", "/cloud/folder/file", strings.NewReader("new"), &n, core.WriteOptions{Replace: true}); err != nil {
+	if _, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), strings.NewReader("new"), &n, core.WriteOptions{Policy: core.Publish()}); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, c, "/cloud/folder/file", nil); string(got) != "new" {
 		t.Fatal(string(got))
+	}
+	dav, err := webdav.New(c, webdav.Options{Tree: core.TreeOptions{MaxEntries: 64, MaxPlanBytes: 8192}, Prefix: "/dav/", Root: core.Path("/cloud"), CursorTTL: time.Minute,
+		Limits:       webdav.Limits{XMLBytes: 1024, ListEntries: 10, ListNameBytes: 4096},
+		Authenticate: func(http.ResponseWriter, *http.Request) (core.Principal, bool) { return "writer", true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		body, condition string
+		status          int
+	}{{"one", "", 201}, {"two", "", 204}, {"bad", "*", 412}} {
+		r := httptest.NewRequest("PUT", "/dav/published", strings.NewReader(tc.body))
+		if tc.condition != "" {
+			r.Header.Set("If-None-Match", tc.condition)
+		}
+		w := httptest.NewRecorder()
+		dav.ServeHTTP(w, r)
+		if w.Code != tc.status {
+			t.Fatal("native publication response", w.Code, w.Body.String())
+		}
+	}
+	if got := readFile(t, c, "/cloud/published", nil); string(got) != "two" {
+		t.Fatal("exclusive publication replaced content", string(got))
+	}
+	jsonHTTP, err := httpapi.New(c, func(context.Context, string) (core.Principal, error) { return "writer", nil }, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jsonHTTP.Close(ctx)
+	// The same observed tag travels through both protocols and the same native
+	// commit. No metadata request may precede a conditional GET.
+	for _, endpoint := range []struct {
+		handler http.Handler
+		url     string
+	}{
+		{dav, "/dav/published"}, {jsonHTTP, "/api/v1/fs/content?path=/cloud/published&replace=true"},
+	} {
+		request := func(method, body string, headers map[string]string, status int) *httptest.ResponseRecorder {
+			t.Helper()
+			r := httptest.NewRequest(method, endpoint.url, strings.NewReader(body))
+			r.Header.Set("Authorization", "Bearer synthetic")
+			for name, value := range headers {
+				r.Header.Set(name, value)
+			}
+			w := httptest.NewRecorder()
+			endpoint.handler.ServeHTTP(w, r)
+			if w.Code != status {
+				t.Fatalf("%s %s: %d %s", method, endpoint.url, w.Code, w.Body.String())
+			}
+			return w
+		}
+		// GET does not accept the JSON write-only replace query.
+		readURL := endpoint.url
+		endpoint.url = strings.TrimSuffix(endpoint.url, "&replace=true")
+		first := request("GET", "", nil, 200)
+		tag := first.Header().Get("ETag")
+		if tag == "" {
+			t.Fatal("native validator was dropped")
+		}
+		heads := server.calls["HEAD  "]
+		request("GET", "", map[string]string{"If-Match": tag, "If-Unmodified-Since": "Thu, 01 Jan 1970 00:00:00 GMT", "Range": "bytes=0-0"}, 206)
+		request("HEAD", "", map[string]string{"If-None-Match": "W/" + tag}, 304)
+		request("GET", "", map[string]string{"If-None-Match": tag}, 304)
+		if server.calls["HEAD  "] != heads+1 {
+			t.Fatal("conditional GET added a HEAD")
+		}
+		endpoint.url = readURL
+		putStatus := 204
+		if endpoint.handler == jsonHTTP {
+			putStatus = 201
+		}
+		request("PUT", "changed", map[string]string{"If-Match": tag}, putStatus)
+		request("PUT", "stale", map[string]string{"If-Match": tag}, 412)
+		request("PUT", "weak", map[string]string{"If-Match": "W/" + tag}, 412)
+		request("PUT", "many", map[string]string{"If-Match": tag + `, "other"`}, 501)
+		endpoint.url = strings.TrimSuffix(endpoint.url, "&replace=true")
+		current := request("GET", "", nil, 200)
+		if current.Body.String() != "changed" {
+			t.Fatal("failed condition changed content")
+		}
+		// Make the next protocol's original representation different again.
+		server.objects["vault/published"] = []byte("two")
+	}
+	state, err := c.Stat(ctx, "writer", core.Path("/cloud/published"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := core.IfMatch(core.Validator{Domain: "s3-etag", Tag: `"stale"`})
+	for _, options := range []core.CopyOptions{
+		{Source: core.ReadSelection{When: stale}},
+		{Source: core.ReadSelection{When: core.IfMatch(state.Evidence.Validator)}, Target: core.WriteOptions{Policy: core.Publish(stale)}},
+	} {
+		change, err := c.Copy(ctx, "writer", core.Path("/cloud/published"), core.Path("/cloud/guarded-copy"), options)
+		if core.CodeOf(err) != core.PreconditionFailed || change.Effect != core.Unchanged {
+			t.Fatal(change, err)
+		}
+	}
+	if change, err := c.Remove(ctx, "writer", core.Path("/cloud/published"), core.RemoveOptions{When: stale}); core.CodeOf(err) != core.PreconditionFailed || change.Effect != core.Unchanged {
+		t.Fatal(change, err)
+	}
+	operation := map[string]any{"kind": "fs.copy", "input": map[string]any{
+		"source": "/cloud/published", "target": "/cloud/guarded-copy", "options": core.CopyOptions{
+			Source: core.ReadSelection{When: core.IfMatch(state.Evidence.Validator)}, Target: core.WriteOptions{Policy: core.Publish(core.IfAbsent())},
+		},
+	}}
+	wire, err := json.Marshal(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("CONTRACT FileOperationRequest " + string(wire))
+	for _, status := range []int{200, 412} {
+		r := httptest.NewRequest("POST", "/api/v1/fs/operations", bytes.NewReader(wire))
+		r.Header.Set("Authorization", "Bearer synthetic")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		jsonHTTP.ServeHTTP(w, r)
+		if w.Code != status {
+			t.Fatal("structured guarded Copy", w.Code, w.Body.String())
+		}
 	}
 	localDriver, err := local.New(localRoot)
 	if err != nil {
@@ -342,18 +498,18 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	if _, err := c.Install("/local", localDriver); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.CopyTree(ctx, "writer", "/cloud/folder", "/local/copied", core.TreeCopyOptions{MaxEntries: 10, MaxPlanBytes: 1024})
-	if err != nil || len(rows) != 2 {
+	rows, err := c.CopyTree(ctx, "writer", core.Path("/cloud/folder"), core.Path("/local/copied"), core.TreeCopyOptions{MaxEntries: 10, MaxPlanBytes: 1024})
+	if err != nil || len(rows.Items) != 2 {
 		t.Fatal(rows, err)
 	}
-	if _, err := c.Copy(ctx, "writer", "/local/copied/file", "/cloud/folder/copied"); err != nil {
+	if _, err := c.Copy(ctx, "writer", core.Path("/local/copied/file"), core.Path("/cloud/folder/copied")); err != nil {
 		t.Fatal(err)
 	}
 	server.mu.Lock()
 	server.lostComplete = true
 	before := server.next
 	server.mu.Unlock()
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/lost", bytes.NewReader(payload), nil); err == nil || change.Effect != core.Unknown {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/lost"), bytes.NewReader(payload), nil); err == nil || change.Effect != core.Unknown {
 		t.Fatal(change, err)
 	}
 	server.mu.Lock()
@@ -363,7 +519,7 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	}
 	server.failPart, server.failAbort = true, true
 	server.mu.Unlock()
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/failed", bytes.NewReader(payload), nil); err == nil || change.Effect != core.Unchanged {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/failed"), bytes.NewReader(payload), nil); err == nil || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
 	if len(d.PendingUploads()) != 1 {
@@ -371,7 +527,7 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	}
 	untouched := strings.NewReader("z")
 	one := int64(1)
-	if change, err := c.Write(ctx, "writer", "/cloud/folder/blocked", untouched, &one); err == nil || change.Effect != core.Unchanged || untouched.Len() != 1 {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/blocked"), untouched, &one); err == nil || change.Effect != core.Unchanged || untouched.Len() != 1 {
 		t.Fatal(change, err)
 	}
 	server.mu.Lock()
@@ -381,19 +537,19 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.rejectNext = true
-	if _, err := c.Write(ctx, "writer", "/cloud/folder/rejected", strings.NewReader("x"), &one); err == nil {
+	if _, err := c.Write(ctx, "writer", core.Path("/cloud/folder/rejected"), strings.NewReader("x"), &one); err == nil {
 		t.Fatal("native early rejection ignored")
 	}
 	if n, _ := server.rejectedBody.Read(make([]byte, 1)); n != 0 {
 		t.Fatal("late transport read retained a released payload buffer")
 	}
-	if _, err := c.Remove(ctx, "writer", "/cloud/folder/file"); err != nil {
+	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/folder/file")); err != nil {
 		t.Fatal(err)
 	}
-	if change, err := c.Remove(ctx, "writer", "/cloud/folder"); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged {
+	if change, err := c.Remove(ctx, "writer", core.Path("/cloud/folder")); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
-	if _, err := c.RemoveTree(ctx, "writer", "/cloud/folder", core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 1024}); core.CodeOf(err) != core.UnsupportedOperation {
+	if _, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/folder"), core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 1024}); core.CodeOf(err) != core.UnsupportedOperation {
 		t.Fatal(err)
 	}
 	if got := readFile(t, c, "/cloud/folder/copied", nil); string(got) != "new" {
@@ -401,32 +557,58 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	}
 	policy := core.DirectoryRemoveOptions{Scope: core.Subtree}
 	limits := core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 1024}
-	if rows, err := c.RemoveTree(ctx, "writer", "/cloud/folder", core.TreeOptions{MaxEntries: 1, MaxPlanBytes: 1024}, policy); core.CodeOf(err) != core.CapacityExceeded || len(rows) != 1 || rows[0].Change.Effect != core.Unchanged || server.deleteBatches != 0 {
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/folder"), core.TreeOptions{MaxEntries: 1, MaxPlanBytes: 1024}, policy); core.CodeOf(err) != core.CapacityExceeded || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Unchanged || server.deleteBatches != 0 {
 		t.Fatal(rows, err)
 	}
 	server.deleteErrorKey = "vault/folder/copied"
-	if rows, err := c.RemoveTree(ctx, "writer", "/cloud/folder", limits, policy); core.CodeOf(err) != core.UpstreamAccessDenied || len(rows) != 1 || rows[0].Change.Effect != core.Incomplete {
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/folder"), limits, policy); core.CodeOf(err) != core.UpstreamAccessDenied || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Incomplete {
 		t.Fatal(rows, err)
 	}
 	if got := readFile(t, c, "/cloud/folder/copied", nil); string(got) != "new" {
 		t.Fatal(string(got))
 	}
 	server.deleteErrorKey, server.addDuringDelete = "", true
-	if rows, err := c.RemoveTree(ctx, "writer", "/cloud/folder", limits, policy); core.CodeOf(err) != core.DirectoryNotEmpty || len(rows) != 1 || rows[0].Change.Effect != core.Incomplete {
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/folder"), limits, policy); core.CodeOf(err) != core.DirectoryNotEmpty || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Incomplete {
 		t.Fatal(rows, err)
 	}
 	if got := readFile(t, c, "/cloud/folder/concurrent", nil); string(got) != "new" {
 		t.Fatal(string(got))
 	}
-	if rows, err := c.RemoveTree(ctx, "writer", "/cloud/folder", limits, policy); err != nil || len(rows) != 1 || rows[0].Change.Effect != core.Applied {
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/folder"), limits, policy); err != nil || len(rows.Items) != 1 || rows.Items[0].Change.Effect != core.Applied {
 		t.Fatal(rows, err)
 	}
 	for i := 0; i < 1001; i++ {
 		server.objects[fmt.Sprintf("vault/bulk/%04d", i)] = []byte("x")
 	}
 	beforeBatches := server.deleteBatches
-	if _, err := c.RemoveTree(ctx, "writer", "/cloud/bulk", core.TreeOptions{MaxEntries: 1010, MaxPlanBytes: 10000}, policy); err != nil || server.deleteBatches != beforeBatches+2 {
+	if _, err := c.RemoveTree(ctx, "writer", core.Path("/cloud/bulk"), core.TreeOptions{MaxEntries: 1010, MaxPlanBytes: 10000}, policy); err != nil || server.deleteBatches != beforeBatches+2 {
 		t.Fatal(server.deleteBatches, err)
+	}
+	// One visible clear composes native recursive S3 effects with Local's strict
+	// child removal, preserving both alias roots and the cloud directory marker.
+	server.objects["vault/keep/"] = []byte{}
+	server.objects["vault/keep/nested/"] = []byte{}
+	server.objects["vault/keep/nested/file"] = []byte("nested")
+	cloud, _ := c.Binding("/cloud")
+	disk, _ := c.Binding("/local")
+	if err := c.BindAlias(ctx, "/sources/cloud", cloud.Mount, "/keep"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BindAlias(ctx, "/sources/local", disk.Mount, "/copied"); err != nil {
+		t.Fatal(err)
+	}
+	policy.ContentsOnly = true
+	if rows, err := c.RemoveTree(ctx, "writer", core.Path("/sources"), limits, policy); err != nil || len(rows.Items) != 2 {
+		t.Fatal(rows, err)
+	}
+	if _, exists := server.objects["vault/keep/"]; !exists {
+		t.Fatal("clear removed its native root")
+	}
+	if _, exists := server.objects["vault/keep/nested/file"]; exists {
+		t.Fatal("native subtree survived")
+	}
+	if _, err := c.Stat(ctx, "writer", core.Path("/sources/local")); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -436,12 +618,12 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 	server.hold, server.started = make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(server.hold) })
 	t.Cleanup(release)
-	d, c := preparedDriver(t, server.roundTrip, []driver.Options{{PartSize: 5 << 20, MaxBufferedBytes: 10 << 20, PartConcurrency: 2, CleanupTimeout: time.Second}})
+	d, c := preparedDriver(t, server.roundTrip, []driver.Options{{PartSize: 5 << 20, MaxBufferedBytes: 10 << 20, PartConcurrency: 2, CleanupTimeout: time.Second}}, nil)
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		change, err := c.Write(callCtx, "writer", "/cloud/held", bytes.NewReader(bytes.Repeat([]byte("a"), (5<<20)+1)), nil)
+		change, err := c.Write(callCtx, "writer", core.Path("/cloud/held"), bytes.NewReader(bytes.Repeat([]byte("a"), (5<<20)+1)), nil)
 		if change.Effect != core.Unchanged {
 			err = errors.Join(err, errors.New("cancelled multipart published"))
 		}
@@ -460,7 +642,7 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 	}
 	untouched := strings.NewReader("x")
 	n := int64(1)
-	if change, err := c.Write(ctx, "writer", "/cloud/other", untouched, &n); core.CodeOf(err) != core.CapacityExceeded || change.Effect != core.Unchanged || untouched.Len() != 1 {
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/other"), untouched, &n); core.CodeOf(err) != core.CapacityExceeded || change.Effect != core.Unchanged || untouched.Len() != 1 {
 		t.Fatal(change, err)
 	}
 	release()
@@ -470,7 +652,7 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 	if len(d.PendingUploads()) != 0 {
 		t.Fatal("acknowledged cleanup retained a private upload")
 	}
-	if _, err := c.Write(ctx, "writer", "/cloud/other", strings.NewReader("x"), &n); err != nil {
+	if _, err := c.Write(ctx, "writer", core.Path("/cloud/other"), strings.NewReader("x"), &n); err != nil {
 		t.Fatal(err)
 	}
 }

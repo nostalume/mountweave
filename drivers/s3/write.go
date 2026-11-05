@@ -14,9 +14,9 @@ import (
 
 // Create conditionally creates a file. Configured buffering enables multipart;
 // otherwise it uses one PUT with an exact, known input length.
-func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
+func (d *Driver) Create(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {
 	if d.buffer != nil {
-		return d.bufferedWrite(ctx, p, input, length, false)
+		return d.bufferedWrite(ctx, p, input, length, core.PublicationOptions{When: core.IfAbsent()})
 	}
 	unchanged := core.Change{Effect: core.Unchanged}
 	if input == nil || (length != nil && *length < 0) {
@@ -25,7 +25,7 @@ func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *
 	if err := d.admit(ctx, p); err != nil {
 		return unchanged, err
 	}
-	if p == "/" {
+	if p.Namespace() == core.TreeNamespace && p.Value() == "/" {
 		return unchanged, core.Fail(core.InvalidRequest, nil)
 	}
 	if length == nil || *length > 5<<30 {
@@ -34,7 +34,7 @@ func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *
 	if err := d.ancestors(ctx, p); err != nil {
 		return unchanged, err
 	}
-	directory, err := d.hasDirectory(ctx, d.key(p))
+	directory, err := d.directoryAt(ctx, p)
 	if err != nil {
 		return unchanged, err
 	}
@@ -48,7 +48,7 @@ func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *
 			return unchanged, err
 		}
 	}
-	_, putErr := d.client.PutObject(ctx, &sdk.PutObjectInput{
+	ack, putErr := d.client.PutObject(ctx, &sdk.PutObjectInput{
 		Bucket: aws.String(d.bucket), Key: aws.String(d.key(p)), Body: body,
 		ContentLength: length, IfNoneMatch: aws.String("*"),
 	}, func(o *sdk.Options) {
@@ -72,7 +72,7 @@ func (d *Driver) Create(ctx context.Context, p string, input io.Reader, length *
 	if !complete {
 		return core.Change{Effect: core.Unknown}, errors.Join(core.Fail(core.InvalidUpstreamResponse, errors.New("upload did not consume the complete input")), err)
 	}
-	return core.Change{Effect: core.Applied}, err
+	return core.Change{Effect: core.Applied, Evidence: evidence(ack.ETag, ack.VersionId)}, err
 }
 
 // uploadBody owns request access, not input. finish waits for a current Read and

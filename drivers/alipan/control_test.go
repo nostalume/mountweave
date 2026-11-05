@@ -40,7 +40,9 @@ func (s *mountStore) Commit(_ context.Context, d control.Definition, expected ui
 
 func TestControlledRefreshHandoffWithRunningTask(t *testing.T) {
 	ctx := context.Background()
-	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, string) error { return nil }})
+	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
+		return nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,12 +132,12 @@ func TestControlledRefreshHandoffWithRunningTask(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	selection, err := c.Capture(ctx, core.PathAccess{Path: "/source/a"})
+	selection, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/source/a")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	h, err := q.Submit(ctx, task.Work{Run: func(ctx context.Context, _ func(any)) (any, error) {
-		return c.Stat(selection.Context(ctx), "reader", "/source/a")
+		return c.Stat(selection.Context(ctx), "reader", core.Path("/source/a"))
 	}})
 	if err != nil {
 		t.Fatal(err)

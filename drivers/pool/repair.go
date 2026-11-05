@@ -114,7 +114,7 @@ func (d *Driver) loadVerified(o *operation, s stripeRecord, buffers [][]byte, sk
 			failures[slot] = core.Fail(core.MountUnavailable, nil)
 			return
 		}
-		failures[slot] = reader.fetch(s.Shards[slot], buffers[slot])
+		failures[slot] = reader.fetch(reader.op.ctx, s.Shards[slot], buffers[slot])
 		if failures[slot] == nil {
 			shards[slot] = buffers[slot]
 		}

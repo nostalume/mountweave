@@ -5,27 +5,39 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
+// Iterator owns a native enumeration. Next returns a batch and may return io.EOF
+// together with its final entries. Context applies to the current call only.
+type Iterator interface {
+	Next(context.Context, int) ([]Metadata, error)
+	Close() error
+}
+
 type ListRequest struct {
-	Path   string
+	When   Condition
+	Query  Query
 	Limit  int
 	Cursor string
 	// CursorTTL is required on the first request; zero inherits on continuation.
 	CursorTTL time.Duration
 }
+
 type Page struct {
 	Items           []Entry    `json:"items"`
 	NextCursor      *string    `json:"next_cursor"`
 	CursorExpiresAt *time.Time `json:"cursor_expires_at"`
 }
+
 type session struct {
 	core                 *Core
 	principal            Principal
-	target               string
+	query                Query
 	limit                int
 	ttl                  time.Duration
 	mount                *Mount
@@ -50,20 +62,34 @@ type session struct {
 }
 
 func (c *Core) List(ctx context.Context, p Principal, r ListRequest) (Page, error) {
-	if err := ValidatePath(r.Path); err != nil {
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
 		return Page{}, err
+	}
+	defer turn.finish(false)
+	if err := c.validateInput(ctx, r.Query.address); err != nil {
+		return Page{}, err
+	}
+	if err := r.Query.validate(); err != nil {
+		return Page{}, err
+	}
+	if err := r.When.Validate(); err != nil {
+		return Page{}, err
+	}
+	if !r.When.Empty() && r.Query.address.Namespace() != TreeNamespace {
+		return Page{}, Fail(UnsupportedOperation, nil)
 	}
 	if r.Cursor != "" {
 		c.mu.Lock()
 		s := c.tokens[r.Cursor]
 		c.mu.Unlock()
-		if s == nil || s.principal != p || s.target != r.Path || (r.Limit != 0 && r.Limit != s.limit) || (r.CursorTTL != 0 && r.CursorTTL != s.ttl) {
+		if s == nil || s.principal != p || s.query != r.Query || (r.Limit != 0 && r.Limit != s.limit) || (r.CursorTTL != 0 && r.CursorTTL != s.ttl) {
 			return Page{}, Fail(CursorUnavailable, nil)
 		}
-		if err := c.authorize(ctx, p, ListAction, r.Path); err != nil {
+		if err := c.authorize(ctx, p, ListAction, r.Query.address); err != nil {
 			return Page{}, err
 		}
-		return s.next(ctx, r.Cursor)
+		return s.next(ctx, r.Cursor, r.When)
 	}
 	if r.Limit == 0 {
 		r.Limit = DefaultPage
@@ -71,21 +97,33 @@ func (c *Core) List(ctx context.Context, p Principal, r ListRequest) (Page, erro
 	if r.Limit < 1 || r.Limit > MaxPage || r.CursorTTL <= 0 {
 		return Page{}, Fail(InvalidRequest, nil)
 	}
-	s, err := c.beginList(ctx, p, r.Path, r.Limit, r.CursorTTL)
+	s, err := c.beginList(ctx, p, r.Query, r.Limit, r.CursorTTL, r.When)
 	if err != nil {
 		return Page{}, err
 	}
-	return s.next(ctx, "")
+	return s.next(ctx, "", Condition{})
 }
-func (c *Core) beginList(ctx context.Context, p Principal, target string, limit int, ttl time.Duration) (*session, error) {
-	if err := c.authorizePath(ctx, p, ListAction, target); err != nil {
+
+func (c *Core) beginList(ctx context.Context, p Principal, query Query, limit int, ttl time.Duration, when Condition) (*session, error) {
+	target := query.address
+	if err := c.authorizeChecked(ctx, p, ListAction, target); err != nil {
 		return nil, err
 	}
-	expected, err := c.constrained(ctx, target, nil)
+	c.mu.Lock()
+	at, names, err := c.resolveRequestLocked(ctx, target)
+	c.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	s := &session{core: c, principal: p, target: target, limit: limit, cleaned: make(chan struct{}), ttl: ttl, expires: time.Now().Add(ttl)}
+	if at != nil {
+		if !at.validExtent() {
+			return nil, Fail(InvalidPath, nil)
+		}
+		if err = c.authorizeBinding(ctx, p, ListAction, at); err != nil {
+			return nil, err
+		}
+	}
+	s := &session{core: c, principal: p, query: query, limit: limit, cleaned: make(chan struct{}), ttl: ttl, expires: time.Now().Add(ttl)}
 	s.mu.Lock()
 	c.mu.Lock()
 	if c.opts.MaxCursors > 0 && len(c.sessions) >= c.opts.MaxCursors {
@@ -93,10 +131,21 @@ func (c *Core) beginList(ctx context.Context, p Principal, target string, limit 
 		s.mu.Unlock()
 		return nil, Fail(CapacityExceeded, nil)
 	}
-	u, names, err := c.locateLocked(context.Background(), target, expected)
+	var u *use
+	if at != nil {
+		u, err = c.borrowAtLocked(context.Background(), at)
+	} else if c.closed {
+		err = Fail(MountUnavailable, nil)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		c.mu.Unlock()
 		s.mu.Unlock()
+		if u != nil {
+			u.release()
+		}
 		return nil, err
 	}
 	s.use = u
@@ -115,23 +164,35 @@ func (c *Core) beginList(ctx context.Context, p Principal, target string, limit 
 	s.timer = time.AfterFunc(time.Until(s.expires), s.invalidate)
 	call, end := requestScope(ctx, s.life)
 	if u != nil {
-		err = c.authorizeBinding(call, p, ListAction, u.location)
-		if err == nil {
-			s.iter, err = u.mount.driver.Enumerate(call, u.path)
+		native := NativeChildren(u.native())
+		if target.namespace == KeyNamespace {
+			native = NativeKeys(u.path, query.delimiter)
+			if query.after != "" {
+				native = native.After(u.keyBase() + query.after)
+			}
 		}
+		s.iter, err = u.mount.driver.Enumerate(call, native)
 	} else {
 		items := make([]Metadata, 0, len(names))
 		for _, name := range names {
-			if c.authorize(call, p, StatAction, childPath(target, name)) == nil {
+			err = c.authorize(call, p, StatAction, Path(childPath(target.value, name)))
+			if err == nil {
 				items = append(items, Metadata{Name: name, Kind: Directory})
+			} else if CodeOf(err) != PermissionDenied {
+				break
+			} else {
+				err = nil
 			}
 		}
-		err = call.Err()
+		err = observedCause(call, err)
 		s.iter = &virtualIterator{items: items}
 	}
 	end()
 	if err == nil && s.iter == nil {
 		err = Fail(InvalidUpstreamResponse, errors.New("enumeration has no iterator"))
+	}
+	if err == nil {
+		err = when.Check(Evidence{}, true)
 	}
 	if err != nil {
 		s.invalidate()
@@ -142,15 +203,8 @@ func (c *Core) beginList(ctx context.Context, p Principal, target string, limit 
 	}
 	return s, nil
 }
-func requestScope(ctx, lifetime context.Context) (context.Context, func()) {
-	child, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(lifetime, cancel)
-	if lifetime.Err() != nil {
-		cancel()
-	}
-	return child, func() { stop(); cancel() }
-}
-func (s *session) next(ctx context.Context, token string) (Page, error) {
+
+func (s *session) next(ctx context.Context, token string, when Condition) (Page, error) {
 	if !s.mu.TryLock() {
 		return Page{}, Fail(CapacityExceeded, nil)
 	}
@@ -163,11 +217,15 @@ func (s *session) next(ctx context.Context, token string) (Page, error) {
 		s.invalidate()
 		return Page{}, Fail(CursorUnavailable, nil)
 	}
-	if s.haveReplay && token == s.lastInput {
-		return clonePage(s.replay), nil
-	}
-	if token != s.nextToken {
+	replay := s.haveReplay && token == s.lastInput
+	if !replay && token != s.nextToken {
 		return Page{}, Fail(CursorUnavailable, nil)
+	}
+	if err := when.Check(Evidence{}, true); err != nil {
+		return Page{}, err
+	}
+	if replay {
+		return clonePage(s.replay), nil
 	}
 	page, more, err := s.advance(ctx)
 	if err != nil {
@@ -198,17 +256,36 @@ func (s *session) advance(ctx context.Context) (Page, bool, error) {
 		s.pending = batch
 		s.eof = errors.Is(err, io.EOF)
 	}
-	page := Page{Items: make([]Entry, 0, s.limit)}
+	page := Page{Items: make([]Entry, 0, min(s.limit, len(s.pending)))}
+	root := s.query.address
+	room := childRoom(root.value)
 	for len(s.pending) > 0 && len(page.Items) < s.limit {
 		meta := s.pending[0]
 		s.pending[0] = Metadata{}
 		s.pending = s.pending[1:]
-		if !ValidName(meta.Name) {
-			return Page{}, false, Fail(UnrepresentableName, nil)
-		}
-		target := childPath(s.target, meta.Name)
-		if ValidatePath(target) != nil {
-			return Page{}, false, Fail(UnrepresentableName, nil)
+		var target Address
+		if root.namespace == TreeNamespace {
+			if !ValidName(meta.Name) || len(meta.Name) > room {
+				return Page{}, false, Fail(UnrepresentableName, nil)
+			}
+			target = Path(childPath(root.value, meta.Name))
+		} else {
+			base := s.binding.keyBase()
+			if !utf8.ValidString(meta.Name) || !strings.HasPrefix(meta.Name, base) {
+				return Page{}, false, Fail(InvalidUpstreamResponse, nil)
+			}
+			key := strings.TrimPrefix(meta.Name, base)
+			if !strings.HasPrefix(key, root.value) || key == "" || (meta.Kind != File && meta.Kind != PrefixGroup) {
+				return Page{}, false, Fail(InvalidUpstreamResponse, nil)
+			}
+			target = Key(root.space, key)
+			if meta.Kind == PrefixGroup {
+				if s.query.delimiter == "" || !strings.HasSuffix(key, s.query.delimiter) {
+					return Page{}, false, Fail(InvalidUpstreamResponse, nil)
+				}
+				target = Prefix(root.space, key)
+			}
+			meta.Name = key
 		}
 		entry, err := project(target, meta)
 		if err != nil {
@@ -265,6 +342,7 @@ func (s *session) publish(token string, page Page, more bool) (Page, error) {
 	}
 	return page, nil
 }
+
 func (s *session) closeIterator() error {
 	if s.iterClosed {
 		return s.closeErr
@@ -282,6 +360,7 @@ func (s *session) closeIterator() error {
 	}
 	return s.closeErr
 }
+
 func (s *session) invalidate() {
 	if !s.invalid.CompareAndSwap(false, true) {
 		return
@@ -313,7 +392,9 @@ func (s *session) invalidate() {
 		c.mu.Unlock()
 	}()
 }
+
 func (s *session) cleanupError() error { s.mu.Lock(); defer s.mu.Unlock(); return s.closeErr }
+
 func clonePage(p Page) Page {
 	q := Page{Items: make([]Entry, len(p.Items))}
 	copy(q.Items, p.Items)
@@ -354,22 +435,26 @@ func (v *virtualIterator) Next(ctx context.Context, n int) ([]Metadata, error) {
 	}
 	return items, nil
 }
+
 func (v *virtualIterator) Close() error { v.items = nil; return nil }
 
-// CheckCursor validates a continuation without advancing it, for conditional
-// responses. No I/O or extra enumeration is performed.
+// CheckCursor validates a continuation without advancing it.
+// No I/O or extra enumeration is performed.
 func (c *Core) CheckCursor(ctx context.Context, p Principal, r ListRequest) error {
-	if err := ValidatePath(r.Path); err != nil {
+	if err := c.validateInput(ctx, r.Query.address); err != nil {
+		return err
+	}
+	if err := r.Query.validate(); err != nil {
 		return err
 	}
 	if r.Cursor == "" {
-		return c.authorize(ctx, p, ListAction, r.Path)
+		return c.authorize(ctx, p, ListAction, r.Query.address)
 	}
 	c.mu.Lock()
 	s := c.tokens[r.Cursor]
 	valid := s != nil && !c.closed
 	if valid {
-		valid = s.principal == p && s.target == r.Path && (r.Limit == 0 || r.Limit == s.limit) && (r.CursorTTL == 0 || r.CursorTTL == s.ttl) && !s.invalid.Load() && time.Now().Before(s.expires)
+		valid = s.principal == p && s.query == r.Query && (r.Limit == 0 || r.Limit == s.limit) && (r.CursorTTL == 0 || r.CursorTTL == s.ttl) && !s.invalid.Load() && time.Now().Before(s.expires)
 		if s.mount != nil {
 			valid = valid && !s.mount.retiring && s.binding.active && s.revision == s.mount.revision
 		} else {
@@ -380,7 +465,7 @@ func (c *Core) CheckCursor(ctx context.Context, p Principal, r ListRequest) erro
 	if !valid {
 		return Fail(CursorUnavailable, nil)
 	}
-	return c.authorize(ctx, p, ListAction, r.Path)
+	return c.authorize(ctx, p, ListAction, r.Query.address)
 }
 
 // ReleaseCursor closes an owned enumeration, including in-flight work. A revoked

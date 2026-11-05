@@ -345,7 +345,7 @@ func (d *Driver) drain(o *operation, id string, limit int, saved *drainState) (r
 			buffers = d.buffers()
 		}
 		reader := body{op: o}
-		moveErr := reader.fetch(work.Stripe.Shards[slot], buffers[slot])
+		moveErr := reader.fetch(reader.op.ctx, work.Stripe.Shards[slot], buffers[slot])
 		if moveErr != nil && o.ctx.Err() == nil {
 			var cleanup *cleanupFailure
 			if !errors.As(moveErr, &cleanup) {
@@ -449,7 +449,7 @@ func (d *Driver) placeShard(o *operation, work *stripeWork, slot int, payload []
 		err = core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	if err == nil {
-		err = reader.fetch(*next, payload)
+		err = reader.fetch(reader.op.ctx, *next, payload)
 	}
 	var changed bool
 	d.state.Lock()

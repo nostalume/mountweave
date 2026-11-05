@@ -3,8 +3,8 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base",
   "info": {
     "title": "Mountweave API",
-    "version": "0.3.0",
-    "description": "Composable file, mount-control and generic task HTTP delivery. Synchronous file operations and file tasks use the same typed request and Core semantics. The host injects identity policy, driver factories, durable storage and optional task kinds. Advertised operations are not per-mount capability or authorization grants. Optional durable inputs resume client byte receipt; sealed inputs feed the same Core.Write semantics synchronously or through process-local tasks."
+    "version": "0.4.0",
+    "description": "Composable file, mount-control and generic task HTTP delivery. Synchronous file operations and file tasks use the same typed request and Core semantics. The host injects identity policy, driver factories, durable storage and optional task kinds. Advertised operations are not per-mount capability or authorization grants. Optional durable inputs resume client byte receipt; sealed inputs feed the same Core.Write semantics synchronously or through process-local tasks. Optional job sources project existing durable transfer and Pool maintenance owners. A JobRef identifies persisted intent; a TaskID identifies one process-local execution attempt. Queries load metadata only; the host restores original owners and chooses recovery scheduling."
   },
   "servers": [
     {
@@ -33,6 +33,10 @@
     {
       "name": "inputs",
       "description": "Optional durable input bytes and immutable source versions. Ownership policy is independent of file and task authorization."
+    },
+    {
+      "name": "jobs",
+      "description": "Optional durable intent discovery and domain commands; no separate job runtime or database."
     }
   ],
   "paths": {
@@ -205,6 +209,12 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/Path"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
           }
         ],
         "responses": {
@@ -444,6 +454,12 @@
                     "none"
                   ]
                 }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional domain-preserving native validator; omitted when no trustworthy validator exists."
               }
             },
             "content": {
@@ -507,6 +523,12 @@
                   "pattern": "^bytes [0-9]+-[0-9]+/[0-9]+$"
                 },
                 "example": "bytes 0-99/1024"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional domain-preserving native validator; omitted when no trustworthy validator exists."
               }
             },
             "content": {
@@ -634,6 +656,12 @@
                     "none"
                   ]
                 }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional domain-preserving native validator; omitted when no trustworthy validator exists."
               }
             }
           },
@@ -862,13 +890,10 @@
       "put": {
         "operationId": "createFile",
         "summary": "Write raw bytes, with explicit complete-file replacement",
-        "description": "Default creation preserves the existing create-only contract and requires create authority. replace=true requires write authority and FilePublisher: receive complete input before publishing, create if absent. It is independent of tree-directory merge. Input failure leaves an existing target unchanged in replacement mode. Combining replacement with If-None-Match is invalid. Only true/false are accepted when replace is supplied. No append, native version precondition, durability or automatic replay guarantee is added. Content-Length remains an exact whole-input length; unknown length is accepted by supported modes. The body is streamed under request lifetime, not buffered into a task request.",
+        "description": "Default PUT retains exclusive streaming creation. replace=true selects complete publication, creating or replacing a file. If-None-Match:* selects exclusive creation (complete when replace=true); other supported tag predicates select complete guarded publication. Explicit replace=false conflicts with those complete modes. The native commit enforces the original predicate; no metadata precheck substitutes for it. FilePublisher and write authority are required for potentially replacing publication. No durability or automatic replay is added.",
         "parameters": [
           {
             "$ref": "#/components/parameters/Path"
-          },
-          {
-            "$ref": "#/components/parameters/CreateIfNoneMatch"
           },
           {
             "name": "replace",
@@ -877,6 +902,12 @@
               "type": "boolean",
               "default": false
             }
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
           }
         ],
         "responses": {
@@ -893,6 +924,12 @@
                 "schema": {
                   "type": "string"
                 }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional domain-preserving native validator; omitted when no trustworthy validator exists."
               }
             },
             "content": {
@@ -5254,6 +5291,331 @@
         ],
         "description": "No request body. Sealing is idempotent for the same confirmed offset and version. No complete-file copy is made; sealed data is read from verified journal extents."
       }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "listDurableJobs",
+        "summary": "List bounded durable intent metadata",
+        "description": "Bearer authentication and original domain policy apply. Unknown/duplicate query fields and conditional/range headers are rejected. Source registration borrows host-owned services; queries never construct SDKs, probe members or load native logs. Errors may accompany effects; preserve problem.result.",
+        "parameters": [
+          {
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "source",
+            "in": "query"
+          },
+          {
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "name": "after",
+            "in": "query"
+          },
+          {
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "type": "integer"
+            },
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The metadata view or invocation receipt. Failures can retain a safe receipt in problem.result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "501": {
+            "description": "The selected native capability is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/UpstreamTimeout"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/job": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "getDurableJob",
+        "summary": "Get committed durable intent",
+        "description": "Bearer authentication and original domain policy apply. Unknown/duplicate query fields and conditional/range headers are rejected. Source registration borrows host-owned services; queries never construct SDKs, probe members or load native logs. Errors may accompany effects; preserve problem.result.",
+        "parameters": [
+          {
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "source",
+            "in": "query"
+          },
+          {
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "id",
+            "in": "query"
+          },
+          {
+            "required": false,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "generation",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The metadata view or invocation receipt. Failures can retain a safe receipt in problem.result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "501": {
+            "description": "The selected native capability is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/UpstreamTimeout"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "createDurableJob",
+        "summary": "Persist an idempotent intent without starting work",
+        "description": "Bearer authentication and original domain policy apply. Unknown/duplicate query fields and conditional/range headers are rejected. Source registration borrows host-owned services; queries never construct SDKs, probe members or load native logs. Errors may accompany effects; preserve problem.result.",
+        "parameters": [
+          {
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "source",
+            "in": "query"
+          },
+          {
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "name": "id",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The metadata view or invocation receipt. Failures can retain a safe receipt in problem.result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "501": {
+            "description": "The selected native capability is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/UpstreamTimeout"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/actions": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "runDurableJobAction",
+        "summary": "Execute a request-bound domain action",
+        "description": "Bearer authentication and original domain policy apply. Unknown/duplicate query fields and conditional/range headers are rejected. Source registration borrows host-owned services; queries never construct SDKs, probe members or load native logs. Errors may accompany effects; preserve problem.result.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The metadata view or invocation receipt. Failures can retain a safe receipt in problem.result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/PermissionDenied"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/CapacityExceeded"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "501": {
+            "description": "The selected native capability is unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/UpstreamTimeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5326,7 +5688,7 @@
       "IfMatch": {
         "name": "If-Match",
         "in": "header",
-        "description": "No ETag is emitted in the current API. For an existing resource, * passes; other valid tags have no current match and return 412. Ordinary resource errors take precedence.",
+        "description": "Strong tag comparison at the actual Core read or native commit. * requires presence. Finite tag sets need native support. Unsupported conditions return 501, actual mismatches 412. Reuse observed ETag values unchanged.",
         "schema": {
           "type": "string"
         }
@@ -5334,7 +5696,7 @@
       "IfNoneMatch": {
         "name": "If-None-Match",
         "in": "header",
-        "description": "No ETag is emitted in the current API. For an existing resource, * returns 304 for GET or HEAD; other valid tags do not match.",
+        "description": "Weak negative tag comparison at the actual Core read or native commit. * requires absence for writes. Matching GET/HEAD returns 304; failed mutations return 412. Unsupported predicates return 501.",
         "schema": {
           "type": "string"
         }
@@ -5342,7 +5704,7 @@
       "IfModifiedSince": {
         "name": "If-Modified-Since",
         "in": "header",
-        "description": "Ignore this date condition because the current API has no reliable Last-Modified validator.",
+        "description": "Not implemented independently (501); ignored when superseded by If-None-Match.",
         "schema": {
           "type": "string"
         }
@@ -5350,7 +5712,7 @@
       "IfUnmodifiedSince": {
         "name": "If-Unmodified-Since",
         "in": "header",
-        "description": "Ignore this date condition because the current API has no reliable Last-Modified validator.",
+        "description": "Not implemented independently (501); ignored when superseded by If-Match.",
         "schema": {
           "type": "string"
         }
@@ -5358,22 +5720,10 @@
       "IfRange": {
         "name": "If-Range",
         "in": "header",
-        "description": "The current API has no matching strong validator. Ignore Range and return full 200 when Range is present; otherwise ignore If-Range.",
+        "description": "Use the valid full-response fallback: ignore Range when If-Range is supplied. No metadata preflight or guessed match is used.",
         "schema": {
           "type": "string"
         }
-      },
-      "CreateIfNoneMatch": {
-        "name": "If-None-Match",
-        "in": "header",
-        "required": false,
-        "schema": {
-          "type": "string",
-          "enum": [
-            "*"
-          ]
-        },
-        "description": "Optional create-only condition. Checked by the native exclusive creation, never by Stat-then-write. Existing targets return 412 with unchanged; without this header they return 409. Other mutation conditions and range headers are rejected before effects."
       }
     },
     "responses": {
@@ -5729,7 +6079,7 @@
         }
       },
       "NotModified": {
-        "description": "A conditional GET or HEAD sends no body. The current API has no ETag or Last-Modified validator; If-None-Match:* matches an existing resource.",
+        "description": "Actual negative GET/HEAD condition failure; no body. An observed native ETag is returned when supplied by that failed read. No validator is fabricated.",
         "headers": {
           "Cache-Control": {
             "schema": {
@@ -5739,6 +6089,11 @@
           },
           "X-Request-ID": {
             "description": "Request identifier.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          "ETag": {
             "schema": {
               "type": "string"
             }
@@ -5808,7 +6163,8 @@
           "file_operations_read_only",
           "limits",
           "components",
-          "task_kinds"
+          "task_kinds",
+          "job_sources"
         ],
         "properties": {
           "api_major": {
@@ -5920,12 +6276,16 @@
               },
               "inputs": {
                 "type": "boolean"
+              },
+              "jobs": {
+                "type": "boolean"
               }
             },
             "required": [
               "control",
               "tasks",
-              "inputs"
+              "inputs",
+              "jobs"
             ]
           },
           "task_kinds": {
@@ -5934,6 +6294,40 @@
               "type": "string"
             },
             "uniqueItems": true
+          },
+          "job_sources": {
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "version": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "actions": {
+                  "additionalProperties": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "source",
+                "kind",
+                "version",
+                "actions"
+              ]
+            },
+            "type": "array"
           }
         },
         "examples": [
@@ -5963,11 +6357,168 @@
             "components": {
               "control": false,
               "tasks": false,
-              "inputs": false
+              "inputs": false,
+              "jobs": false
             },
-            "task_kinds": []
+            "task_kinds": [],
+            "job_sources": []
           }
         ]
+      },
+      "Validator": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tag"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string",
+            "description": "Opaque quoted entity-tag, including optional W/ prefix. No size/time or path identity is inferred."
+          }
+        }
+      },
+      "Evidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "validator": {
+            "$ref": "#/components/schemas/Validator"
+          },
+          "version": {
+            "type": "string",
+            "description": "Optional immutable native revision; distinct from validator comparison."
+          }
+        }
+      },
+      "Condition": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "match": {
+            "type": "string",
+            "minLength": 1
+          },
+          "not_match": {
+            "type": "string",
+            "minLength": 1
+          },
+          "domain": {
+            "type": "string"
+          }
+        },
+        "description": "At most one positive and one negative test. Values are * or a comma-separated quoted tag set in one domain; positive comparison is strong, negative is weak. Empty object is unconditional. Native unsupported predicates fail explicitly; no Stat-then-mutate approximation."
+      },
+      "WritePolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "enum": [
+              "create_new",
+              "publish"
+            ]
+          },
+          "when": {
+            "$ref": "#/components/schemas/Condition"
+          }
+        },
+        "description": "create_new preserves direct exclusive streaming creation and requires an empty condition. publish checks complete input before guarded publication, creating or replacing a file. Failed conditions retain unchanged target effects."
+      },
+      "ReadSelection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "when": {
+            "$ref": "#/components/schemas/Condition"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "CopyOptions": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/ReadSelection"
+          },
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "policy": {
+                "$ref": "#/components/schemas/WritePolicy"
+              },
+              "observe_target": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "MoveOptions": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/Condition"
+          },
+          "target": {
+            "$ref": "#/components/schemas/Condition"
+          },
+          "existing": {
+            "enum": [
+              "",
+              "create_new",
+              "replace"
+            ],
+            "default": "create_new",
+            "type": "string"
+          },
+          "tree": {
+            "additionalProperties": false,
+            "properties": {
+              "max_plan_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "max_entries": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "concurrency": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "type": "object",
+            "description": "Positive planning budgets are required when explicit target removal encounters a directory."
+          }
+        },
+        "description": "Same-mount native relocation. Source and target conditions stay distinct. Explicit replace permits separately receipted target removal, followed by exclusive relocation protecting later peers. The target predicate is consumed at deletion, not reapplied to the deliberately missing target."
+      },
+      "RemoveInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/LogicalPath"
+          },
+          "when": {
+            "$ref": "#/components/schemas/Condition"
+          }
+        }
       },
       "Entry": {
         "type": "object",
@@ -6016,6 +6567,9 @@
           },
           "virtual": {
             "type": "boolean"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/Evidence"
           }
         },
         "allOf": [
@@ -6188,7 +6742,8 @@
               "unavailable",
               "input_conflict",
               "input_busy",
-              "input_state"
+              "input_state",
+              "transfer_busy"
             ]
           },
           "request_id": {
@@ -6313,12 +6868,16 @@
           "replace": {
             "type": "boolean",
             "default": false
+          },
+          "options": {
+            "$ref": "#/components/schemas/CopyOptions"
           }
         },
         "required": [
           "source",
           "target"
-        ]
+        ],
+        "description": "Optional options uses the same Core source selection and target policy as synchronous/queued Copy. Legacy replace=true and explicit options are mutually exclusive."
       },
       "MoveInput": {
         "type": "object",
@@ -6329,6 +6888,9 @@
           },
           "target": {
             "$ref": "#/components/schemas/LogicalPath"
+          },
+          "options": {
+            "$ref": "#/components/schemas/MoveOptions"
           }
         },
         "required": [
@@ -6429,27 +6991,55 @@
           },
           "max_entries": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 0
           },
           "max_plan_bytes": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 0
           },
           "replace": {
             "type": "boolean",
-            "default": false
+            "default": false,
+            "description": "Legacy per-file complete publication. Cannot be combined with explicit policy."
           },
           "merge_directories": {
             "type": "boolean",
-            "default": false
+            "default": false,
+            "description": "Legacy mapping to existing=merge. Cannot be combined with explicit existing."
+          },
+          "existing": {
+            "enum": [
+              "",
+              "create_new",
+              "merge",
+              "replace"
+            ],
+            "default": "create_new",
+            "type": "string",
+            "description": "Root target policy. Replace removes all old membership before exclusive creation; merge preserves target-only names. Neither is a tree transaction."
+          },
+          "depth": {
+            "enum": [
+              "",
+              "self",
+              "recursive"
+            ],
+            "default": "recursive",
+            "type": "string",
+            "description": "Directory source selection; file leaves have no descendants."
+          },
+          "source_selection": {
+            "$ref": "#/components/schemas/ReadSelection"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/WritePolicy"
           }
         },
         "required": [
           "source",
-          "target",
-          "max_entries",
-          "max_plan_bytes"
-        ]
+          "target"
+        ],
+        "description": "File leaf or bounded tree copy. Directory plans require positive budgets; a file leaf accepts zero. Source and old-target plans are bounded separately. File publication policy is independent of root membership policy. Directory finite validators/versions are refused before child effects."
       },
       "RemoveTreeInput": {
         "type": "object",
@@ -6466,12 +7056,12 @@
           },
           "max_entries": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 0,
             "description": "Bounds client discovery/planning, not the number of descendants affected by native subtree deletion."
           },
           "max_plan_bytes": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 0,
             "description": "Bounds stored client plan path/key bytes; native subtree deletion need not enumerate descendants."
           },
           "scope": {
@@ -6483,13 +7073,20 @@
             ],
             "default": "discovered",
             "description": "Empty/omitted selects discovered and preserves the finite-name plan. Subtree requires remove_tree authority for descendant deletion; new descendants may be affected and native execution may return only a root receipt."
+          },
+          "contents_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "Remove selected mutable contents while preserving the requested root and virtual, mount and alias anchors. Accepts a visible directory spanning multiple bindings; binding membership is captured before execution. Independent of scope. Receipts describe attempted mutations only."
+          },
+          "when": {
+            "$ref": "#/components/schemas/Condition"
           }
         },
         "required": [
-          "path",
-          "max_entries",
-          "max_plan_bytes"
-        ]
+          "path"
+        ],
+        "description": "File leaf or bounded directory removal. A file leaf accepts zero budgets and uses its root condition. Directories require positive budgets; nonempty directory guards without native commit proof are refused before child effects, never broadcast to descendants."
       },
       "FileOperationRequest": {
         "oneOf": [
@@ -6533,7 +7130,7 @@
                 "const": "fs.remove"
               },
               "input": {
-                "$ref": "#/components/schemas/PathInput"
+                "$ref": "#/components/schemas/RemoveInput"
               }
             },
             "required": [
@@ -6691,7 +7288,7 @@
             ]
           }
         ],
-        "description": "Host kinds decode their own input and project redacted results. Registration extends this HTTP adapter, not the generic scheduler. Input is structured JSON, not serialized executable code or a borrowed request body."
+        "description": "Host kinds decode their own input and project redacted results. Registration extends this HTTP adapter, not the generic scheduler. Input is structured JSON, not serialized executable code or a borrowed request body. Registered job actions use JobActionRequest unchanged; 202 confirms only process-local queue acceptance, not durable replay. Create persisted intent separately."
       },
       "FileItem": {
         "type": "object",
@@ -6715,6 +7312,97 @@
           },
           "error": {
             "type": "string"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "source",
+              "target"
+            ]
+          },
+          "error_side": {
+            "enum": [
+              "source",
+              "target"
+            ],
+            "type": "string",
+            "description": "Failure endpoint when it differs from the effect owner, such as source input failure during target publication."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "read",
+              "create",
+              "write",
+              "remove"
+            ]
+          },
+          "removed": {
+            "description": "MoveBatch target-removal receipt. Its ordered rows are tree phases, never nested batch operations.",
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "items": {
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "relative_path": {
+                      "type": "string"
+                    },
+                    "effect": {
+                      "$ref": "#/components/schemas/Effect"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "side": {
+                      "type": "string",
+                      "enum": [
+                        "source",
+                        "target"
+                      ]
+                    },
+                    "error_side": {
+                      "enum": [
+                        "source",
+                        "target"
+                      ],
+                      "type": "string",
+                      "description": "Failure endpoint when it differs from the effect owner, such as source input failure during target publication."
+                    },
+                    "phase": {
+                      "type": "string",
+                      "enum": [
+                        "read",
+                        "create",
+                        "write",
+                        "remove"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "index"
+                  ]
+                },
+                "type": "array"
+              },
+              "before": {
+                "enum": [
+                  1,
+                  2
+                ],
+                "type": "integer",
+                "description": "Original target observation when known: 1 missing, 2 present. Omitted means unknown, not an optimistic-concurrency proof."
+              },
+              "effect": {
+                "$ref": "#/components/schemas/Effect"
+              }
+            }
           }
         },
         "required": [
@@ -6743,10 +7431,21 @@
           "cleanup_error": {
             "type": "string",
             "description": "Cleanup failure retains the known file effect."
+          },
+          "before": {
+            "enum": [
+              1,
+              2
+            ],
+            "type": "integer",
+            "description": "Original target observation when known: 1 missing, 2 present. Omitted means unknown, not an optimistic-concurrency proof."
+          },
+          "target_removed_effect": {
+            "$ref": "#/components/schemas/Effect"
           }
         },
         "required": [],
-        "description": "Single target effect, two Move endpoint effects, or ordered attempted item receipts. Empty item lists are omitted. Duplicate batch inputs remain distinct. Applied/unknown/partial effects remain meaningful on error; unstarted suffix items are absent."
+        "description": "Single or whole-tree effect, Move endpoint effects, and ordered attempted phase receipts. Whole-tree applied means selected work completed, not every item mutated. Move target_removed_effect and items retain its separate pre-delete phase even if relocation fails. Unstarted work is absent; confirmed effects survive errors."
       },
       "Alias": {
         "type": "object",
@@ -7051,9 +7750,310 @@
           "replace": {
             "default": false,
             "type": "boolean"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/WritePolicy"
           }
         },
-        "description": "Pins a sealed input at admission, opens it at execution, and invokes Core.Write with the same file authorization, binding and effects as streamed PUT. Queue lifetime and input lifetime remain separate."
+        "description": "Pins a sealed input at admission, opens it at execution, and invokes Core.Write with the same file authorization, binding and effects as streamed PUT. Queue lifetime and input lifetime remain separate. Explicit policy or legacy replace is accepted, never both. The same immutable Core policy is used by synchronous and queued input consumers.",
+        "not": {
+          "required": [
+            "replace",
+            "policy"
+          ]
+        }
+      },
+      "JobRef": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "generation": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "id",
+          "generation"
+        ]
+      },
+      "JobView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "generation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "owner": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "actions": {
+            "additionalProperties": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "details": true
+        },
+        "required": [
+          "source",
+          "id",
+          "generation",
+          "kind",
+          "version",
+          "state",
+          "actions",
+          "details"
+        ],
+        "description": "Committed metadata from one durable owner. State/details are domain-specific: transfer has preparing/ready/completed/aborted, request, revision, effect, cleanup_pending and retention_released; Pool has pending/completed, request, done and the latest visited/changed/bytes/more receipt. Pool has no fabricated user owner. Actions advertise syntax, not future authority. No native checkpoints, credentials, raw errors or SDK config are exposed."
+      },
+      "JobResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "generation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "action": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "receipt": true
+        },
+        "required": [
+          "source",
+          "id",
+          "generation",
+          "action",
+          "receipt"
+        ],
+        "description": "This invocation receipt, including known effects accompanying persistence errors. It is not a subsequent GET and does not prove all metadata saved. Transfer receipt contains state/details; Pool run receipt contains done and latest batch counts; Pool forget contains record_effect and does not undo shard/file effects or Drain policy."
+      },
+      "JobPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/JobView"
+            },
+            "type": "array"
+          },
+          "next": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "description": "Limit bounds scanned metadata, including hidden entries. Empty items may carry next, the last scanned ID. Pages do not form a global snapshot. Resume with after=next in the same source; a full last page can have a cursor followed by an empty page."
+      },
+      "Address": {
+        "description": "A tagged tree path or literal key/prefix in an existing binding. Key bytes are never path-normalized. A prefix selects listing/scheduling ranges, not a file mutation target.",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["namespace", "path"],
+            "properties": {
+              "namespace": {"const": "tree"},
+              "path": {"$ref": "#/components/schemas/LogicalPath"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["namespace", "space", "kind", "key"],
+            "properties": {
+              "namespace": {"const": "keys"},
+              "space": {"$ref": "#/components/schemas/LogicalPath"},
+              "kind": {"enum": ["key", "prefix"]},
+              "key": {"type": "string"}
+            },
+            "if": {"properties": {"kind": {"const": "key"}}},
+            "then": {"properties": {"key": {"minLength": 1}}}
+          }
+        ]
+      },
+      "TransferJobInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "input_id",
+          "target"
+        ],
+        "properties": {
+          "input_id": {
+            "$ref": "#/components/schemas/InputID"
+          },
+          "replace": {
+            "type": "boolean",
+            "default": false
+          },
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "definition_id",
+              "revision"
+            ],
+            "properties": {
+              "definition_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "path": {
+                "$ref": "#/components/schemas/LogicalPath"
+              },
+              "address": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Address"
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "kind"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "const": "prefix"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "oneOf": [
+              {
+                "required": [
+                  "path"
+                ]
+              },
+              {
+                "required": [
+                  "address"
+                ]
+              }
+            ]
+          },
+          "policy": {
+            "$ref": "#/components/schemas/WritePolicy"
+          }
+        },
+        "description": "Version 1 transfer source input. Exactly one tree path or tagged address is required. Native keys use address; prefixes are not upload targets. Driver length/capability limits still apply at execution. Responses preserve path for tree targets and address for key targets. This is not a second file execution API. Policy or legacy replace is accepted, never both. A zero/create_new policy normalizes to complete Publish(IfAbsent); explicit publish predicates remain unchanged. The original condition is persisted and restored, without a refreshed expected tag.",
+        "not": {
+          "required": [
+            "replace",
+            "policy"
+          ]
+        }
+      },
+      "JobCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "input": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "version",
+          "input"
+        ],
+        "description": "Use the registered source format version (built-ins: 1). Transfer input follows TransferJobInput: input_id, target{definition_id,revision,path OR address}, optional policy or legacy replace. Pool input: kind=repair|drain|collect, member required only for drain. Same ID/request is idempotent; a different request conflicts. Creation persists intent and retention only, without starting native work. On error, query/retry the original ID; do not infer rollback."
+      },
+      "JobCommandInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "generation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "generation"
+        ],
+        "description": "Transfer run/abort: id,generation only. Pool run: id,generation,positive limit; one bounded maintenance batch. Pool forget: id,generation only. The original domain owner checks the expected generation before effects. It grants no authority or cross-process lease. Prepare performs no owner lookup or resource borrowing."
+      },
+      "JobActionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input": {
+            "$ref": "#/components/schemas/JobCommandInput"
+          }
+        },
+        "required": [
+          "kind",
+          "input"
+        ],
+        "description": "Registered source.action, for example uploads.run/uploads.abort or archive.run/archive.forget. Use this identical envelope for synchronous jobs/actions and asynchronous tasks. Canceling a Task pauses/cancels that attempt, not the durable intent; Abort performs domain cleanup and cannot undo publication. Pool forget only removes an inactive intent. Task finished does not imply Pool pass done; do not busy-loop on more."
       }
     }
   },

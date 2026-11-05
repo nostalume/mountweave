@@ -13,12 +13,15 @@ type Mount struct {
 	core                 *Core
 	path                 string
 	driver               Driver
+	keys                 bool
+	projection           KeyProjection
 	revision             uint64
 	uses                 map[*use]struct{}
 	retiring, closing    bool
 	done                 chan struct{}
 	closeErr, cleanupErr error
 }
+
 type use struct {
 	*location
 	ctx            context.Context
@@ -33,6 +36,7 @@ func (m *Mount) borrowLocked(parent context.Context, at *location) *use {
 	m.uses[u] = struct{}{}
 	return u
 }
+
 func (u *use) release() {
 	u.once.Do(func() {
 		u.cancel()
@@ -43,6 +47,7 @@ func (u *use) release() {
 		c.mu.Unlock()
 	})
 }
+
 func (u *use) failed(err error, resource io.Closer) {
 	c := u.mount.core
 	c.mu.Lock()
@@ -50,6 +55,7 @@ func (u *use) failed(err error, resource io.Closer) {
 	u.mount.cleanupErr = errors.Join(u.mount.cleanupErr, err)
 	c.mu.Unlock()
 }
+
 func (m *Mount) startCloseLocked() {
 	if !m.retiring || m.closing || len(m.uses) != 0 {
 		return
@@ -74,6 +80,7 @@ func (m *Mount) startCloseLocked() {
 		c.mu.Unlock()
 	}()
 }
+
 func (m *Mount) beginRetire() {
 	c := m.core
 	c.mu.Lock()
@@ -106,6 +113,7 @@ func (m *Mount) beginRetire() {
 // Retire stops admission and requests cancellation immediately. Its context
 // bounds this wait, not the lifetime of unfinished work or Driver.Close.
 func (m *Mount) Retire(ctx context.Context) error { m.beginRetire(); return m.wait(ctx) }
+
 func (m *Mount) wait(ctx context.Context) error {
 	select {
 	case <-m.done:
@@ -119,9 +127,39 @@ func (m *Mount) wait(ctx context.Context) error {
 		return errors.Join(ctx.Err(), m.result())
 	}
 }
+
 func (m *Mount) result() error {
 	c := m.core
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return errors.Join(m.closeErr, m.cleanupErr)
+}
+
+type MountStatus struct {
+	Active, Retiring, Done bool
+	Err                    error
+}
+
+// Status observes this exact generation, even after its prefix is replaced.
+func (m *Mount) Status() MountStatus {
+	c := m.core
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := MountStatus{Active: !c.closed && c.mounts[m.path] == m && !m.retiring,
+		Retiring: m.retiring, Err: errors.Join(m.closeErr, m.cleanupErr)}
+	select {
+	case <-m.done:
+		s.Done = true
+	default:
+	}
+	return s
+}
+
+func requestScope(ctx, lifetime context.Context) (context.Context, func()) {
+	child, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(lifetime, cancel)
+	if lifetime.Err() != nil {
+		cancel()
+	}
+	return child, func() { stop(); cancel() }
 }

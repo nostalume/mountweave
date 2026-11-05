@@ -94,7 +94,9 @@ func TestClosedHTTPRefreshAndRetirement(t *testing.T) {
 		_ = source.Close()
 		t.Fatal(err)
 	}
-	reader, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, string) error { return nil }})
+	reader, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
+		return nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestClosedHTTPRefreshAndRetirement(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	opened, err := reader.Open(watchdog, "reader", "/cloud/song", nil)
+	opened, err := reader.Open(watchdog, "reader", core.Path("/cloud/song"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,8 +14,9 @@ import (
 	"time"
 
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 	"github.com/nostalume/mountweave/task"
+	bolt "go.etcd.io/bbolt"
 )
 
 type gatedMember struct {
@@ -24,8 +25,13 @@ type gatedMember struct {
 	reads, closes             atomic.Int32
 }
 
-func (m *gatedMember) Open(ctx context.Context, p string, wanted *core.Range) (core.Opened, error) {
-	o, err := m.memberFixture.Open(ctx, p, wanted)
+func (m *gatedMember) Open(ctx context.Context, pAddress core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
+	o, err := m.memberFixture.Open(ctx, core.NativePath(p), options)
 	if o.Body != nil && m.reads.Add(1) == 1 {
 		o.Body = &gatedBody{ReadCloser: o.Body, ctx: ctx, member: m}
 	}
@@ -72,10 +78,10 @@ func TestMemberReconnectionWaitsForBodyAcknowledgement(t *testing.T) {
 		}
 	})
 	content := []byte("member handoff preserves the logical file")
-	if _, err := c.Write(ctx, "user", "/pool/file", bytes.NewReader(content), nil); err != nil {
+	if _, err := c.Write(ctx, "user", core.Path("/pool/file"), bytes.NewReader(content), nil); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := c.Open(ctx, "user", "/pool/file", nil)
+	opened, err := c.Open(ctx, "user", core.Path("/pool/file"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +155,7 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	opts, _, roots := rig(t, 3)
 	d, c := attach(t, opts)
 	content := []byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK")
-	if _, err := c.Write(ctx, "user", "/pool/file", bytes.NewReader(content), nil); err != nil {
+	if _, err := c.Write(ctx, "user", core.Path("/pool/file"), bytes.NewReader(content), nil); err != nil {
 		t.Fatal(err)
 	}
 	f, err := d.file("/file")
@@ -182,7 +188,30 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	if _, err := d.PlanMaintenance(ctx, "repair-1", MaintenanceRequest{Kind: CollectWork}); core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(err)
 	}
+	// Simulate the former metadata shape. Reads project a stable generation;
+	// actual execution extends the record without discarding the old scan.
+	d.state.Lock()
+	legacyErr := d.update(func(tx *bolt.Tx) error {
+		r, e := d.maintenanceRecord(tx, "repair-1")
+		if e != nil {
+			return e
+		}
+		r.Version = 1
+		r.Generation = ""
+		return tx.Bucket(jobsKey).Put([]byte(r.ID), encode(r))
+	})
+	d.state.Unlock()
+	if legacyErr != nil {
+		t.Fatal(legacyErr)
+	}
+	legacy, err := d.MaintenanceStatus(ctx, "repair-1")
+	if err != nil || legacy.Generation == "" {
+		t.Fatal(legacy, err)
+	}
 	job, err := d.RunMaintenance(ctx, "repair-1", 1)
+	if job.Generation != legacy.Generation {
+		t.Fatal("execution replaced legacy identity")
+	}
 	if err != nil || job.Last.Changed != 1 || job.Done {
 		t.Fatal(job, err)
 	}
@@ -206,6 +235,12 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	jobs, err := d.MaintenanceJobs(ctx, "", 1)
 	if err != nil || len(jobs) != 1 || jobs[0].Done || jobs[0].Last.Changed != 1 {
 		t.Fatal(jobs, err)
+	}
+	if jobs[0].Generation == "" || jobs[0].Generation != job.Generation {
+		t.Fatal("restart changed durable intent identity")
+	}
+	if status, err := d.MaintenanceStatus(ctx, "repair-1"); err != nil || status != jobs[0] {
+		t.Fatal(status, err)
 	}
 	queue, err := task.New(task.Options{Concurrency: 1, Capacity: 1})
 	if err != nil {
@@ -268,7 +303,7 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	// not switch the logical placement or forget the pending maintenance intent.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	spare.create = func(ctx context.Context, p string, r io.Reader, n *int64) (core.Change, error) {
-		change, err := spare.Driver.Create(ctx, p, r, n)
+		change, err := spare.Driver.Create(ctx, core.NativePath(p), r, n)
 		cancel()
 		return change, err
 	}
@@ -308,6 +343,26 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	if _, err := d.ForgetMaintenance(ctx, "repair-1"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := d.PlanMaintenance(ctx, "repair-1", request); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []func() error{
+		func() error {
+			_, err := d.RunMaintenance(ctx, "repair-1", 1, MaintenanceOptions{ExpectedGeneration: jobs[0].Generation})
+			return err
+		},
+		func() error {
+			_, err := d.ForgetMaintenance(ctx, "repair-1", MaintenanceOptions{ExpectedGeneration: jobs[0].Generation})
+			return err
+		},
+	} {
+		if core.CodeOf(run()) != core.AlreadyExists {
+			t.Fatal("stale command affected reused ID")
+		}
+	}
+	if _, err := d.ForgetMaintenance(ctx, "repair-1"); err != nil {
+		t.Fatal(err)
+	}
 	if job, err = d.RunMaintenance(ctx, "cancelled", 100); err != nil || !job.Done {
 		t.Fatal(job, err)
 	}
@@ -323,7 +378,7 @@ func TestRepairAndDurableMaintenanceResume(t *testing.T) {
 	parityOpts, parityMembers, parityRoots := rig(t, 3)
 	parityOpts.DataShards, parityOpts.ParityShards = 1, 2
 	parityPool, parityCore := attach(t, parityOpts)
-	if _, err := parityCore.Write(ctx, "user", "/pool/file", bytes.NewBufferString("parity"), nil); err != nil {
+	if _, err := parityCore.Write(ctx, "user", core.Path("/pool/file"), bytes.NewBufferString("parity"), nil); err != nil {
 		t.Fatal(err)
 	}
 	pf, err := parityPool.file("/file")
@@ -362,7 +417,7 @@ type settledLocal struct {
 }
 
 func (m *settledLocal) ResolveUpload(ctx context.Context, intent PrivateUpload) (core.Change, error) {
-	o, err := m.Driver.Open(ctx, intent.Path, nil)
+	o, err := m.Driver.Open(ctx, core.NativePath(intent.Path), core.OpenOptions{})
 	if core.CodeOf(err) == core.NotFound {
 		return core.Change{Effect: core.Unchanged}, m.resolutionErr
 	}
@@ -376,8 +431,13 @@ func (m *settledLocal) ResolveUpload(ctx context.Context, intent PrivateUpload) 
 	}
 	return core.Change{Effect: core.Applied}, m.resolutionErr
 }
-func (m *settledLocal) Remove(ctx context.Context, p string) (core.Change, error) {
-	change, err := m.Driver.Remove(ctx, p)
+func (m *settledLocal) Remove(ctx context.Context, pAddress core.NativeAddress, _ ...core.RemoveOptions) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
+	change, err := m.Driver.Remove(ctx, core.NativePath(p))
 	if err == nil && m.lostDelete != nil && m.lostDelete.CompareAndSwap(false, true) {
 		return core.Change{}, core.Fail(core.UpstreamTimeout, nil)
 	}
@@ -451,7 +511,7 @@ func TestPoolRecoveryAfterProcessExit(t *testing.T) {
 				t.Fatal(err)
 			}
 			spare.create = func(ctx context.Context, p string, r io.Reader, n *int64) (core.Change, error) {
-				if _, err := spare.Driver.Create(ctx, p, r, n); err != nil {
+				if _, err := spare.Driver.Create(ctx, core.NativePath(p), r, n); err != nil {
 					t.Fatal(err)
 				}
 				os.Exit(48) // Repair target exists; placement/receipt remain unconfirmed.
@@ -460,7 +520,7 @@ func TestPoolRecoveryAfterProcessExit(t *testing.T) {
 			d.RunMaintenance(ctx, "repair-crash", 1)
 			t.Fatal("repair crash hook not reached")
 		}
-		if _, err := d.Create(ctx, "/committed", bytes.NewReader(content), nil); err != nil {
+		if _, err := d.Create(ctx, core.NativePath("/committed"), bytes.NewReader(content), nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := d.PlanMaintenance(ctx, "gc", MaintenanceRequest{Kind: CollectWork}); err != nil {
@@ -468,20 +528,20 @@ func TestPoolRecoveryAfterProcessExit(t *testing.T) {
 		}
 		m := opts.Members[0].Driver.(*memberFixture)
 		m.create = func(ctx context.Context, p string, r io.Reader, n *int64) (core.Change, error) {
-			if _, err := m.Driver.Create(ctx, p, r, n); err != nil {
+			if _, err := m.Driver.Create(ctx, core.NativePath(p), r, n); err != nil {
 				t.Fatal(err)
 			}
 			os.Exit(47) // Real process exit after native creation, before its receipt.
 			return core.Change{}, nil
 		}
-		d.Create(ctx, "/interrupted", bytes.NewBufferString("uncommitted"), nil)
+		d.Create(ctx, core.NativePath("/interrupted"), bytes.NewBufferString("uncommitted"), nil)
 		t.Fatal("crash hook not reached")
 	}
 	d, c := attach(t, opts)
 	if got, err := read(t, c, "/pool/committed", nil); err != nil || !bytes.Equal(got, content) {
 		t.Fatal(err)
 	}
-	if _, err := c.Stat(ctx, "user", "/pool/interrupted"); core.CodeOf(err) != core.NotFound {
+	if _, err := c.Stat(ctx, "user", core.Path("/pool/interrupted")); core.CodeOf(err) != core.NotFound {
 		t.Fatal(err)
 	}
 	if result, err := d.RunMaintenance(ctx, "gc", 100); !errors.Is(err, ErrUncertain) || result.Done {

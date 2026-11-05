@@ -94,7 +94,19 @@ func (d *Driver) commitLocked(ctx context.Context, run func(*bolt.Tx) error) (co
 	}
 	return core.Change{Effect: effect}, errors.Join(err, ctx.Err())
 }
-func (d *Driver) Stat(ctx context.Context, p string) (meta core.Metadata, err error) {
+func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
+	if len(selections) > 1 {
+		return meta, core.Fail(core.InvalidRequest, nil)
+	}
+	var selection core.ReadSelection
+	if len(selections) == 1 {
+		selection = selections[0]
+	}
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if err = core.ValidatePath(p); err != nil {
 		return
 	}
@@ -115,11 +127,19 @@ func (d *Driver) Stat(ctx context.Context, p string) (meta core.Metadata, err er
 			}
 		}
 		meta = metadata(path.Base(p), e, f)
+		if err := selection.Check(meta.Evidence); err != nil {
+			return err
+		}
 		return o.ctx.Err()
 	})
 	return
 }
-func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if err := core.ValidatePath(p); err != nil {
 		return core.Change{Effect: core.Unchanged}, err
 	}
@@ -144,7 +164,7 @@ func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
 		return tx.Bucket(entriesKey).Put(key, encode(e))
 	})
 }
-func unlink(tx *bolt.Tx, parent, name string, expected core.Kind) error {
+func unlink(tx *bolt.Tx, parent, name string, expected core.Kind, conditions ...core.Condition) error {
 	if tx.Bucket(dirsKey).Get([]byte(parent)) == nil {
 		return core.Fail(core.NotFound, nil)
 	}
@@ -160,6 +180,11 @@ func unlink(tx *bolt.Tx, parent, name string, expected core.Kind) error {
 	if (expected == core.File && e.Directory) || (expected == core.Directory && !e.Directory) {
 		return core.Fail(core.InvalidRequest, nil)
 	}
+	if len(conditions) == 1 {
+		if err := conditions[0].Check(metadata(name, e, fileRecord{ID: e.Generation}).Evidence, true); err != nil {
+			return err
+		}
+	}
 	if e.Directory {
 		prefix := entryKey(e.ID, "")
 		k, _ := tx.Bucket(entriesKey).Cursor().Seek(prefix)
@@ -174,7 +199,22 @@ func unlink(tx *bolt.Tx, parent, name string, expected core.Kind) error {
 	}
 	return tx.Bucket(entriesKey).Delete(key)
 }
-func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, policies ...core.RemoveOptions) (core.Change, error) {
+	if len(policies) > 1 {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+	}
+	var policy core.RemoveOptions
+	if len(policies) == 1 {
+		policy = policies[0]
+	}
+	if err := policy.When.ForDomain("pool-generation"); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if err := core.ValidatePath(p); err != nil {
 		return core.Change{Effect: core.Unchanged}, err
 	}
@@ -188,10 +228,32 @@ func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
 		if err != nil {
 			return err
 		}
-		return unlink(tx, parent, name, "")
+		return unlink(tx, parent, name, "", policy.When)
 	})
 }
-func (d *Driver) Relocate(ctx context.Context, from, to string) (core.Change, error) {
+func (d *Driver) Relocate(ctx context.Context, fromAddress, toAddress core.NativeAddress, policies ...core.MoveOptions) (core.Change, error) {
+	if len(policies) > 1 {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+	}
+	var policy core.MoveOptions
+	if len(policies) == 1 {
+		policy = policies[0]
+	}
+	if err := policy.Source.ForDomain("pool-generation"); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	if err := policy.Target.ForDomain("pool-generation"); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	if fromAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	from := fromAddress.Value()
+	if toAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	to := toAddress.Value()
+
 	for _, p := range []string{from, to} {
 		if err := core.ValidatePath(p); err != nil {
 			return core.Change{Effect: core.Unchanged}, err
@@ -209,7 +271,7 @@ func (d *Driver) Relocate(ctx context.Context, from, to string) (core.Change, er
 		}
 		newParent, newName, err := parentAt(tx, to)
 		if err != nil {
-			return err
+			return &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
 		}
 		oldKey, newKey := entryKey(oldParent, oldName), entryKey(newParent, newName)
 		if bytes.Equal(oldKey, newKey) {
@@ -220,12 +282,27 @@ func (d *Driver) Relocate(ctx context.Context, from, to string) (core.Change, er
 		if raw == nil {
 			return core.Fail(core.NotFound, nil)
 		}
-		if b.Get(newKey) != nil {
-			return core.Fail(core.AlreadyExists, nil)
-		}
 		var e entryRecord
 		if err := decode(raw, &e); err != nil {
 			return err
+		}
+		if err := policy.Source.Check(metadata(oldName, e, fileRecord{ID: e.Generation}).Evidence, true); err != nil {
+			return err
+		}
+		var targetEvidence core.Evidence
+		target := b.Get(newKey)
+		if target != nil {
+			var existing entryRecord
+			if err := decode(target, &existing); err != nil {
+				return err
+			}
+			targetEvidence = metadata(newName, existing, fileRecord{ID: existing.Generation}).Evidence
+		}
+		if err := policy.Target.Check(targetEvidence, target != nil); err != nil {
+			return err
+		}
+		if target != nil {
+			return core.Fail(core.AlreadyExists, nil)
 		}
 		if e.Directory {
 			for parent, depth := newParent, 0; ; depth++ {
@@ -299,10 +376,20 @@ func (d *Driver) enumerate(ctx context.Context, p string, track bool) (*iterator
 	i.mu.Unlock()
 	return i, nil
 }
-func (d *Driver) Enumerate(ctx context.Context, p string) (core.Iterator, error) {
+func (d *Driver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core.Iterator, error) {
+	if pAddress.Address().Namespace() != core.TreeNamespace || pAddress.Delimiter() != "" || pAddress.StartAfter() != "" {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Address().Value()
+
 	return d.enumerate(ctx, p, false)
 }
-func (d *Driver) OpenDirectory(ctx context.Context, p string) (core.DirectoryScope, error) {
+func (d *Driver) OpenDirectory(ctx context.Context, pAddress core.NativeAddress) (core.DirectoryScope, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	return d.enumerate(ctx, p, true)
 }
 func (i *iterator) Next(ctx context.Context, limit int) ([]core.Metadata, error) {
@@ -367,7 +454,7 @@ func (i *iterator) OpenFile(ctx context.Context, name string) (core.Opened, erro
 	if i.closed || !i.ended || i.seen[name] != core.File || !core.ValidName(name) {
 		return core.Opened{}, core.Fail(core.InvalidRequest, nil)
 	}
-	return i.op.d.open(ctx, name, nil, func(tx *bolt.Tx) (entryRecord, error) {
+	return i.op.d.open(ctx, name, core.OpenOptions{}, func(tx *bolt.Tx) (entryRecord, error) {
 		var e entryRecord
 		if tx.Bucket(dirsKey).Get([]byte(i.parent)) == nil {
 			return e, core.Fail(core.NotFound, nil)

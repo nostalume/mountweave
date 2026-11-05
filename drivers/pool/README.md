@@ -51,11 +51,11 @@ Pool implements the existing `Driver`, `DirectoryMaker`, `FileCreator`,
 Directory scopes also implement `ChildRemover`. Use ordinary Core APIs:
 
 ```go
-files.Mkdir(ctx, principal, "/pool/videos")
-files.Write(ctx, principal, "/pool/videos/movie", input, length)
-files.Write(ctx, principal, "/pool/videos/movie", input, length,
-    core.WriteOptions{Replace: true})
-files.Move(ctx, principal, "/pool/videos", "/pool/archive")
+files.Mkdir(ctx, principal, core.Path("/pool/videos"))
+files.Write(ctx, principal, core.Path("/pool/videos/movie"), input, length)
+files.Write(ctx, principal, core.Path("/pool/videos/movie"), input, length,
+    core.WriteOptions{Policy: core.Publish()})
+files.Move(ctx, principal, core.Path("/pool/videos"), core.Path("/pool/archive"))
 ```
 
 `CopyTree`, `RemoveTree`, batches, and directory-merge options reuse their existing
@@ -69,10 +69,21 @@ Publish creates or replaces a regular file only after complete input and full
 redundancy. It captures its parent ID before reading input, preserving that parent
 across rename and refusing publication into a deleted/recreated parent.
 
-An open pins its immutable content generation. Replacement atomically switches
+An open pins its immutable content generation. BoundRead returns File with
+PinnedVersion strength, reusing that same pin and stripe decoder. ReadAt EOF and
+call cancellation do not unpin; Close does. Every ReadAt returns its shared stripe
+window credit before returning, so an idle File retains metadata/pin only.
+Separate small calls can refetch stripes; sequential Body retains its original
+streaming window and fast path. Replacement atomically switches
 the name to a new generation; deletion unlinks the name. Both leave old readers
 usable until Close. Logical success does not claim physical garbage collection.
 Remove is nonrecursive and refuses nonempty directories; Move does not overwrite.
+File evidence uses the immutable generation as a strong validator in the
+`pool-generation` domain. Publish, Remove and Move compare the selected conditions
+inside the same manifest transaction as their effects; finite sets and paired
+positive/negative tests need no extra native query. Open compares and pins that
+same generation. An explicit Version selects only the currently named generation;
+it does not expose arbitrary retained garbage through a historical lookup API.
 
 ## Members, capacity, and maintenance
 
@@ -166,13 +177,9 @@ change, err := storage.PlanMaintenance(ctx, "repair-pass-1",
 
 handle, err := queue.Submit(ctx, task.Work{
     Run: func(ctx context.Context, report func(any)) (any, error) {
-        for {
-            job, err := storage.RunMaintenance(ctx, "repair-pass-1", 32)
-            report(job)
-            if err != nil || job.Done {
-                return job, err
-            }
-        }
+        job, err := storage.RunMaintenance(ctx, "repair-pass-1", 32)
+        report(job)
+        return job, err // Host policy schedules another bounded batch if needed.
     },
 })
 ```
@@ -192,7 +199,24 @@ spinning on More. `ForgetMaintenance` removes an inactive intent/receipt without
 undoing file effects; private resources remain owned by the shard ledger. A
 running batch must return first; its task Handle can request cancellation.
 The generic queue still accepts arbitrary functions, without serializing closures,
-credentials, bodies or a second Pool scheduler. No new HTTP route is introduced.
+credentials, bodies or a second Pool scheduler.
+
+`MaintenanceStatus(ctx, id)` performs an exact metadata lookup. Every intent has
+an immutable `Generation`; optional `MaintenanceOptions{ExpectedGeneration: ...}`
+on RunMaintenance/ForgetMaintenance rejects an old command after ID reuse inside
+the original maintenance owner. Ordinary calls retain their syntax; method value
+types now include a variadic options parameter. Legacy records obtain a stable
+reference without query-time writes, preserving checkpoints; later execution
+saves the extended record. New intents receive random generations.
+
+The optional `drivers/pool/delivery` package registers maintenance in
+`httpapi.Options.JobSources` with `delivery.Jobs(delivery.Options{Scope, Resolve,
+Authorize})`. Resolve borrows this same restored Pool; Scope must remain stable
+and shared by all registrations of it. Authorization controls resource management,
+not a fabricated job owner. Its run action takes id/generation/positive limit;
+forget takes id/generation. Both share the existing TaskKind for synchronous
+`/api/v1/jobs/actions` or queued `/api/v1/tasks` execution. The base Pool package
+does not import HTTP; no new module, runtime or metadata database is required.
 
 ## Format, buffers, and recovery
 

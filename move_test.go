@@ -13,11 +13,12 @@ import (
 
 func TestLocalMove(t *testing.T) {
 	directory := t.TempDir()
-	c := newCore(t, core.Options{Authorize: func(ctx context.Context, p core.Principal, a core.Action, target string) error {
+	c := newCore(t, core.Options{Authorize: func(ctx context.Context, p core.Principal, a core.Action, targetAddress core.Address) error {
+		target := targetAddress.Value()
 		if core.Within(target, "/files/folder") && (a == core.ReadAction || a == core.ListAction) {
 			return errors.New("directory move needs no descendant read grant")
 		}
-		return allow(ctx, p, a, target)
+		return allow(ctx, p, a, core.Path(target))
 	}})
 	defer closeCore(t, c)
 	m := mountLocal(t, c, directory)
@@ -29,21 +30,21 @@ func TestLocalMove(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(directory, "folder"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	page, err := c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute})
+	page, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
 	if err != nil || page.NextCursor == nil {
 		t.Fatal(page, err)
 	}
-	change, err := c.Move(context.Background(), "alice", "/files/a", "/files/existing")
+	change, err := c.Move(context.Background(), "alice", core.Path("/files/a"), core.Path("/files/existing"))
 	if change.Source.Effect == core.Unchanged && change.Target.Effect == core.Unchanged && core.CodeOf(err) == core.UnsupportedOperation {
 		t.Skip("native no-replace relocation unavailable on this filesystem")
 	}
 	if change.Source.Effect != core.Unchanged || change.Target.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(change, err)
 	}
-	if err := c.CheckCursor(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *page.NextCursor}); err != nil {
+	if err := c.CheckCursor(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor}); err != nil {
 		t.Fatal("refusal invalidated the cursor", err)
 	}
-	change, err = c.Move(context.Background(), "alice", "/files/a", "/files/folder/b")
+	change, err = c.Move(context.Background(), "alice", core.Path("/files/a"), core.Path("/files/folder/b"))
 	if core.CodeOf(err) == core.UnsupportedOperation && change.Source.Effect == core.Unchanged && change.Target.Effect == core.Unchanged {
 		t.Skip("native no-replace relocation unavailable on this filesystem")
 	}
@@ -59,8 +60,8 @@ func TestLocalMove(t *testing.T) {
 			t.Fatal(name, string(data), err)
 		}
 	}
-	code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *page.NextCursor}), core.CursorUnavailable)
-	change, err = c.Move(context.Background(), "alice", "/files/folder/b", "/files/folder/c")
+	code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor}), core.CursorUnavailable)
+	change, err = c.Move(context.Background(), "alice", core.Path("/files/folder/b"), core.Path("/files/folder/c"))
 	if change.Source.Effect != core.Applied || change.Target.Effect != core.Applied || err != nil {
 		t.Fatal(change, err)
 	}
@@ -82,24 +83,24 @@ func TestLocalMove(t *testing.T) {
 	if err := c.BindAlias(context.Background(), "/view", m, "/folder"); err != nil {
 		t.Fatal(err)
 	}
-	page, err = c.List(context.Background(), "alice", core.ListRequest{Path: "/files", Limit: 1, CursorTTL: time.Minute})
+	page, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
 	if err != nil || page.NextCursor == nil {
 		t.Fatal(page, err)
 	}
-	change, err = c.Move(context.Background(), "alice", "/files/folder", "/alias/occupied")
+	change, err = c.Move(context.Background(), "alice", core.Path("/files/folder"), core.Path("/alias/occupied"))
 	if change.Source.Effect != core.Unchanged || change.Target.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(change, err)
 	}
-	if err := c.CheckCursor(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *page.NextCursor}); err != nil {
+	if err := c.CheckCursor(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor}); err != nil {
 		t.Fatal("refused directory move invalidated cursor", err)
 	}
 	for _, target := range []string{"/alias/folder", "/alias/folder/nested/inside"} {
-		change, err = c.Move(context.Background(), "alice", "/files/folder", target)
+		change, err = c.Move(context.Background(), "alice", core.Path("/files/folder"), core.Path(target))
 		if change.Source.Effect != core.Unchanged || change.Target.Effect != core.Unchanged || core.CodeOf(err) != core.InvalidRequest {
 			t.Fatal(change, err)
 		}
 	}
-	change, err = c.Move(context.Background(), "alice", "/files/folder", "/alias/renamed")
+	change, err = c.Move(context.Background(), "alice", core.Path("/files/folder"), core.Path("/alias/renamed"))
 	if change.Source.Effect != core.Applied || change.Target.Effect != core.Applied || err != nil {
 		t.Fatal(change, err)
 	}
@@ -110,15 +111,14 @@ func TestLocalMove(t *testing.T) {
 	if info, err := os.Stat(filepath.Join(directory, "renamed", "nested", "empty")); err != nil || !info.IsDir() {
 		t.Fatal(info, err)
 	}
-	code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Path: "/files", Cursor: *page.NextCursor}), core.CursorUnavailable)
-	_, err = c.Stat(context.Background(), "alice", "/view")
+	code(t, c.CheckCursor(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor}), core.CursorUnavailable)
+	_, err = c.Stat(context.Background(), "alice", core.Path("/view"))
 	code(t, err, core.NotFound) // Aliases retain paths, not directory identities.
-
 	rows, err := c.MoveBatch(context.Background(), "alice", []core.MoveRequest{
-		{Source: "/files/renamed", Target: "/files/final"},
-		{Source: "/alias/final/nested/payload", Target: "/files/result"},
-		{Source: "/files/final/c", Target: "/files/result"},
-		{Source: "/files/final/c", Target: "/files/not-started"},
+		{Source: core.Path("/files/renamed"), Target: core.Path("/files/final")},
+		{Source: core.Path("/alias/final/nested/payload"), Target: core.Path("/files/result")},
+		{Source: core.Path("/files/final/c"), Target: core.Path("/files/result")},
+		{Source: core.Path("/files/final/c"), Target: core.Path("/files/not-started")},
 	})
 	if len(rows) != 3 || core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(rows, err)
@@ -146,7 +146,16 @@ type relocatingDriver struct {
 	move func(context.Context, string, string) (core.Change, error)
 }
 
-func (d *relocatingDriver) Relocate(ctx context.Context, source, target string) (core.Change, error) {
+func (d *relocatingDriver) Relocate(ctx context.Context, sourceAddress, targetAddress core.NativeAddress, _ ...core.MoveOptions) (core.Change, error) {
+	if sourceAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	source := sourceAddress.Value()
+	if targetAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	target := targetAddress.Value()
+
 	return d.move(ctx, source, target)
 }
 
@@ -154,7 +163,7 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	denied, calls := true, 0
-	c := newCore(t, core.Options{Authorize: func(_ context.Context, _ core.Principal, a core.Action, target string) error {
+	c := newCore(t, core.Options{Authorize: func(_ context.Context, _ core.Principal, a core.Action, targetAddress core.Address) error {
 		if denied && a == core.CreateAction {
 			return errors.New("target denied")
 		}
@@ -173,7 +182,7 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 	if _, err := c.Install("/files", d); err != nil {
 		t.Fatal(err)
 	}
-	change, err := c.Move(ctx, "alice", "/files/a", "/files/b")
+	change, err := c.Move(ctx, "alice", core.Path("/files/a"), core.Path("/files/b"))
 	if change.Source.Effect != core.Unchanged || change.Target.Effect != core.Unchanged || core.CodeOf(err) != core.PermissionDenied || calls != 0 {
 		t.Fatal(change, err, calls)
 	}
@@ -181,11 +190,11 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 	if _, err := c.Install("/other", &fakeDriver{}); err != nil {
 		t.Fatal(err)
 	}
-	change, err = c.Move(ctx, "alice", "/files/a", "/other/b")
+	change, err = c.Move(ctx, "alice", core.Path("/files/a"), core.Path("/other/b"))
 	if change.Source.Effect != core.Unchanged || change.Target.Effect != core.Unchanged || core.CodeOf(err) != core.UnsupportedOperation || calls != 0 {
 		t.Fatal(change, err, calls)
 	}
-	change, err = c.Move(ctx, "alice", "/files/a", "/files/b")
+	change, err = c.Move(ctx, "alice", core.Path("/files/a"), core.Path("/files/b"))
 	if change.Source.Effect != core.Applied || change.Target.Effect != core.Applied || !errors.Is(err, fault) || !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatal(change, err, calls)
 	}
@@ -200,7 +209,7 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 		d.move = func(context.Context, string, string) (core.Change, error) {
 			return core.Change{Effect: tc.effect}, fault
 		}
-		result, err := c.Move(context.Background(), "alice", "/files/a", "/files/b")
+		result, err := c.Move(context.Background(), "alice", core.Path("/files/a"), core.Path("/files/b"))
 		if result.Source.Effect != tc.want || result.Target.Effect != tc.want || !errors.Is(err, fault) {
 			t.Fatal(result, err)
 		}
@@ -219,7 +228,7 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 		{c, "/files/a", "/files/../b", core.InvalidPath},
 		{c, "/files", "/files/b", core.InvalidRequest},
 	} {
-		result, err := tc.c.Move(context.Background(), "alice", tc.source, tc.target)
+		result, err := tc.c.Move(context.Background(), "alice", core.Path(tc.source), core.Path(tc.target))
 		if result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged || core.CodeOf(err) != tc.code {
 			t.Fatal(result, err)
 		}
@@ -229,7 +238,8 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 		t.Run("rebound-"+endpoint, func(t *testing.T) {
 			var c *core.Core
 			var m *core.Mount
-			c = newCore(t, core.Options{Authorize: func(ctx context.Context, _ core.Principal, _ core.Action, target string) error {
+			c = newCore(t, core.Options{Authorize: func(ctx context.Context, _ core.Principal, _ core.Action, targetAddress core.Address) error {
+				target := targetAddress.Value()
 				if core.Within(target, "/alias") {
 					if err := c.UnbindAlias(ctx, "/alias"); err != nil {
 						return err
@@ -252,11 +262,11 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 			if err := c.BindAlias(context.Background(), "/alias", m, "/"); err != nil {
 				t.Fatal(err)
 			}
-			request := core.MoveRequest{Source: "/files/a", Target: "/files/b"}
+			request := core.MoveRequest{Source: core.Path("/files/a"), Target: core.Path("/files/b")}
 			if endpoint == "source" {
-				request.Source = "/alias/a"
+				request.Source = core.Path("/alias/a")
 			} else {
-				request.Target = "/alias/b"
+				request.Target = core.Path("/alias/b")
 			}
 			rows, err := c.MoveBatch(context.Background(), "alice", []core.MoveRequest{request})
 			if len(rows) != 1 || nativeCalls != 0 || core.CodeOf(err) != core.MountUnavailable ||

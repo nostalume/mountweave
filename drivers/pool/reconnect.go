@@ -103,7 +103,7 @@ func (d *Driver) createShard(ctx context.Context, shard shardRecord, input io.Re
 	if !ok {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
-	change, err := creator.Create(u.ctx, shard.Path, input, &length)
+	change, err := creator.Create(u.ctx, core.NativePath(shard.Path), input, &length)
 	return change, errors.Join(err, u.ctx.Err())
 }
 

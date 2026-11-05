@@ -12,13 +12,14 @@ import (
 	sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/internal/upload"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 type resumeBinding struct {
 	Scope, Bucket, Key, Source string
 	Length, PartSize           int64
-	Replace                    bool
+	Replace                    bool           `json:",omitempty"` // Decode version-2 checkpoints only.
+	When                       core.Condition `json:",omitzero"`
 }
 type uploadState struct {
 	Phase, Token, UploadID string
@@ -30,8 +31,17 @@ func resumeError(message string) error { return core.Fail(core.UpstreamFailure, 
 // ContinueWrite retains native uploads on cancellation/failure. The protected
 // checkpoint consumer owns them after return; ordinary PendingUploads/Cleanup
 // never aborts these independently owned sessions. No credentials/URLs are saved.
-func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replayable, length int64, replace bool, c core.WriteContinuation) (result core.Change, err error) {
+func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source core.Replayable, length int64, options core.PublicationOptions, c core.WriteContinuation) (result core.Change, err error) {
 	result.Effect = core.Unchanged
+	// Observation for
+	// a new HTTP response is not reconstructed from a durable prior attempt.
+	if options.ObserveTarget {
+		return result, core.Fail(core.UnsupportedOperation, nil)
+	}
+	match, none, err := nativeCondition(options.When, false)
+	if err != nil {
+		return result, err
+	}
 	if d.buffer == nil || d.opts.ResumeScope == "" {
 		return result, core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -49,13 +59,13 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 		return result, core.Fail(core.UnsupportedOperation, nil)
 	}
 	count = max(count, 1)
-	binding := resumeBinding{Scope: d.opts.ResumeScope, Bucket: d.bucket, Key: d.key(p), Source: source.SourceVersion(), Length: length, PartSize: d.opts.PartSize, Replace: replace}
+	binding := resumeBinding{Scope: d.opts.ResumeScope, Bucket: d.bucket, Key: d.key(p), Source: source.SourceVersion(), Length: length, PartSize: d.opts.PartSize, When: options.When}
 	state, err := restoreUpload(c.Checkpoint, binding, int(count))
 	if err != nil {
 		return result, err
 	}
 	save := func(saveCtx context.Context) error {
-		record := uploadRecord{Version: 2, Kind: "phase", Phase: state.Phase, UploadID: state.UploadID}
+		record := uploadRecord{Version: 3, Kind: "phase", Phase: state.Phase, UploadID: state.UploadID}
 		if state.Phase == "initializing" {
 			record.Kind = "start"
 			record.Binding = &binding
@@ -79,7 +89,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 		out, e := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key)})
 		if e == nil && out.Metadata["mountweave-upload"] == state.Token && out.ContentLength != nil && *out.ContentLength == length && aws.ToString(out.ETag) != "" {
 			state.Phase = "done"
-			return core.Change{Effect: core.Applied}, save(acknowledged)
+			return core.Change{Effect: core.Applied, Evidence: evidence(out.ETag, out.VersionId)}, save(acknowledged)
 		}
 		return core.Change{Effect: core.Unknown}, errors.Join(resumeError("multipart publication is unresolved"), translate(e))
 	}
@@ -117,7 +127,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 		return result, save(acknowledged)
 	}
 	// Recheck the ordinary namespace before creating/sending any new native data.
-	if directory, e := d.hasDirectory(ctx, binding.Key); e != nil {
+	if directory, e := d.directoryAt(ctx, p); e != nil {
 		return result, e
 	} else if directory {
 		return result, core.Fail(core.NotFile, nil)
@@ -199,7 +209,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 			checkpointMu.Lock()
 			defer checkpointMu.Unlock()
 			state.Parts[n] = tag
-			return appendUpload(context.WithoutCancel(partCtx), c.Append, uploadRecord{Version: 2, Kind: "part", Part: n, ETag: tag})
+			return appendUpload(context.WithoutCancel(partCtx), c.Append, uploadRecord{Version: 3, Kind: "part", Part: n, ETag: tag})
 		})
 		err = errors.Join(inputError(err), reader.Close())
 		if err != nil {
@@ -227,15 +237,13 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 		return
 	}
 	request := &sdk.CompleteMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), UploadId: aws.String(state.UploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: receipts}}
-	if !replace {
-		request.IfNoneMatch = aws.String("*")
-	}
+	request.IfMatch, request.IfNoneMatch = match, none
 	ack, e := d.client.CompleteMultipartUpload(ctx, request, noReplay)
 	if e != nil {
 		var status interface{ HTTPStatusCode() int }
-		if !replace && errors.As(e, &status) && status.HTTPStatusCode() == 412 {
+		if errors.As(e, &status) && status.HTTPStatusCode() == 412 {
 			state.Phase = "uploading"
-			return result, errors.Join(core.Fail(core.AlreadyExists, e), save(acknowledged))
+			return result, errors.Join(core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{Negative: options.When.IsAbsent()}, e)), save(acknowledged))
 		}
 		return core.Change{Effect: core.Unknown}, translate(e)
 	}
@@ -243,7 +251,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p string, source core.Replay
 		return core.Change{Effect: core.Unknown}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	state.Phase = "done"
-	return core.Change{Effect: core.Applied}, save(acknowledged)
+	return core.Change{Effect: core.Applied, Evidence: evidence(ack.ETag, ack.VersionId)}, save(acknowledged)
 }
 
 // missingInput concatenates only missing native ranges for the existing bounded

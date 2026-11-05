@@ -11,7 +11,12 @@ import (
 
 // RemoveSubtree deletes the captured native directory ID and confirms its task.
 // This is whole-subtree authority, including names absent from client listings.
-func (d *Driver) RemoveSubtree(ctx context.Context, p string, limits core.TreeOptions) (core.Change, error) {
+func (d *Driver) RemoveSubtree(ctx context.Context, pAddress core.NativeAddress, limits core.TreeOptions) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	unchanged := core.Change{Effect: core.Unchanged}
 	if p == "/" || limits.MaxEntries <= 0 || limits.MaxPlanBytes <= 0 || limits.Concurrency < 0 {
 		return unchanged, core.Fail(core.InvalidRequest, nil)

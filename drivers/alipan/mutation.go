@@ -81,7 +81,12 @@ func (d *Driver) createEntry(ctx context.Context, parent, name, kind string, par
 	}
 	return out, change, err
 }
-func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.Change, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	unchanged := core.Change{Effect: core.Unchanged}
 	parent, name, err := d.destination(ctx, p)
 	if err != nil {
@@ -95,7 +100,18 @@ func (d *Driver) Mkdir(ctx context.Context, p string) (core.Change, error) {
 	_, change, err := d.createEntry(ctx, parent.ID, name, "folder", nil, nil)
 	return change, err
 }
-func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
+func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, policies ...core.RemoveOptions) (core.Change, error) {
+	if len(policies) > 1 {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(policies) == 1 && !policies[0].When.Empty() {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	unchanged := core.Change{Effect: core.Unchanged}
 	if p == "/" {
 		return unchanged, core.Fail(core.InvalidRequest, nil)
@@ -111,7 +127,22 @@ func (d *Driver) Remove(ctx context.Context, p string) (core.Change, error) {
 	}
 	return d.deleteEntry(ctx, f.ID)
 }
-func (d *Driver) Relocate(ctx context.Context, source, target string) (core.Change, error) {
+func (d *Driver) Relocate(ctx context.Context, sourceAddress, targetAddress core.NativeAddress, policies ...core.MoveOptions) (core.Change, error) {
+	if len(policies) > 1 {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(policies) == 1 && (!policies[0].Source.Empty() || !policies[0].Target.Empty()) {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if sourceAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	source := sourceAddress.Value()
+	if targetAddress.Namespace() != core.TreeNamespace {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	target := targetAddress.Value()
+
 	unchanged := core.Change{Effect: core.Unchanged}
 	if source == "/" || target == "/" || source == target {
 		return unchanged, core.Fail(core.InvalidRequest, nil)
@@ -122,7 +153,7 @@ func (d *Driver) Relocate(ctx context.Context, source, target string) (core.Chan
 	}
 	parent, name, err := d.destination(ctx, target)
 	if err != nil {
-		return unchanged, err
+		return unchanged, &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
 	}
 	if _, exists, err := d.child(ctx, parent.ID, name); err != nil {
 		return unchanged, err

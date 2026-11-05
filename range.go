@@ -5,6 +5,7 @@ type Range struct {
 	Start, End int64
 	Suffix     bool
 }
+
 type ContentRange struct{ Start, End, Total int64 }
 
 func (r Range) Valid() bool {
@@ -13,6 +14,7 @@ func (r Range) Valid() bool {
 	}
 	return r.Start >= 0 && (r.End == -1 || r.End >= r.Start)
 }
+
 func (r Range) Resolve(total int64) (ContentRange, error) {
 	if !r.Valid() {
 		return ContentRange{}, Fail(InvalidRange, nil)

@@ -13,7 +13,7 @@ import (
 	sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	core "github.com/nostalume/mountweave"
-	"github.com/nostalume/mountweave/internal/upload"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 // PendingUpload is an owned private resource, not a resumable client token.
@@ -86,10 +86,25 @@ func inputError(err error) error {
 		return err
 	}
 }
-func (d *Driver) Publish(ctx context.Context, p string, input io.Reader, length *int64) (core.Change, error) {
-	return d.bufferedWrite(ctx, p, input, length, true)
+func (d *Driver) Publish(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64, options core.PublicationOptions) (core.Change, error) {
+	return d.bufferedWrite(ctx, p, input, length, options)
 }
-func (d *Driver) bufferedWrite(ctx context.Context, p string, input io.Reader, length *int64, replace bool) (result core.Change, err error) {
+func (d *Driver) bufferedWrite(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64, options core.PublicationOptions) (result core.Change, err error) {
+	replace := !options.When.IsAbsent()
+	match, none, conditionErr := nativeCondition(options.When, false)
+	if conditionErr != nil {
+		return core.Change{Effect: core.Unchanged}, conditionErr
+	}
+	before := core.TargetUnknown
+	defer func() {
+		if !replace && result.Effect == core.Applied {
+			before = core.TargetMissing
+		}
+		if options.When.Match() != "" && result.Effect == core.Applied {
+			before = core.TargetPresent
+		}
+		result.Before = before
+	}()
 	result.Effect = core.Unchanged
 	if input == nil || (length != nil && *length < 0) {
 		return result, core.Fail(core.InvalidRequest, nil)
@@ -110,7 +125,7 @@ func (d *Driver) bufferedWrite(ctx context.Context, p string, input io.Reader, l
 	if pending != 0 {
 		return result, core.Fail(core.UpstreamFailure, errors.New("multipart cleanup remains unresolved"))
 	}
-	if directory, e := d.hasDirectory(ctx, d.key(p)); e != nil {
+	if directory, e := d.directoryAt(ctx, p); e != nil {
 		return result, e
 	} else if directory {
 		code := core.AlreadyExists
@@ -118,6 +133,16 @@ func (d *Driver) bufferedWrite(ctx context.Context, p string, input io.Reader, l
 			code = core.NotFile
 		}
 		return result, core.Fail(code, nil)
+	}
+	if options.ObserveTarget && options.When.Empty() {
+		_, headErr := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(d.key(p))})
+		before = core.TargetPresent
+		if headErr != nil {
+			if core.CodeOf(translate(headErr)) != core.NotFound {
+				return result, translate(headErr)
+			}
+			before = core.TargetMissing
+		}
 	}
 	parts := 0
 	if length != nil {
@@ -144,7 +169,7 @@ func (d *Driver) bufferedWrite(ctx context.Context, p string, input io.Reader, l
 			return
 		}
 		err = lease.Send(ctx, func() error {
-			result, err = d.putBuffer(ctx, d.key(p), data, replace)
+			result, err = d.putBuffer(ctx, d.key(p), data, options.When)
 			return err
 		})
 		return
@@ -217,12 +242,14 @@ func (d *Driver) bufferedWrite(ctx context.Context, p string, input io.Reader, l
 		return
 	}
 	request := &sdk.CompleteMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(intent.Key), UploadId: aws.String(intent.UploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: receipts[:count]}}
-	if !replace {
-		request.IfNoneMatch = aws.String("*")
-	}
+	request.IfMatch, request.IfNoneMatch = match, none
 	ack, e := d.client.CompleteMultipartUpload(ctx, request, noReplay)
-	result, err = mutationResult(ctx, e, !replace)
+	result, err = mutationResult(ctx, e, !options.When.Empty())
+	if core.CodeOf(err) == core.AlreadyExists && !options.When.IsAbsent() {
+		err = core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{}, err))
+	}
 	if e == nil {
+		result.Evidence = evidence(ack.ETag, ack.VersionId)
 		complete = true
 		d.forgetPending(intent.ID)
 		if ack.ETag == nil || *ack.ETag == "" {

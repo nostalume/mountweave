@@ -16,7 +16,7 @@ import (
 	core "github.com/nostalume/mountweave"
 	driver "github.com/nostalume/mountweave/drivers/alipan"
 	"github.com/nostalume/mountweave/drivers/alipan/credential"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 )
 
 type transport func(*http.Request) (*http.Response, error)
@@ -56,7 +56,9 @@ func prepared(t *testing.T, rt transport, configure func(*driver.Options)) (*dri
 		_ = tokens.Close()
 		t.Fatal(err)
 	}
-	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, string) error { return nil }})
+	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
+		return nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,15 +141,15 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	})
 	d, c := prepared(t, rt, nil)
 	ctx := context.Background()
-	entry, err := c.Stat(ctx, "reader", "/cloud/song")
+	entry, err := c.Stat(ctx, "reader", core.Path("/cloud/song"))
 	if err != nil || entry.Size == nil || *entry.Size != 99 || pages.Load() != 2 {
 		t.Fatalf("stat: %#v %v", entry, err)
 	}
-	first, err := c.List(ctx, "reader", core.ListRequest{Path: "/cloud", Limit: 1, CursorTTL: time.Minute})
+	first, err := c.List(ctx, "reader", core.ListRequest{Query: core.Children(core.Path("/cloud")), Limit: 1, CursorTTL: time.Minute})
 	if err != nil || len(first.Items) != 1 || first.NextCursor == nil {
 		t.Fatal(first, err)
 	}
-	req := core.ListRequest{Path: "/cloud", Cursor: *first.NextCursor}
+	req := core.ListRequest{Query: core.Children(core.Path("/cloud")), Cursor: *first.NextCursor}
 	second, err := c.List(ctx, "reader", req)
 	if err != nil || len(second.Items) != 1 || second.Items[0].Kind != core.Directory || second.Items[0].Size != nil {
 		t.Fatal(second, err)
@@ -156,7 +158,7 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	if _, err = c.List(ctx, "reader", req); err != nil || pages.Load() != before {
 		t.Fatal("replay advanced native state", err)
 	}
-	opened, err := c.Open(ctx, "reader", "/cloud/song", &core.Range{Start: 2, End: 5})
+	opened, err := c.Open(ctx, "reader", core.Path("/cloud/song"), core.OpenOptions{Range: &core.Range{Start: 2, End: 5}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +169,7 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	if pages.Load()-before != 2 || links.Load() != 1 || downloads.Load() != 1 {
 		t.Fatal("redundant path resolution or download")
 	}
-	scope, err := d.OpenDirectory(ctx, "/")
+	scope, err := d.OpenDirectory(ctx, core.NativePath("/"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,8 +205,8 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	if _, err := c.Install("/local", output); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.CopyTree(ctx, "reader", "/cloud", "/local/copied", core.TreeCopyOptions{MaxEntries: 20, MaxPlanBytes: 1024})
-	if err != nil || len(rows) != 3 {
+	rows, err := c.CopyTree(ctx, "reader", core.Path("/cloud"), core.Path("/local/copied"), core.TreeCopyOptions{MaxEntries: 20, MaxPlanBytes: 1024})
+	if err != nil || len(rows.Items) != 3 {
 		t.Fatal(rows, err)
 	}
 	data, err = os.ReadFile(filepath.Join(directory, "copied", "song"))
@@ -248,7 +250,7 @@ func TestResolutionNeverInventsUniquenessOrAbsence(t *testing.T) {
 					o.MaxResolvePages = 1
 				}
 			})
-			_, err := c.Stat(context.Background(), "reader", "/cloud/song")
+			_, err := c.Stat(context.Background(), "reader", core.Path("/cloud/song"))
 			want := map[string]core.Code{"duplicate": core.PathAmbiguous, "incomplete": core.UpstreamFailure, "budget": core.ResolutionBudgetExceeded, "missing": core.NotFound, "repeated-marker": core.InvalidUpstreamResponse, "wrong-drive": core.InvalidUpstreamResponse, "invalid-name": core.UnrepresentableName, "missing-items": core.InvalidUpstreamResponse}[scenario]
 			requireCode(t, err, want)
 		})
@@ -301,7 +303,7 @@ func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
 			}, nil)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			opened, err := c.Open(ctx, "reader", "/cloud/song", &core.Range{Start: 1, End: 2})
+			opened, err := c.Open(ctx, "reader", core.Path("/cloud/song"), core.OpenOptions{Range: &core.Range{Start: 1, End: 2}})
 			switch scenario {
 			case "bad-range", "missing-range", "unsafe-url":
 				requireCode(t, err, core.InvalidUpstreamResponse)
@@ -359,7 +361,7 @@ func TestCancellationReachesNativeRequest(t *testing.T) {
 	}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, err := c.Stat(ctx, "reader", "/cloud/song"); done <- err }()
+	go func() { _, err := c.Stat(ctx, "reader", core.Path("/cloud/song")); done <- err }()
 	<-started
 	cancel()
 	select {
@@ -417,7 +419,7 @@ func TestOAuthRefreshAndOneReplay(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if _, err = d.Stat(context.Background(), "/song"); err != nil {
+	if _, err = d.Stat(context.Background(), core.NativePath("/song")); err != nil {
 		t.Fatal(err)
 	}
 	if exchanges.Load() != 1 || saves.Load() != 1 || requests.Load() != 2 {
@@ -441,7 +443,7 @@ func TestResponseBudgetAndNativeThrottle(t *testing.T) {
 					o.MaxResponseBytes = int64(len(payload) - 1)
 				}
 			})
-			_, err := c.List(context.Background(), "reader", core.ListRequest{Path: "/cloud", CursorTTL: time.Minute})
+			_, err := c.List(context.Background(), "reader", core.ListRequest{Query: core.Children(core.Path("/cloud")), CursorTTL: time.Minute})
 			switch scenario {
 			case "exact-budget":
 				if err != nil {

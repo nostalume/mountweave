@@ -17,6 +17,9 @@
 // and later capture an unrelated replacement. Selection then protects execution
 // against subsequent rebinding. Credentials and refresh revisions are not stored
 // in intent; native factories/providers still load their current secret state.
+// Target.Address retains tree/key identity. Old JSON Target.Path records decode
+// as tree addresses; their legacy generation hash uses the original field order.
+// Store every new field and stop old writers before switching versions.
 //
 // Authorize protects intent creation/observation/execution/abort and use of the
 // referenced input; input IDs alone grant no byte permission. It receives a copy

@@ -5,11 +5,33 @@
 // success. The embedding application eventually calls Core.Close with its chosen
 // wait context. Drivers keep physical paths, provider IDs and temporary URLs private.
 //
+// # Addresses and queries
+//
+// All file operations accept Address: Path("/files/a") selects the tree view;
+// Key("/cloud", "a//b") selects an exact key in that installed binding. Space is
+// an existing mount/alias prefix, not a second registry or a credential owner.
+// Constructors preserve bytes; admission validates their namespace. Authorization
+// receives the full Address and must distinguish tree paths, keys and prefixes.
+// Entry.Address retains that distinction; a key Entry.Name is the visible key.
+//
+// ListRequest.Query is Children(Path(...)) or Keys(space, prefix, delimiter).
+// Query.After is a literal native start-after key, not a Core cursor. PrefixGroup
+// entries carry Prefix addresses and are listing selectors, never directories or
+// file mutation targets. Delimiter/ordering semantics belong to the Driver.
+// Native keys do not pass through path normalization or tree ancestor checks.
+// Tree-only drivers reject key addresses before consuming input or making effects.
+//
+// Drivers receive NativeAddress/NativeQuery after root projection. NamespaceSupport
+// advertises key support; optional KeyProjection conservatively describes overlap
+// between tree and key views without native I/O. Both views retain the same mount,
+// budget, mutation revision, authorization and retirement owner. These addresses
+// name execution-time resources, not immutable content or persistent object IDs.
+//
 // ListRequest.CursorTTL supplies an absolute lifetime on the first enumeration
 // request. A continuation inherits it when zero, or must match it when supplied.
 // Stat and Open need no enumeration policy. MaxCursors and OpenTimeout are optional
 // runtime policies. Hosts choose values; there are no benchmark defaults.
-// Continuations bind principal, path, mount generation and limit. The latest
+// Continuations bind principal, the complete Query, mount generation and limit. The latest
 // continuation response is replayable until advancement; competing advancement
 // returns 429 instead of queuing. ReleaseCursor explicitly releases one enumeration.
 // Cursors do not survive process restart.
@@ -28,7 +50,7 @@
 //
 // An alias owns no Driver, connection or credentials. Every action checks both its
 // visible path and corresponding primary path through the same Authorizer.
-// Operations reject alias roots just like mount roots. Explicit aliases share
+// Tree mutations reject alias roots just like mount roots. Explicit aliases share
 // mount revisions and retirement; equivalent resolved Copy/Move endpoints are
 // rejected. No implicit physical-alias discovery across independent mounts is
 // promised.
@@ -63,11 +85,6 @@
 // Applied or Incomplete. Check both. Confirmed effects survive cancellation and
 // cleanup failure; do not automatically retry or delete a failed target by path.
 //
-// Local creates one directory with requested mode 0700, removes one entry without
-// recursion, and creates new files with O_CREATE|O_EXCL and requested mode 0600.
-// The operating system's permission rules still apply. Existing contents are never
-// truncated. A final symbolic link is removed itself, not its target.
-//
 // Default new-file creation may be visible while being written, and failed input
 // can leave an incomplete file. This mode has no complete-publication or append
 // guarantee. Explicit complete publication is described below. Failed native cleanup
@@ -78,38 +95,88 @@
 // invalidated by this coordination. Already-admitted reads may finish with an
 // earlier observation; enumeration is not a snapshot.
 //
-// The HTTP mutation routes are:
+// Protocol delivery belongs to the packages under protocols/. The JSON HTTP
+// wire contract is maintained by protocols/httpapi and api/openapi.json.
 //
-// | Method and path | Result |
-// | --- | --- |
-// | POST /api/v1/fs/directories?path=... | Create one directory; no request body |
-// | DELETE /api/v1/fs/entry?path=... | Remove one entry without recursion; no body |
-// | PUT /api/v1/fs/content?path=... | Create a file from raw request bytes |
+// # Bound file reading
 //
-// Success returns JSON with effect applied (201 for creation, 200 for removal).
-// Handled mutation errors add effect to redacted Problem Details. Unsupported
-// mounts return 501; existing targets and nonempty directories return 409.
-// PUT optionally accepts If-None-Match: *; a proven unchanged conflict then returns
-// 412. The condition uses native exclusion, not a metadata preflight.
-// Other mutation conditions/range headers and non-identity Content-Encoding are
-// rejected. Known Content-Length is exact; chunked input runs to normal EOF.
-// A disconnected client may receive no receipt and must treat its outcome as
-// uncertain. A later conflict does not prove an earlier lost request had no effect.
+// OpenOptions{Mode: BoundRead} uses the same Core/Driver.Open and returns
+// Content.File (*BoundFile), exclusively of Body. Its native port is ReadFile:
+// ReadAt(context.Context, []byte, int64), Stat(context.Context) and Close(). Core
+// Stat returns Entry; native Stat returns Metadata for the original opened name.
+// Each logical call renews ReadAction or StatAction and checks its original
+// binding generation, without resolving that name or borrowing another use.
 //
-// The info response lists server operations, not per-mount support or permission.
-// There is no capability-discovery or frontend product in this module.
+// The opening context bounds construction only. Once adopted, File owns one use
+// until Close or retirement. ReadAt follows io.ReaderAt byte/EOF rules; EOF and
+// per-call cancellation do not close File. Calls on one File are serial; waits
+// are cancelable, and different files are independent. Close needs no permission,
+// stops admission, cancels active work and joins both native Close and calls.
+// A failed Close keeps the original cleanup owner and prevents successful retirement.
+// The host bounds retained files and concurrent callers; no global handle table
+// or task queue is introduced. StreamRead/zero OpenOptions keeps ordinary Body
+// and WriterTo, including its request lifetime and EOF cleanup.
+//
+// OpenOptions.Binding requests minimum strength; zero means BoundObject.
+// Content.Binding reports the supplied strength. BoundObject fixes resource
+// identity, allowing in-place content changes; PinnedVersion also fixes contents.
+// Local holds its fd and refuses PinnedVersion. Pool holds its immutable generation
+// pin and reuses the stripe decoder, returning window credits after every ReadAt.
+// S3 requires a non-null VersionId obtained at open; each Range and Stat uses that
+// version directly. External deletion fails instead of reopening the current key.
+// Alipan refuses BoundRead until equivalent native lifetime can be established.
+// Range is a stream selection and cannot be combined with a File mode; offsets
+// belong to ReadAt. No HTTP handle route is added here.
+//
+// # Visible editing and receive order
+//
+// OpenOptions{Mode: LiveEdit} opens an existing file for WriteAction. Read: true
+// additionally requires ReadAction before any opening effect. Creation selects
+// OpenExisting (zero), OpenOrCreate or exclusive OpenNew; Truncate acts during
+// Open. Content.Change retains known opening effects even when adoption or cleanup
+// fails. This mode requires BoundObject and refuses immutable version selection.
+//
+// The same BoundFile provides WriteAt(ctx, bytes, offset), Append(ctx, bytes),
+// Truncate(ctx, size) and Sync(ctx). Native Opened.File implements EditFile,
+// selected once at adoption. Byte methods return n, Change and error independently;
+// short writes retain their visible prefix. AppendOnly permits Append and refuses
+// WriteAt, using native end-of-file writes rather than Stat followed by WriteAt.
+// Sync explicitly requests native file durability, not a parent-name transaction.
+// Close is cleanup, not publication. Local supplies Windows/Linux editing; object
+// upload adapters refuse the mode without attempting a read/reupload emulation.
+//
+// Optional NewOrderScope(capacity) bounds active plus waiting operations. Reserve
+// turns in trusted receive order before concurrent dispatch, then pass each
+// turn.Context() to the same Core or File API. Defer turn.Cancel() for abandoned
+// reservations. Internal compositions enter once, preserving existing finite-batch
+// concurrency. A scoped File requires fresh turns of its opening scope. Stream
+// bodies retain the turn through real completion; persistent Open releases it
+// after handoff. No goroutine lock race is advertised as receive order.
+//
+// Unknown effects stop that scope; known partial effects do not. Stop cancels
+// contexts but leaves native acknowledgments with their original owners. Close
+// and ReleaseCursor bypass ordering so cleanup cannot wait behind itself. Each
+// turn covers one Core operation, not an arbitrary protocol transaction; protocol
+// request framing and waiting before a requested CLOSE remain host-owned.
+// Other scopes, unscoped calls and external writes are independent. There are no
+// new task records, worker pools, distributed locks or HTTP routes.
 //
 // # Complete file publication
 //
 // Core.Write(ctx, principal, target, input, length, options...) is the common body
 // write entry. Core.Create remains its default new-file shorthand. Supply at most
-// one WriteOptions; Replace defaults to false. Explicit Replace creates a missing
-// name or replaces an existing file only after complete input, including normal
-// EOF and any declared length, has been validated. Input is never replayed or
-// closed by the operation. Copy accepts the same options; each CopyRequest embeds
-// WriteOptions for CopyBatch. CopyTree accepts it through DirectoryCopyOptions;
-// Move retains its no-replacement rule.
-// The HTTP PUT route continues to use default creation.
+// one WriteOptions. Its zero policy directly creates a new file and may leave
+// partial new content on failure. Policy: Publish() creates or replaces a file;
+// Publish(IfAbsent()) publishes exclusively. Both validate complete input,
+// including normal EOF and any declared length, before publication. Input is never replayed or
+// closed by the operation. CopyOptions separates Source ReadSelection from Target
+// WriteOptions; each CopyRequest retains these options for CopyBatch.
+// CopyTree accepts WriteOptions through DirectoryCopyOptions independently of
+// whole-tree target policy. Move defaults to no replacement; explicit Replace
+// records target removal separately from its final exclusive native relocation.
+// ObserveTarget requests Change.Before for response classification. This is a
+// native observation, not a CAS guarantee; ordinary publication need not add a
+// HEAD for it. The exclusive predicate itself is enforced by native commit.
 //
 // FilePublisher is a narrow optional Driver capability, separate from FileCreator.
 // Unsupported capability or known Local configuration/volume mismatch is refused
@@ -117,45 +184,26 @@
 // A confirmed native publication reports Applied even with a subsequent cancellation
 // or cleanup error. Unconfirmed publication stays Unknown; partial-publication
 // receipts violate the capability and are reported conservatively. There is no
-// automatic retry, rollback, conditional version update or power-loss durability.
+// automatic retry, rollback or power-loss durability.
 //
-// Local enables publication with local.New(directory, local.Options{
-// StagingDirectory: staging, MaxStagingBytes: budget}). Both settings are required
-// together; the byte budget must be positive. The host supplies an existing staging
-// directory outside the served root, keeps it private from other mounts, and does
-// not move or manipulate its owned objects while the Driver is active. No user name
-// is reserved or filtered. Each target's actual parent must share the staging
-// filesystem; a mismatch refuses publication without a cross-device copy fallback.
-// Missing configuration leaves default creation available and refuses replacement.
+// Evidence keeps Validator comparison and immutable Version selection distinct.
+// IfMatch is a strong comparison; IfNotMatch uses weak comparison. IfPresent and
+// IfAbsent test presence. All combines at most one positive and one negative
+// test, without an expression tree. Tag sets are canonical comparable values.
+// Publish(When) enforces the predicate at the actual native commit. A failure
+// reports PreconditionFailed and an Unchanged target; native private cleanup may
+// still be owed. Unsupported conditions are not treated as failed comparisons.
+// Local has no strong validator; S3 uses native ETags and supported SDK guards;
+// Pool compares generations in its transaction. Ordinary reads add no hash/HEAD.
+// OpenOptions holds Range and ReadSelection; Stat accepts an optional selection.
+// Source copy conditions apply to the actual open, target conditions to commit.
+// RemoveOptions and MoveOptions use these same predicates. Move retains its
+// same-mount boundary; target evidence is never copied to source.
+// Tree policies do not broadcast one file validator over all members.
 //
-// Optional local.Options.MaxConcurrentCommits limits concurrent native complete-file
-// publication commits within one Local instance. Zero adds no limit; negative values
-// are invalid. It is independent of batch concurrency and staging configuration.
-// Transfers remain parallel, and waiting calls retain their staging reservations,
-// captured parents and runtime uses. Waiting honors cancellation and retirement;
-// the permit is released after the native call, before temporary-file cleanup.
-// The limit does not cover default creation, Move or Remove, and supplies no FIFO
-// ordering, cross-instance limit or transaction isolation. Choose it for the host's
-// filesystem workload; no platform-specific limit is imposed.
-//
-// The budget belongs to one Local instance across all its calls. Known lengths
-// reserve their full logical byte count before reading input; unknown lengths
-// reserve each write before growing the temporary file. Exhaustion fails with
-// CapacityExceeded rather than queueing. Cleanup of unpublished data must finish
-// before its reservation is released; failed cleanup remains owned and charged.
-// Published data leaves this temporary budget, while cleanup errors still prevent
-// successful retirement. This is not a physical-block, total-storage, file-count or
-// cross-instance quota. It excludes old opened objects, foreign files and crash
-// leftovers; restart cleanup and recovery belong to the host.
-//
-// Local performs one streaming write to private storage, then a parent-relative
-// native rename: renameat on Linux and FileRenameInformationEx with replacement and
-// POSIX semantics on Windows. It does not copy the temporary body back into target.
-// See [Windows rename semantics](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information).
-// Observed directories, links and spelling mismatches are refused. Final links
-// introduced by a race are never followed; compatible name replacement may race.
-// There is no content snapshot, object-ID/ACL preservation or external-mutation
-// isolation. Already opened readers retain their old object.
+// Native staging configuration, byte budgets and commit limits belong to the
+// Driver. See package github.com/nostalume/mountweave/drivers/local for the
+// filesystem implementation's publication and cleanup requirements.
 //
 // A write retains its captured mount and parent through transfer, publication and
 // cleanup. If the parent is moved meanwhile, the bound original directory remains
@@ -178,7 +226,7 @@
 //
 // Core.Copy(ctx, principal, source, target, options...) writes the complete source
 // body to a new target by default. It uses ReadAction and CreateAction, without
-// requiring Stat or List grants. Explicit WriteOptions{Replace: true} instead uses
+// requiring Stat or List grants. Explicit WriteOptions{Policy: Publish()} instead uses
 // WriteAction and the same complete-publication path as Core.Write. The target
 // parent must exist; source and target paths must differ. Distinct paths within one
 // mount or across mounts are supported. Copy does not remove source or copy metadata.
@@ -199,6 +247,11 @@
 // removal and complete target creation. Both must be Applied and error must be nil
 // for completion without errors. Applied can coexist with cancellation or cleanup
 // errors; inspect receipts and error together and do not automatically replay.
+// MoveOptions.Existing defaults to CreateNew. Replace first tries the same
+// exclusive native relocation, then removes an existing target only on a proven
+// unchanged conflict. MoveResult.Removed preserves that separately confirmed
+// phase; the final relocation stays exclusive and never removes a later peer.
+// Tree budgets must be positive if target removal encounters a directory.
 //
 // Currently both paths must select the same live mount with the optional Relocator
 // port. Its native no-replace receipt maps to both endpoints; a possible effect
@@ -215,15 +268,7 @@
 // Mount and alias roots, equivalent resolved endpoints and targets inside the
 // source path are rejected. Aliases retain their configured paths after a move.
 //
-// Local admits regular files and directories with existing target parents, refusing
-// observed final symbolic links and special objects. Name and type checks are
-// observations, not object/version/type conditions against external replacement.
-// Windows opens the source with DELETE access relative to its rooted parent and
-// uses the target directory handle; Linux amd64 uses renameat2 with
-// RENAME_NOREPLACE and rooted parent descriptors. Other native platform/filesystem
-// combinations return UnsupportedOperation when this guarantee is unavailable.
-// Failed owned-handle cleanup remains with the Driver. Cross-volume fallback and
-// power-loss durability are not promised.
+// Native relocation guarantees and platform support belong to each Driver.
 //
 // # Batch file operations
 //
@@ -262,13 +307,13 @@
 // # Directory copy
 //
 // Core.CopyTree(ctx, principal, source, target, TreeOptions, directoryOptions...)
-// copies one real source directory into its corresponding target directory, whose
+// copies a file leaf or selected directory into its corresponding target, whose
 // parent must exist. It uses ListAction on source directories and ReadAction on
 // copied files. Target directories and default file creation use CreateAction;
 // explicit file publication uses WriteAction. The default requires new target names.
 // It preserves empty directories without metadata preservation or source deletion.
 //
-// Supply at most one DirectoryCopyOptions. Explicit MergeDirectories: true reuses
+// Supply at most one DirectoryCopyOptions. Existing: Merge reuses
 // existing directories and creates missing ones. Only an unchanged existence
 // conflict followed by successful no-follow directory confirmation and cleanup is
 // accepted. Reused directories report Unchanged with no error; this receipt does
@@ -279,11 +324,21 @@
 // uses CreateAction without additional Stat/List grants or consuming the returned
 // target iterator. Native path resolution remains driver-specific.
 //
-// DirectoryCopyOptions embeds WriteOptions independently of MergeDirectories.
-// Explicit WriteOptions{Replace: true} publishes each complete file at its target
+// Existing: Replace removes all old target membership after bounded discovery
+// and known admission checks, then creates the new root exclusively. It is not
+// Merge: target-only names are removed, including type conflicts. Failed later
+// work retains confirmed removal receipts without rollback. Source and old-target
+// plans are bounded separately; both their plans/receipts contribute memory cost.
+// Depth defaults to Recursive; Self creates only the directory shell. File leaves
+// ignore depth, reuse no-follow Open and accept zero traversal budgets. Root kind
+// observation adds no StatAction grant. Actual file reads retain Source conditions;
+// directory roots refuse version/finite validator predicates before child effects.
+//
+// DirectoryCopyOptions embeds WriteOptions independently of Existing.
+// Explicit WriteOptions{Policy: Publish()} publishes each complete file at its target
 // name, creating missing files or replacing existing ones. It uses WriteAction on
 // files and requires FilePublisher rather than FileCreator. Directories still use
-// CreateAction and do not merge unless MergeDirectories is explicit. A new tree
+// CreateAction and do not merge unless Existing: Merge is explicit. A new tree
 // can also select complete file publication without directory merging.
 //
 // The default retains ordinary Create semantics, including possible Incomplete
@@ -317,7 +372,7 @@
 // lookup state. A preparation failure leaves that batch unstarted; earlier effects
 // remain. File bodies retain the existing Open/write ownership, length and cleanup
 // contracts. Core adds no extra content staging or shared directory cache; explicit
-// Local publication uses the private storage described above.
+// publication uses the Driver's configured private storage.
 //
 // DirectoryReader is optional and leaves the required Driver unchanged.
 // DirectoryScope reuses Iterator and adds OpenFile for an observed child name,
@@ -328,8 +383,12 @@
 // before target mutation. S3 and alipan also provide source scopes. Destination
 // capabilities remain independent: Local and Pool supply directory creation; see each Driver for its capabilities.
 //
-// TreeItemResult reports RelativePath ("/" for the copied root), Change and Err
-// in plan order: directories first, then file groups. Discovery, budget or
+// TreeResult reports whole Change and ordered Items. Each TreeItemResult keeps
+// RelativePath ("/" for the root), Side, Phase, ErrorSide, Change and Err. Target
+// removal precedes creation, followed by file groups. Preparation/read/cleanup
+// failures retain their provenance; successful cleanup has no separate row.
+// Applied means the selected operation completed, not that every item changed.
+// Discovery, budget or
 // discovery-close failure leaves the target untouched. Execution or later source
 // preparation failure can leave a partial target; inspect both returned rows and
 // the overall error. Confirmed effects survive cancellation or cleanup faults.
@@ -340,9 +399,9 @@
 // # Directory removal
 //
 // Core.RemoveTree(ctx, principal, target, TreeOptions, DirectoryRemoveOptions...)
-// defaults to Discovered: remove one real directory using a finite discovery plan.
-// Core.Remove remains nonrecursive. Mount, alias
-// and virtual roots are refused. The positive entry/path budgets have the same
+// defaults to Discovered: remove a file leaf or directory using a finite name plan.
+// Core.Remove remains nonrecursive. Mount, alias and virtual roots require
+// ContentsOnly and are preserved by it. Positive directory budgets have the same
 // meaning as CopyTree. Discovery, name validation, known capability checks,
 // authorization preflight and enumeration cleanup finish before any deletion.
 //
@@ -400,7 +459,11 @@
 // automatically broadens scope, continually chases additions or prevents later
 // recreation. Frontend confirmation belongs to the caller.
 //
-// RemoveTree returns []TreeItemResult in started execution order, with "/" for the
+// RemoveTree also accepts file leaves with zero traversal budgets, reusing Remove
+// authority and its native predicate. DirectoryRemoveOptions.When is a file-root
+// predicate; nonempty directory guards without commit proof are refused before
+// child effects and never broadcast to descendants.
+// RemoveTree returns TreeResult in started execution order, with "/" for the
 // root. Every item keeps its Change and Err; cancellation, preparation and cleanup
 // errors are also retained by the overall error. Already confirmed effects are not
 // rolled back or rewritten. Applied describes this operation's name removal, not

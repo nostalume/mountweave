@@ -36,6 +36,7 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 		return state, core.Fail(core.InvalidRequest, errors.Join(errors.New("invalid native recovery log"), err))
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	for {
 		var r uploadRecord
 		err := decoder.Decode(&r)
@@ -48,11 +49,20 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 		if err != nil {
 			return invalid(err)
 		}
-		if r.Version != 2 {
+		if r.Version != 2 && r.Version != 3 {
 			return invalid(nil)
 		}
 		switch r.Kind {
 		case "start":
+			if r.Version == 2 && r.Binding != nil {
+				if !r.Binding.When.Empty() {
+					return invalid(nil)
+				}
+				if !r.Binding.Replace {
+					r.Binding.When = core.IfAbsent()
+				}
+				r.Binding.Replace = false
+			}
 			if r.Binding == nil || *r.Binding != binding || r.Token == "" || state.Phase != "" || len(state.Parts) != 0 || r.Phase != "initializing" || r.UploadID != "" || r.Part != 0 || r.ETag != "" {
 				return invalid(nil)
 			}

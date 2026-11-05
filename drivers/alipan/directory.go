@@ -8,7 +8,12 @@ import (
 
 type directoryScope struct{ *iterator }
 
-func (d *Driver) OpenDirectory(ctx context.Context, p string) (core.DirectoryScope, error) {
+func (d *Driver) OpenDirectory(ctx context.Context, pAddress core.NativeAddress) (core.DirectoryScope, error) {
+	if pAddress.Namespace() != core.TreeNamespace {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	f, err := d.resolve(ctx, p)
 	if err != nil {
 		return nil, err

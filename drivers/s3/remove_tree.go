@@ -15,8 +15,11 @@ import (
 
 // RemoveSubtree uses one finite native-key discovery, then batch deletion.
 // Concurrent additions may remain; a final prefix observation confirms absence.
-func (d *Driver) RemoveSubtree(ctx context.Context, p string, limits core.TreeOptions) (core.Change, error) {
+func (d *Driver) RemoveSubtree(ctx context.Context, p core.NativeAddress, limits core.TreeOptions) (core.Change, error) {
 	change := core.Change{Effect: core.Unchanged}
+	if p.Namespace() != core.TreeNamespace {
+		return change, core.Fail(core.UnsupportedOperation, nil)
+	}
 	if limits.MaxEntries <= 0 || limits.MaxPlanBytes <= 0 || limits.Concurrency < 0 {
 		return change, core.Fail(core.InvalidRequest, nil)
 	}
@@ -24,7 +27,7 @@ func (d *Driver) RemoveSubtree(ctx context.Context, p string, limits core.TreeOp
 	if err != nil {
 		return change, err
 	}
-	if p == "/" {
+	if p.Value() == "/" {
 		return change, core.Fail(core.InvalidRequest, nil)
 	}
 	if meta.Kind != core.Directory {

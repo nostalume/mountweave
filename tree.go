@@ -9,211 +9,118 @@ import (
 
 type TreeOptions struct {
 	ExecutionOptions
-	// Both budgets are caller-selected and positive. MaxPlanBytes counts stored
-	// relative-path UTF-8 bytes, not native response bytes or file content.
-	MaxEntries   int
-	MaxPlanBytes int
+	// Directory plans require positive caller-selected budgets; a file leaf
+	// accepts zero. Replacement bounds source and old-target plans separately.
+	// MaxPlanBytes counts relative-path UTF-8 bytes, not responses or content.
+	MaxEntries   int `json:"max_entries"`
+	MaxPlanBytes int `json:"max_plan_bytes"`
 }
 
 // TreeCopyOptions remains an alias for existing CopyTree callers.
 type TreeCopyOptions = TreeOptions
 
-// DirectoryCopyOptions selects directory and file policies independently.
-// MergeDirectories accepts existing directories. WriteOptions governs each file.
-type DirectoryCopyOptions struct {
-	WriteOptions
-	MergeDirectories bool
-}
-
-type TreeItemResult struct {
-	RelativePath string // "/" is the operation root.
-	Change       Change
-	Err          error
-}
-
 type treeDirectory struct {
-	path  string
-	files []string
+	path     string
+	at       *location // nil denotes a virtual hierarchy node, never a native path.
+	depth    int
+	children []treeEntry
 }
 
-// CopyTree discovers a finite source directory before writing its target tree.
-// Existing directories require explicit MergeDirectories; file publication uses
-// the selected WriteOptions. It preserves empty directories without source
-// deletion, snapshots, retries or rollback. Supply at most one DirectoryCopyOptions.
-func (c *Core) CopyTree(ctx context.Context, p Principal, source, target string, options TreeOptions, directoryOptions ...DirectoryCopyOptions) (results []TreeItemResult, err error) {
-	if len(directoryOptions) > 1 {
-		return nil, Fail(InvalidRequest, nil)
-	}
-	var policy DirectoryCopyOptions
-	if len(directoryOptions) == 1 {
-		policy = directoryOptions[0]
-	}
-	if policy.Continuation != nil {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	limit, err := concurrency([]ExecutionOptions{options.ExecutionOptions})
-	if err != nil {
-		return nil, err
-	}
-	if options.MaxEntries <= 0 || options.MaxPlanBytes <= 0 {
-		return nil, Fail(InvalidRequest, nil)
-	}
-	from, _, err := c.admit(ctx, p, ListAction, source)
-	if err != nil {
-		return nil, err
-	}
-	if from == nil {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	defer from.release()
-	to, _, err := c.admit(ctx, p, CreateAction, target)
-	if err != nil {
-		return nil, err
-	}
-	if to == nil {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	defer to.release()
-	if target == to.binding.prefix || to.path == "/" ||
-		(from.mount == to.mount && (Within(to.path, from.path) || Within(from.path, to.path))) {
-		return nil, Fail(InvalidRequest, nil)
-	}
-	if _, ok := from.mount.driver.(DirectoryReader); !ok {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	if _, ok := to.mount.driver.(DirectoryMaker); !ok {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	if policy.Replace {
-		if _, ok := to.mount.driver.(FilePublisher); !ok {
-			return nil, Fail(UnsupportedOperation, nil)
-		}
-	} else if _, ok := to.mount.driver.(FileCreator); !ok {
-		return nil, Fail(UnsupportedOperation, nil)
-	}
-	if policy.MergeDirectories {
-		if _, ok := to.mount.driver.(DirectoryReader); !ok {
-			return nil, Fail(UnsupportedOperation, nil)
-		}
-	}
-	ctx, endSource := requestScope(ctx, from.ctx)
-	defer endSource()
-	ctx, endTarget := requestScope(ctx, to.ctx)
-	defer endTarget()
-	defer func() { err = observedCause(ctx, err) }()
+type treeEntry struct {
+	name string
+	kind Kind
+}
 
-	at := func(u *use, rel string) *location {
-		return u.location.descend(rel)
-	}
-	directories := []treeDirectory{{path: "/"}}
-	entries, pathBytes := 1, 1
+// treeDiscovery varies effect policy while sharing bounded namespace discovery.
+// It owns no resources after discoverTree returns.
+type treeDiscovery struct {
+	open          func(*location) (*directory, error)
+	visit         func(*location, Kind) error
+	recurse       func(*location) bool
+	virtualAction Action
+	target        string
+}
+
+func (c *Core) discoverTree(ctx context.Context, p Principal, root string, at *location, options TreeOptions, policy treeDiscovery) ([]treeDirectory, error) {
+	directories := []treeDirectory{{path: "/", at: at}}
+	entries, bytes := 1, 1
 	for i := 0; i < len(directories); i++ {
-		directory := directories[i].path
-		var files []string
-		scope, readErr := c.readDirectory(ctx, p, at(from, directory), options, func(meta Metadata) error {
-			rel := joinPath(directory, "/"+meta.Name)
-			if ValidatePath(joinPath(source, rel)) != nil || ValidatePath(joinPath(target, rel)) != nil {
+		dir := directories[i]
+		visible := joinPath(root, dir.path)
+		room := MaxPathBytes
+		if policy.target != "" {
+			room = childRoom(joinPath(policy.target, dir.path))
+		}
+		var children []treeEntry
+		add := func(meta Metadata, child *location) error {
+			if len(meta.Name) > room {
 				return Fail(UnrepresentableName, nil)
 			}
+			rel := joinPath(dir.path, "/"+meta.Name)
 			entries++
-			pathBytes += len(rel)
-			if entries > options.MaxEntries || pathBytes > options.MaxPlanBytes {
+			bytes += len(rel)
+			if entries > options.MaxEntries || bytes > options.MaxPlanBytes {
 				return Fail(CapacityExceeded, nil)
 			}
-			if meta.Kind == Directory {
-				directories = append(directories, treeDirectory{path: rel})
-			} else {
-				files = append(files, meta.Name)
+			if dir.at != nil && policy.visit != nil {
+				if err := policy.visit(child, meta.Kind); err != nil {
+					return err
+				}
+			}
+			children = append(children, treeEntry{meta.Name, meta.Kind})
+			if meta.Kind == Directory && (dir.at == nil || policy.recurse == nil || policy.recurse(child)) {
+				directories = append(directories, treeDirectory{path: rel, at: child, depth: dir.depth + 1})
 			}
 			return nil
-		})
-		if readErr != nil {
-			return nil, fmt.Errorf("discover %s: %w", directory, readErr)
 		}
-		if closeErr := scope.close(); closeErr != nil {
-			return nil, fmt.Errorf("close discovery %s: %w", directory, closeErr)
-		}
-		directories[i].files = files
-	}
-	// No source enumeration remains open when namespace writes begin.
-	results, err = execute(ctx, len(directories), 1, results, func(i int) work[TreeItemResult] {
-		rel := directories[i].path
-		targetAt := at(to, rel)
-		return work[TreeItemResult]{accesses: []access{{at: targetAt, write: true}}, run: func() (TreeItemResult, error) {
-			change, err := c.copyDirectory(ctx, p, targetAt, policy.MergeDirectories)
-			return TreeItemResult{RelativePath: rel, Change: change, Err: err}, err
-		}}
-	})
-	if err != nil {
-		return results, err
-	}
-	results, err = executeDirectories(ctx, len(directories), limit, results,
-		func(i int) (*directory, int, error) {
-			directory := directories[i]
-			if len(directory.files) == 0 {
-				return nil, 0, nil
+		var err error
+		if dir.at == nil {
+			grant := visible
+			if policy.virtualAction == RemoveTreeAction {
+				grant = root
 			}
-			scope, openErr := c.readDirectory(ctx, p, at(from, directory.path), options, nil)
-			if openErr != nil {
-				openErr = fmt.Errorf("open source directory %s: %w", directory.path, openErr)
+			if err = c.authorize(ctx, p, policy.virtualAction, Path(grant)); err != nil {
+				return nil, err
 			}
-			return scope, len(directory.files), openErr
-		},
-		func(i int, scope *directory, item int) work[TreeItemResult] {
-			directory := directories[i]
-			rel := joinPath(directory.path, "/"+directory.files[item])
-			sourceAt, targetAt := at(from, rel), at(to, rel)
-			return work[TreeItemResult]{accesses: []access{{at: sourceAt}, {at: targetAt, write: true}}, run: func() (TreeItemResult, error) {
-				row := TreeItemResult{RelativePath: rel, Change: Change{Unchanged}}
-				opened, err := scope.openFile(ctx, p, directory.files[item])
-				if err != nil {
-					row.Err = fmt.Errorf("open source: %w", err)
-					return row, row.Err
+			c.mu.Lock()
+			_, names, resolveErr := c.resolveRequestLocked(ctx, Path(visible))
+			c.mu.Unlock()
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			for _, name := range names {
+				target := childPath(visible, name)
+				if err = c.authorize(ctx, p, StatAction, Path(target)); err != nil {
+					if CodeOf(err) == PermissionDenied {
+						err = nil
+						continue
+					}
+					return nil, err
 				}
-				row.Change, row.Err = c.copyContent(ctx, p, targetAt, opened, policy.WriteOptions)
-				return row, row.Err
-			}}
-		})
-	return results, err
-}
-
-// copyDirectory accepts an existing directory only after an unchanged conflict
-// and a no-follow open. The scope confirms this name now, not the whole future
-// target tree. Confirmation uses CreateAction without consuming its iterator.
-func (c *Core) copyDirectory(ctx context.Context, p Principal, at *location, merge bool) (Change, error) {
-	change, err := c.mkdirAt(ctx, p, at)
-	if !merge || change.Effect != Unchanged || !directoryConflict(err) {
-		return change, err
-	}
-	u, err := c.beginChangeAt(ctx, p, CreateAction, at)
-	if err != nil {
-		return change, err
-	}
-	scope, err := openDirectoryAt(u, false)
-	if err != nil {
-		return change, err
-	}
-	return change, observedCause(ctx, scope.close())
-}
-
-// directoryConflict follows context wrappers but never hides another joined
-// failure. A domain Error owns its native cause; separate failures stay separate.
-func directoryConflict(err error) bool {
-	for err != nil {
-		if public, ok := err.(*Error); ok {
-			return public.Code == AlreadyExists
-		}
-		if joined, ok := err.(interface{ Unwrap() []error }); ok {
-			causes := joined.Unwrap()
-			if len(causes) != 1 {
-				return false
+				c.mu.Lock()
+				child, _, resolveErr := c.resolveRequestLocked(ctx, Path(target))
+				c.mu.Unlock()
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				if err = add(Metadata{Name: name, Kind: Directory}, child); err != nil {
+					break
+				}
 			}
-			err = causes[0]
 		} else {
-			err = errors.Unwrap(err)
+			var scope *directory
+			scope, err = policy.open(dir.at)
+			if err == nil {
+				err = scope.scan(options, func(meta Metadata) error { return add(meta, dir.at.descend("/"+meta.Name)) })
+				err = errors.Join(err, scope.close())
+			}
 		}
+		if err != nil {
+			return nil, fmt.Errorf("discover %s: %w", dir.path, err)
+		}
+		directories[i].children = children
 	}
-	return false
+	return directories, ctx.Err()
 }
 
 // readDirectory returns an owned, fully enumerated scope. A second, bounded
@@ -232,6 +139,7 @@ func (c *Core) readDirectory(ctx context.Context, p Principal, at *location, opt
 
 func (d *directory) scan(options TreeOptions, visit func(Metadata) error) error {
 	u, scope, target := d.owner, d.native, d.at.visible()
+	room := min(childRoom(target), childRoom(d.at.primary()))
 	seen := make(map[string]bool)
 	count, bytes := 0, 0
 	for {
@@ -255,6 +163,9 @@ func (d *directory) scan(options TreeOptions, visit func(Metadata) error) error 
 			if !ValidName(meta.Name) {
 				return Fail(UnrepresentableName, nil)
 			}
+			if len(meta.Name) > room {
+				return Fail(UnrepresentableName, nil)
+			}
 			if seen[meta.Name] {
 				return Fail(PathAmbiguous, nil)
 			}
@@ -263,7 +174,7 @@ func (d *directory) scan(options TreeOptions, visit func(Metadata) error) error 
 			if bytes > options.MaxPlanBytes {
 				return Fail(CapacityExceeded, nil)
 			}
-			if _, err := project(joinPath(target, "/"+meta.Name), meta); err != nil {
+			if _, err := project(Path(joinPath(target, "/"+meta.Name)), meta); err != nil {
 				return err
 			}
 			if visit != nil {
@@ -279,4 +190,47 @@ func (d *directory) scan(options TreeOptions, visit func(Metadata) error) error 
 			return nil
 		}
 	}
+}
+
+// inspectTree selects the actual branch under one of its operation grants. It
+// adds no StatAction requirement. Execution keeps its own admission and native
+// condition checks; this observation is never a later mutation's version guard.
+func (c *Core) inspectTree(ctx context.Context, p Principal, target Address, fileAction, directoryAction Action, version Version) (*use, Entry, error) {
+	u, _, err := c.admit(ctx, p, fileAction, target)
+	action := fileAction
+	if CodeOf(err) == PermissionDenied && fileAction != directoryAction {
+		u, _, err = c.admit(ctx, p, directoryAction, target)
+		action = directoryAction
+	}
+	if err != nil {
+		return nil, Entry{}, err
+	}
+	fail := func(err error) (*use, Entry, error) {
+		if u != nil {
+			u.release()
+		}
+		return nil, Entry{}, err
+	}
+	entry := virtualEntry(target)
+	if u != nil {
+		entry, err = c.observe(u, version)
+		if err != nil {
+			return fail(err)
+		}
+	}
+	wanted := fileAction
+	if entry.Kind == Directory {
+		wanted = directoryAction
+	}
+	if wanted != action {
+		if err := c.authorizeChecked(ctx, p, wanted, target); err != nil {
+			return fail(err)
+		}
+		if u != nil {
+			if err := c.authorizeBinding(ctx, p, wanted, u.location); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	return u, entry, nil
 }

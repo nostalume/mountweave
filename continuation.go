@@ -38,5 +38,5 @@ type WriteContinuation struct {
 // cannot close or retain source. Confirmed Abort may return Unchanged with nil;
 // all other results follow complete-publication semantics.
 type ContinuableWriter interface {
-	ContinueWrite(context.Context, string, Replayable, int64, bool, WriteContinuation) (Change, error)
+	ContinueWrite(context.Context, NativeAddress, Replayable, int64, PublicationOptions, WriteContinuation) (Change, error)
 }

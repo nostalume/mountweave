@@ -13,7 +13,7 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/control"
-	"github.com/nostalume/mountweave/local"
+	"github.com/nostalume/mountweave/drivers/local"
 	"github.com/nostalume/mountweave/task"
 )
 
@@ -170,15 +170,15 @@ func TestManagedBindingsTasksAndRestore(t *testing.T) {
 	}()
 	block := addTask(t, q, task.Work{Run: func(context.Context, func(any)) (any, error) { close(entered); <-release; return nil, nil }})
 	await(t, entered)
-	selected, err := c.Capture(ctx, core.PathAccess{Path: "/view/a"}, core.PathAccess{Path: "/target/stale", Write: true})
+	selected, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/view/a")}, core.AddressAccess{Address: core.Path("/target/stale"), Write: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	overlap, err := c.Capture(ctx, core.PathAccess{Path: "/source/tree/a", Write: true})
+	overlap, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/source/tree/a"), Write: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	readOnly, err := c.Capture(ctx, core.PathAccess{Path: "/source/tree/a"})
+	readOnly, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/source/tree/a")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestManagedBindingsTasksAndRestore(t *testing.T) {
 		t.Fatal("alias conflict coordinates are inconsistent")
 	}
 	oldTask := addTask(t, q, task.Work{Key: selected, Run: func(ctx context.Context, _ func(any)) (any, error) {
-		return c.Copy(selected.Context(ctx), "alice", "/view/a", "/target/stale")
+		return c.Copy(selected.Context(ctx), "alice", core.Path("/view/a"), core.Path("/target/stale"))
 	}})
 	config, _ = json.Marshal(root2)
 	d.Config = config
@@ -211,24 +211,24 @@ func TestManagedBindingsTasksAndRestore(t *testing.T) {
 		t.Fatalf("unexpected target: %v", err)
 	}
 	// A current selection covers all discovered descendants without new APIs.
-	current, err := c.Capture(ctx, core.PathAccess{Path: "/view"}, core.PathAccess{Path: "/target/tree", Write: true})
+	current, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/view")}, core.AddressAccess{Address: core.Path("/target/tree"), Write: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	publishErr := errors.New("host receipt save failed")
 	tree := addTask(t, q, task.Work{Key: current, Run: func(ctx context.Context, report func(any)) (any, error) {
 		report("copying")
-		return c.CopyTree(current.Context(ctx), "alice", "/view", "/target/tree", core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 100})
+		return c.CopyTree(current.Context(ctx), "alice", core.Path("/view"), core.Path("/target/tree"), core.TreeOptions{MaxEntries: 10, MaxPlanBytes: 100})
 	}, Complete: func(context.Context, task.Snapshot) error { return publishErr }})
 	s = taskResult(t, tree)
-	if s.Err != nil || !errors.Is(s.CompletionErr, publishErr) || len(s.Result.([]core.TreeItemResult)) != 2 {
+	if s.Err != nil || !errors.Is(s.CompletionErr, publishErr) || len(s.Result.(core.TreeResult).Items) != 2 {
 		t.Fatalf("tree receipt: %+v", s)
 	}
 	if b, err := os.ReadFile(filepath.Join(target, "tree/a")); err != nil || string(b) != "new" {
 		t.Fatalf("tree body: %q %v", b, err)
 	}
 	// Alias identity is stronger than its mount/path coordinates for admission.
-	aliasSelection, err := c.Capture(ctx, core.PathAccess{Path: "/view"})
+	aliasSelection, err := c.Capture(ctx, core.AddressAccess{Address: core.Path("/view")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestManagedBindingsTasksAndRestore(t *testing.T) {
 	if err = c.BindAlias(ctx, "/view", b.Mount, "/tree"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.Stat(aliasSelection.Context(ctx), "alice", "/view/a")
+	_, err = c.Stat(aliasSelection.Context(ctx), "alice", core.Path("/view/a"))
 	code(t, err, core.MountUnavailable)
 	if _, err = manager.Apply(ctx, "alice", d.ID, d.Revision); err != nil || builds.Load() != 2 {
 		t.Fatal("alias reconciliation rebuilt", err)
@@ -262,7 +262,7 @@ func TestManagedBindingsTasksAndRestore(t *testing.T) {
 	if err != nil || len(restored) != 1 || restored[0].Err != nil || !restored[0].Runtime.Active || restored[0].Mount == b.Mount {
 		t.Fatalf("restore: %+v %v", restored, err)
 	}
-	if _, err = c2.Stat(ctx, "alice", "/view/a"); err != nil {
+	if _, err = c2.Stat(ctx, "alice", core.Path("/view/a")); err != nil {
 		t.Fatal(err)
 	}
 }

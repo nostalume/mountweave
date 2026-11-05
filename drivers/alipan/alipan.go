@@ -18,7 +18,7 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/alipan/credential"
-	"github.com/nostalume/mountweave/internal/upload"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 const Endpoint = "https://openapi.alipan.com"
@@ -218,7 +218,27 @@ func (d *Driver) child(ctx context.Context, parent, name string) (found nativeFi
 		marker = next
 	}
 }
-func (d *Driver) Stat(ctx context.Context, p string) (core.Metadata, error) {
+func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
+	if len(selections) > 1 {
+		return meta, core.Fail(core.InvalidRequest, nil)
+	}
+	var selection core.ReadSelection
+	if len(selections) == 1 {
+		selection = selections[0]
+	}
+	if selection.Version != "" {
+		return meta, core.Fail(core.UnsupportedOperation, nil)
+	}
+	defer func() {
+		if err == nil {
+			err = selection.Check(meta.Evidence)
+		}
+	}()
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	f, err := d.resolve(ctx, p)
 	if err != nil {
 		return core.Metadata{}, err
@@ -228,7 +248,12 @@ func (d *Driver) Stat(ctx context.Context, p string) (core.Metadata, error) {
 	}
 	return f.metadata()
 }
-func (d *Driver) Enumerate(ctx context.Context, p string) (core.Iterator, error) {
+func (d *Driver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core.Iterator, error) {
+	if pAddress.Address().Namespace() != core.TreeNamespace || pAddress.Delimiter() != "" || pAddress.StartAfter() != "" {
+		return nil, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Address().Value()
+
 	f, err := d.resolve(ctx, p)
 	if err != nil {
 		return nil, err
@@ -406,12 +431,34 @@ func rangeHeader(r *core.Range) string {
 	}
 	return fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
 }
-func (d *Driver) Open(ctx context.Context, p string, wanted *core.Range) (core.Opened, error) {
+func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
+	if err := options.Validate(); err != nil {
+		return core.Opened{}, err
+	}
+	if options.Mode != core.StreamRead {
+		return core.Opened{Change: core.Change{Effect: core.Unchanged}}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	wanted := options.Range
+	if options.Selection.Version != "" {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if pAddress.Namespace() != core.TreeNamespace {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	p := pAddress.Value()
+
 	if wanted != nil && !wanted.Valid() {
 		return core.Opened{}, core.Fail(core.InvalidRange, nil)
 	}
 	f, err := d.resolve(ctx, p)
 	if err != nil {
+		return core.Opened{}, err
+	}
+	if f.Type != "file" {
+		return core.Opened{}, core.Fail(core.NotFile, nil)
+	}
+	// IDs and temporary download URLs do not establish a representation validator.
+	if err := options.Selection.Check(core.Evidence{}); err != nil {
 		return core.Opened{}, err
 	}
 	return d.openFile(ctx, f, wanted)
