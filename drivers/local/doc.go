@@ -2,14 +2,23 @@
 //
 // # Filesystem and transfer behavior
 //
-// Local uses os.Root and exact directory-entry names, with incremental directory
-// reads and root-anchored metadata. Name checks and subsequent opens are separate
-// observations; concurrent external renames are not an atomic snapshot. Lookup may
-// require directory-read permission. The root is a path boundary, not a host sandbox
-// or an inode-provenance guarantee.
+// Local binds native parents beneath a prepared os.Root. Reads, listings and
+// mutations use exact names and never traverse native links. Windows checks
+// the stored name on the opened handle. Linux admits ext and tmpfs directories
+// with readable native flags and case folding disabled. Unsupported filesystems
+// or platforms refuse strict child access before effects.
 //
-// Only regular files and directories are accepted. Linux uses a nonblocking open
-// flag to avoid a FIFO-open race; arbitrary filesystem calls still have no hard
+// The host owns the native root and its external mutation policy. Bound
+// directories continue to refer to the same objects after a rename. The root
+// is a path boundary, not a host sandbox or an inode-provenance guarantee.
+//
+// Lstat on Windows and Linux walks bound parent directories without following
+// links. It classifies a recognized final symbolic link without reading its
+// target. Unrecognized reparse points are refused. The lookup borrows temporary
+// handles and observes the current name without freezing it for a later open.
+//
+// Data operations accept regular files and directories. Linux uses a nonblocking
+// open flag to avoid a FIFO-open race. Arbitrary filesystem calls still have no hard
 // interruption guarantee. Other platform mechanisms remain local to the adapter.
 //
 // Content length and ranges come from the opened result. Copying retains compatible
@@ -28,7 +37,12 @@
 // Local creates one directory with requested mode 0700, removes one entry without
 // recursion, and creates new files with O_CREATE|O_EXCL and requested mode 0600.
 // The operating system's permission rules still apply. Default creation never
-// truncates existing contents. Removing a final link removes the link itself.
+// truncates existing contents. Typed removal unlinks one non-directory entry
+// or removes one empty directory. Removing a final link removes the link itself.
+// Windows coordinates this instance's name commits by native parent identity.
+// The guard spans the name check and native commit, without covering streaming.
+// The host must exclude unsynchronized replacement of names through external
+// writers or other Driver instances when it relies on exact replacement.
 //
 // # Complete file publication
 //

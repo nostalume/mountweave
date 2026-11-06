@@ -65,9 +65,12 @@ func (s *Store) acquire(ctx context.Context, id, key string) (*Reference, error)
 func (r *Reference) Record() Record { return r.record }
 
 func (r *Reference) Open(ctx context.Context) (io.ReadCloser, error) {
-	return r.openRange(ctx, 0, r.record.Offset)
+	return r.OpenRange(ctx, 0, r.record.Offset)
 }
-func (r *Reference) openRange(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+
+// OpenRange reads and verifies a range of this sealed version through EOF.
+// The body owns its pin and must be closed, even after the reference is closed.
+func (r *Reference) OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -200,7 +203,7 @@ func (b *rangeBody) OpenRange(ctx context.Context, offset, length int64) (io.Rea
 	s.mu.Unlock()
 	r := &Reference{store: s, entry: b.entry, record: b.record}
 	b.mu.Unlock()
-	opened, err := r.openRange(ctx, offset, length)
+	opened, err := r.OpenRange(ctx, offset, length)
 	return opened, errors.Join(err, r.Close())
 }
 func (b *rangeBody) Read(p []byte) (int, error) {

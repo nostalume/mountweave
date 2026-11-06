@@ -100,7 +100,7 @@ func TestVisibleNamespaceDelivery(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	h, err := httpapi.New(c, identity, time.Minute, httpapi.Options{Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy})
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: identity, CursorTTL: time.Minute, Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestSharedFileDeliveryAndPublication(t *testing.T) {
 		work.Complete = func(context.Context, task.Snapshot) error { return errors.New("private save failure") }
 		return work, nil
 	}
-	h, err := httpapi.New(c, identity, time.Minute, httpapi.Options{Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.saved-copy": saved}})
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: identity, CursorTTL: time.Minute, Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.saved-copy": saved}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestManagedHTTPTasksAndBindingHandoff(t *testing.T) {
 	}, Project: func(s task.Snapshot) (httpapi.TaskValues, error) {
 		return httpapi.TaskValues{Progress: s.Progress, Result: s.Result}, nil
 	}}
-	h, err := httpapi.New(c, identity, time.Minute, httpapi.Options{Control: m, Queue: q, MaxTasks: 2, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.gate": gate}})
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: identity, CursorTTL: time.Minute, Control: m, Queue: q, MaxTasks: 2, MaxJSONBytes: 4096, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.gate": gate}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +571,7 @@ func TestRejectedTaskCleanupAndAdapterShutdown(t *testing.T) {
 	kind := httpapi.TaskKind{Prepare: func(context.Context, core.Principal, json.RawMessage) (task.Work, error) {
 		return task.Work{Run: func(context.Context, func(any)) (any, error) { runs.Add(1); return nil, nil }, Cleanup: func() error { closes.Add(1); close(cleaning); <-ack; return failure }}, nil
 	}, Project: func(task.Snapshot) (httpapi.TaskValues, error) { return httpapi.TaskValues{}, nil }}
-	h, err := httpapi.New(c, identity, time.Minute, httpapi.Options{Queue: q, MaxTasks: 1, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.owned": kind}})
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: identity, CursorTTL: time.Minute, Queue: q, MaxTasks: 1, AuthorizeTask: taskPolicy, TaskKinds: map[string]httpapi.TaskKind{"host.owned": kind}})
 	if err != nil {
 		t.Fatal(err)
 	}

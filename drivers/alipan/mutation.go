@@ -104,7 +104,7 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 	if len(policies) > 1 {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
 	}
-	if len(policies) == 1 && !policies[0].When.Empty() {
+	if len(policies) == 1 && (!policies[0].When.Empty() || policies[0].Target != "") {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
 	if pAddress.Namespace() != core.TreeNamespace {

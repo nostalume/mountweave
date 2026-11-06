@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
@@ -34,13 +35,32 @@ func sameFilesystem(from, to *os.File) error {
 	return nil
 }
 
-func (d *Driver) publishNative(ctx context.Context, file, to *os.File, _, newName string, absent bool) (core.Change, bool, error) {
-	// FileRenameInformationEx: replace a non-directory name, retaining existing
-	// readers of its old object. No copy/delete or delayed-publication fallback.
+func (d *Driver) publishNative(ctx context.Context, file, to *os.File, _, newName string, absent bool) (change core.Change, moved bool, err error) {
+	unlock, err := d.names.lock(ctx, to, nil)
+	if err != nil {
+		return core.Change{Effect: core.Unchanged}, false, err
+	}
+	defer unlock()
+	// Recheck the exact name after streaming, within the managed commit.
+	if !absent {
+		target, info, openErr := d.openChild(to, newName, leafChild)
+		if openErr == nil {
+			if closeErr := d.closeFile(target); closeErr != nil {
+				return core.Change{Effect: core.Unchanged}, false, closeErr
+			}
+			if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+				return core.Change{Effect: core.Unchanged}, false, core.Fail(core.NotFile, nil)
+			}
+		} else if errors.Is(openErr, os.ErrNotExist) {
+			absent = true
+		} else {
+			return core.Change{Effect: core.Unchanged}, false, localError(openErr)
+		}
+	}
 	flags, class := uint32(3), uint32(65)
 	if absent {
 		flags, class = 0, 10
 	}
-	change, err := renameFile(ctx, file, to, newName, flags, class)
+	change, err = renameFile(ctx, file, to, newName, flags, class)
 	return change, change.Effect == core.Applied, err
 }

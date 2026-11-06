@@ -21,6 +21,7 @@ type uploadRecord struct {
 	UploadID string         `json:"upload_id,omitempty"`
 	Part     int            `json:"part,omitempty"`
 	ETag     string         `json:"etag,omitempty"`
+	Evidence *core.Evidence `json:"evidence,omitempty"`
 }
 
 func appendUpload(ctx context.Context, appendRecord func(context.Context, []byte) error, r uploadRecord) error {
@@ -49,7 +50,16 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 		if err != nil {
 			return invalid(err)
 		}
-		if r.Version != 2 && r.Version != 3 {
+		if r.Version != 2 && r.Version != 3 && r.Version != 4 {
+			return invalid(nil)
+		}
+		done := r.Kind == "phase" && r.Phase == "done"
+		if r.Evidence != nil {
+			if !done || r.Version != 4 || !r.Evidence.Validator.Valid() {
+				return invalid(nil)
+			}
+			state.Evidence = *r.Evidence
+		} else if done && r.Version == 4 {
 			return invalid(nil)
 		}
 		switch r.Kind {

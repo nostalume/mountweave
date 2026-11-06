@@ -13,7 +13,13 @@ import (
 	core "github.com/nostalume/mountweave"
 )
 
-func (d *Driver) relocateNative(_ context.Context, from, to *os.File, oldName, newName string) (core.Change, error) {
+func (d *Driver) relocateNative(ctx context.Context, from, to *os.File, oldName, newName string) (core.Change, error) {
+	if _, err := d.statChild(ctx, from, oldName, inspectChild); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	if err := d.checkRelocateTarget(ctx, to, newName); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
 	old, err := syscall.BytePtrFromString(oldName)
 	if err != nil {
 		return core.Change{Effect: core.Unchanged}, err

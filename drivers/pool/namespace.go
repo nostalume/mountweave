@@ -94,6 +94,12 @@ func (d *Driver) commitLocked(ctx context.Context, run func(*bolt.Tx) error) (co
 	}
 	return core.Change{Effect: effect}, errors.Join(err, ctx.Err())
 }
+
+// Lstat uses the same lookup because pool records contain no name redirects.
+func (d *Driver) Lstat(ctx context.Context, p core.NativeAddress) (core.Metadata, error) {
+	return d.Stat(ctx, p)
+}
+
 func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
 	if len(selections) > 1 {
 		return meta, core.Fail(core.InvalidRequest, nil)
@@ -164,7 +170,7 @@ func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.C
 		return tx.Bucket(entriesKey).Put(key, encode(e))
 	})
 }
-func unlink(tx *bolt.Tx, parent, name string, expected core.Kind, conditions ...core.Condition) error {
+func unlink(tx *bolt.Tx, parent, name string, options core.RemoveOptions) error {
 	if tx.Bucket(dirsKey).Get([]byte(parent)) == nil {
 		return core.Fail(core.NotFound, nil)
 	}
@@ -177,11 +183,14 @@ func unlink(tx *bolt.Tx, parent, name string, expected core.Kind, conditions ...
 	if err := decode(raw, &e); err != nil {
 		return err
 	}
-	if (expected == core.File && e.Directory) || (expected == core.Directory && !e.Directory) {
-		return core.Fail(core.InvalidRequest, nil)
+	if options.Target == core.RemoveNonDirectory && e.Directory {
+		return core.Fail(core.NotFile, nil)
 	}
-	if len(conditions) == 1 {
-		if err := conditions[0].Check(metadata(name, e, fileRecord{ID: e.Generation}).Evidence, true); err != nil {
+	if options.Target == core.RemoveEmptyDirectory && !e.Directory {
+		return core.Fail(core.NotDirectory, nil)
+	}
+	if !options.When.Empty() {
+		if err := options.When.Check(metadata(name, e, fileRecord{ID: e.Generation}).Evidence, true); err != nil {
 			return err
 		}
 	}
@@ -207,6 +216,9 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 	if len(policies) == 1 {
 		policy = policies[0]
 	}
+	if policy.Target != "" && policy.Target != core.RemoveNonDirectory && policy.Target != core.RemoveEmptyDirectory {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+	}
 	if err := policy.When.ForDomain("pool-generation"); err != nil {
 		return core.Change{Effect: core.Unchanged}, err
 	}
@@ -228,7 +240,7 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 		if err != nil {
 			return err
 		}
-		return unlink(tx, parent, name, "", policy.When)
+		return unlink(tx, parent, name, policy)
 	})
 }
 func (d *Driver) Relocate(ctx context.Context, fromAddress, toAddress core.NativeAddress, policies ...core.MoveOptions) (core.Change, error) {
@@ -467,13 +479,16 @@ func (i *iterator) OpenFile(ctx context.Context, name string) (core.Opened, erro
 		return e, err
 	})
 }
-func (i *iterator) RemoveChild(ctx context.Context, name string, kind core.Kind) (core.Change, error) {
+func (i *iterator) RemoveChild(ctx context.Context, name string, options core.RemoveOptions) (core.Change, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed || !core.ValidName(name) || (kind != core.File && kind != core.Directory) {
+	if i.closed || !core.ValidName(name) || (options.Target != "" && options.Target != core.RemoveNonDirectory && options.Target != core.RemoveEmptyDirectory) {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
 	}
-	return i.op.d.commit(ctx, func(tx *bolt.Tx) error { return unlink(tx, i.parent, name, kind) })
+	if err := options.When.ForDomain("pool-generation"); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	return i.op.d.commit(ctx, func(tx *bolt.Tx) error { return unlink(tx, i.parent, name, options) })
 }
 func (i *iterator) Close() error {
 	i.mu.Lock()

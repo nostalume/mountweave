@@ -590,6 +590,26 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	}
 	server.lostComplete = false
 
+	// The native receipt survives a crash before the enclosing intent records it.
+	receipt := []byte("receipt bytes")
+	intent = create("receipt-loss", core.Path("/cloud/receipt"), receipt)
+	store.fail = func(next transfer.Record, _ []byte) bool { return next.State == transfer.Completed }
+	r, err = service.Run(ctx, "writer", intent.ID)
+	if !errors.Is(err, storageFault) {
+		t.Fatalf("lost outer receipt: %+v %v", r, err)
+	}
+	phase, uploadID, _ = nativeState(t, store, r)
+	if phase != "done" {
+		t.Fatalf("missing durable native receipt: %s", phase)
+	}
+	before = server.calls["POST  "+uploadID]
+	restart()
+	r, err = service.Run(ctx, "writer", intent.ID)
+	if err != nil || r.State != transfer.Completed || r.Change.Evidence.Validator.Tag != objectTag(receipt) ||
+		server.calls["POST  "+uploadID] != before {
+		t.Fatalf("replay durable native receipt: %+v %v", r, err)
+	}
+
 	// Conditional publication remains the same create-only file semantics.
 	intent = create("conflict", core.Path("/cloud/large"), []byte("new"))
 	r, err = service.Run(ctx, "writer", intent.ID)
@@ -709,7 +729,7 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		h, e := httpapi.New(c, func(context.Context, string) (core.Principal, error) { return "writer", nil }, time.Minute, httpapi.Options{JobSources: map[string]httpapi.JobSource{"uploads": source}, Queue: queue, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: func(context.Context, core.Principal, httpapi.TaskAction, httpapi.TaskInfo) error { return nil }})
+		h, e := httpapi.New(c, httpapi.Options{Authenticate: func(context.Context, string) (core.Principal, error) { return "writer", nil }, CursorTTL: time.Minute, JobSources: map[string]httpapi.JobSource{"uploads": source}, Queue: queue, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: func(context.Context, core.Principal, httpapi.TaskAction, httpapi.TaskInfo) error { return nil }})
 		if e != nil {
 			t.Fatal(e)
 		}

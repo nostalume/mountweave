@@ -161,7 +161,7 @@ func TestPoolFileManagementAndMembershipLifecycle(t *testing.T) {
 		t.Fatal("commit condition was not rechecked", err)
 	}
 	stale := core.IfMatch(oldTag)
-	if change, err := c.Remove(ctx, "user", core.Path("/pool/docs/sub/movie"), core.RemoveOptions{When: stale}); core.CodeOf(err) != core.PreconditionFailed || change.Effect != core.Unchanged {
+	if change, err := c.Remove(ctx, "user", core.Path("/pool/docs/sub/movie"), core.RemoveOptions{Target: core.RemoveNonDirectory, When: stale}); core.CodeOf(err) != core.PreconditionFailed || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
 	if result, err := c.Move(ctx, "user", core.Path("/pool/docs/sub/movie"), core.Path("/pool/stale"), core.MoveOptions{Source: stale}); core.CodeOf(err) != core.PreconditionFailed || result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged {

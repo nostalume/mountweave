@@ -16,6 +16,11 @@ var statusToError = syscall.NewLazyDLL("ntdll.dll").NewProc("RtlNtStatusToDosErr
 
 func (d *Driver) relocateNative(ctx context.Context, from, to *os.File, oldName, newName string) (change core.Change, err error) {
 	change.Effect = core.Unchanged
+	unlock, err := d.names.lock(ctx, from, to)
+	if err != nil {
+		return change, err
+	}
+	defer unlock()
 	owned, info, err := d.openChild(from, oldName, relocateChild)
 	if err != nil {
 		return change, localError(err)
@@ -23,6 +28,9 @@ func (d *Driver) relocateNative(ctx context.Context, from, to *os.File, oldName,
 	defer func() { err = errors.Join(err, d.closeFile(owned)) }()
 	if !info.Mode().IsRegular() && !info.IsDir() {
 		return change, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := d.checkRelocateTarget(ctx, to, newName); err != nil {
+		return change, err
 	}
 	return renameFile(ctx, owned, to, newName, 0, 10)
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path"
 
 	core "github.com/nostalume/mountweave"
 )
@@ -29,17 +28,11 @@ func (d *Driver) edit(ctx context.Context, rel string, options core.OpenOptions)
 		}
 		creation = core.OpenExisting
 	}
-	if err = core.ValidatePath(rel); err != nil {
-		return opened, err
-	}
-	if rel == "/" {
-		return opened, core.Fail(core.InvalidRequest, nil)
-	}
-	parent, err := d.OpenDirectory(ctx, core.NativePath(path.Dir(rel)))
+	parent, name, err := d.openParent(ctx, rel)
 	if err != nil {
 		return opened, err
 	}
-	defer func() { err = errors.Join(err, parent.Close()) }()
+	defer func() { err = errors.Join(err, d.closeFile(parent)) }()
 	if err = ctx.Err(); err != nil {
 		return opened, err
 	}
@@ -53,7 +46,7 @@ func (d *Driver) edit(ctx context.Context, rel string, options core.OpenOptions)
 	var file *os.File
 	var info os.FileInfo
 	if creation != core.OpenExisting {
-		file, info, err = openChild(parent.(*directoryScope).file, path.Base(rel), editChild, flags|os.O_CREATE|os.O_EXCL)
+		file, info, err = d.openEdit(ctx, parent, name, flags|os.O_CREATE|os.O_EXCL)
 		if file != nil {
 			opened.Change = core.Change{Effect: core.Applied, Before: core.TargetMissing}
 		}
@@ -70,18 +63,16 @@ func (d *Driver) edit(ctx context.Context, rel string, options core.OpenOptions)
 		}
 	}
 	if file == nil && err == nil {
-		if err = findChild(ctx, parent.(*directoryScope).file, path.Base(rel)); err == nil {
-			file, info, err = openChild(parent.(*directoryScope).file, path.Base(rel), editChild, flags)
-		}
+		file, info, err = d.openEdit(ctx, parent, name, flags)
 		if when.IsPresent() && core.CodeOf(localError(err)) == core.NotFound {
 			err = core.Fail(core.PreconditionFailed, err)
 		}
-		if file != nil {
+		if err == nil {
 			opened.Change.Before = core.TargetPresent
 		}
 	}
 	if file != nil {
-		opened.File = &boundFile{file: file, driver: d, name: path.Base(rel), readable: options.Read, appendOnly: options.AppendOnly}
+		opened.File = &boundFile{file: file, driver: d, name: name, readable: options.Read, appendOnly: options.AppendOnly}
 		opened.Binding = core.BoundObject
 	}
 	if err != nil {
@@ -103,7 +94,7 @@ func (d *Driver) edit(ctx context.Context, rel string, options core.OpenOptions)
 			return opened, localError(err)
 		}
 	}
-	opened.Metadata, err = metadata(path.Base(rel), info)
+	opened.Metadata, err = metadata(name, info)
 	return opened, errors.Join(err, ctx.Err())
 }
 

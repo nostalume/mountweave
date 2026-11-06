@@ -395,7 +395,7 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	if got := readFile(t, c, "/cloud/published", nil); string(got) != "two" {
 		t.Fatal("exclusive publication replaced content", string(got))
 	}
-	jsonHTTP, err := httpapi.New(c, func(context.Context, string) (core.Principal, error) { return "writer", nil }, time.Minute)
+	jsonHTTP, err := httpapi.New(c, httpapi.Options{Authenticate: func(context.Context, string) (core.Principal, error) { return "writer", nil }, CursorTTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}

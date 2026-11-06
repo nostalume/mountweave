@@ -2,7 +2,7 @@
 //
 // # Optional HTTP adapter
 //
-// httpapi.New(core, verifier, cursorTTL, options...) returns an embeddable
+// httpapi.New(core, options) returns an embeddable
 // http.Handler. Existing three-argument construction keeps file delivery available.
 // Optional httpapi.Options injects a control.Controller, task.Queue, task kinds,
 // task access policy, record capacity, JSON input limit and native-config projection.
@@ -121,7 +121,9 @@
 // httpapi.FileTaskConflicts; compose it with host policies for other key types.
 // Generic task runtime remains independent of this adapter:
 //
-//	handler, err := httpapi.New(files, verify, cursorTTL, httpapi.Options{
+//	handler, err := httpapi.New(files, httpapi.Options{
+//	    Authenticate: verify,
+//	    CursorTTL: cursorTTL,
 //	    Control: manager,
 //	    Queue: jobs,
 //	    MaxTasks: retainedTaskLimit,

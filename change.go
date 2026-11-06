@@ -45,8 +45,17 @@ type Remover interface {
 	Remove(context.Context, NativeAddress, ...RemoveOptions) (Change, error)
 }
 
+type RemoveTarget string
+
+const (
+	RemoveNonDirectory   RemoveTarget = "non_directory"
+	RemoveEmptyDirectory RemoveTarget = "empty_directory"
+)
+
 type RemoveOptions struct {
 	When Condition `json:"when"`
+	// Target constrains the native deletion. Zero allows either kind.
+	Target RemoveTarget `json:"target,omitempty"`
 }
 
 func (c *Core) Mkdir(ctx context.Context, p Principal, target Address) (result Change, err error) {
@@ -96,6 +105,9 @@ func (c *Core) Remove(ctx context.Context, p Principal, target Address, policies
 	if len(policies) == 1 {
 		policy = policies[0]
 	}
+	if policy.Target != "" && policy.Target != RemoveNonDirectory && policy.Target != RemoveEmptyDirectory {
+		return result, Fail(InvalidRequest, nil)
+	}
 	if err := policy.When.Validate(); err != nil {
 		return Change{Effect: Unchanged}, err
 	}
@@ -111,6 +123,18 @@ func (c *Core) removeAt(ctx context.Context, p Principal, at *location) (Change,
 func (c *Core) removeUse(u *use, options RemoveOptions, err error) (Change, error) {
 	if err != nil {
 		return Change{Effect: Unchanged}, err
+	}
+	if options.Target != "" {
+		if u.namespace != TreeNamespace {
+			u.release()
+			return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)
+		}
+		parent, err := openRemovalDirectory(u, nil)
+		if err != nil {
+			return Change{Effect: Unchanged}, err
+		}
+		change, err := parent.removeChild(u, options)
+		return change, errors.Join(err, parent.close())
 	}
 	defer u.release()
 	remover, ok := u.mount.driver.(Remover)

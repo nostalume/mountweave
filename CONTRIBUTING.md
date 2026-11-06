@@ -1,8 +1,9 @@
 # Contributing
 
 Use Go 1.24 or newer. Run the following in the repository root and separately
-in drivers/s3, drivers/alipan and drivers/pool; root commands do not traverse
-nested modules:
+in drivers/s3, drivers/alipan, drivers/pool and protocols/sftp; root commands do
+not traverse nested modules. The optional SFTP codec/client dependencies require
+Go 1.25 or newer in that module:
 
 ```sh
 go test ./...
@@ -11,7 +12,7 @@ go vet ./...
 go test -race ./...
 ```
 
-The root checks include drivers/local and protocols/httpapi, protocols/webdav
+The root checks include drivers/local, protocols/ftp, protocols/httpapi, protocols/webdav
 and their shared internal packages. Local module replacements are for checkout
 development. Keep optional dependencies
 in their owning modules. Do not add a global registry or require every consumer

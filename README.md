@@ -148,6 +148,41 @@ This endpoint does not advertise a compliance class, locks or user-property writ
 It needs no task queue or second storage implementation. Hosts behind a proxy
 must provide the trusted public request host/scheme used for Destination checks.
 
+All protocol constructors use `New(files, Options)`. JSON HTTP now takes
+`Authenticate`, `CursorTTL` and `OnStreamError` in Options; the old positional
+constructor and mutable Handler callback have been removed in this v0 checkout.
+
+`protocols/sftp` is an optional Go module (Go 1.25+) exposing
+`ServeConn(ctx, principal, channel)` for an authenticated SSH subsystem. It uses
+bound file handles for reads, writes, append, FSTAT and size-only FSETSTAT, plus
+bounded cursor-backed directories, lexical REALPATH, MKDIR and no-replacement
+RENAME. The host owns SSH and cancels the session context on disconnect. Requests
+execute in receive order; channel termination cancels active I/O and closes
+owned files/cursors. Optional `ModeView` presents file and directory type bits
+with logical export ceilings. The host derives the view and Core authorization
+from the same policy. A compatible creation mask uses native defaults. A
+conflicting mask fails before creation or truncation. LSTAT observes the final
+entry without following links. Downloads use a separate no-follow bound open.
+Local supports this observation on Windows and Linux. Pool and the S3 tree
+namespace use their existing link-free lookup. Drivers without the capability
+return an unsupported status. REMOVE/RMDIR use Core's non-directory and
+empty-directory predicates. Link resolution and creation and general attribute
+changes remain outside this profile.
+
+`protocols/ftp` remains in the standard-library root module and exposes
+`ServeConn(ctx, control)`. Options supplies authentication, active/passive network
+factories, transfer limits and optional explicit TLS. It supports ordinary
+file transfers, binary REST, APPE, TYPE A conversion, EPLF LIST, MLST/MLSD/NLST,
+lexical navigation, MKD, no-replacement rename, DELE/RMD and ABOR. Ordinary STOR defaults to
+complete publication; explicit LiveEdit, APPE and nonzero REST+STOR use native
+visible editing and can leave partial effects. RETR preserves Body/WriterTo.
+Each connection owns one active transfer, with data and content cleanup before completion.
+Both adapters accept `OnFailure` for original causes and effect receipts.
+Wire replies carry public reason text and known effects. Native causes remain
+with the host.
+See the protocol packages' GoDoc for exact configuration and ownership contracts.
+The new adapters are checkout-only and have not been released.
+
 ## Current scope
 
 The core supports mounted reads, fixed aliases, synchronous file operations,
@@ -227,7 +262,7 @@ apply only to checkout development. Working-tree transfer additions require the
 matching core revision and have not been released; consuming released modules
 does not require local replacements.
 
-See [Contributing](CONTRIBUTING.md) for commands covering all four modules.
+See [Contributing](CONTRIBUTING.md) for commands covering all five modules.
 The API is under development; no v1 compatibility promise is made yet.
 
 ## License

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"sync"
+	"time"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/control"
@@ -50,6 +51,9 @@ type TaskInfo struct {
 // reserved and completed HTTP records; completed records evict oldest-first by
 // acceptance order. The queue and all injected components remain host-owned.
 type Options struct {
+	Authenticate   Verifier
+	CursorTTL      time.Duration
+	OnStreamError  func(string, error)
 	Control        *control.Controller
 	ProjectConfig  func(context.Context, core.Principal, control.Definition) (any, error)
 	Queue          *task.Queue
@@ -76,13 +80,7 @@ type taskIndex struct {
 
 var errTaskCleanup = errors.New("task adapter retains failed cleanup")
 
-func (h *Handler) configure(options []Options) error {
-	if len(options) > 1 {
-		return errors.New("at most one HTTP options value is accepted")
-	}
-	if len(options) == 1 {
-		h.options = options[0]
-	}
+func (h *Handler) configure() error {
 	o := h.options
 	if o.MaxJSONBytes < 0 || o.MaxTasks < 0 {
 		return errors.New("HTTP limits must be nonnegative")

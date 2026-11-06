@@ -197,8 +197,10 @@
 // Pool compares generations in its transaction. Ordinary reads add no hash/HEAD.
 // OpenOptions holds Range and ReadSelection; Stat accepts an optional selection.
 // Source copy conditions apply to the actual open, target conditions to commit.
-// RemoveOptions and MoveOptions use these same predicates. Move retains its
-// same-mount boundary; target evidence is never copied to source.
+// RemoveOptions and MoveOptions use these same predicates. RemoveOptions.Target
+// additionally constrains single-entry tree removal to a non-directory name or
+// an empty directory through the Driver's bound-parent removal capability.
+// Move retains its same-mount boundary; target evidence never flows to source.
 // Tree policies do not broadcast one file validator over all members.
 //
 // Native staging configuration, byte budgets and commit limits belong to the

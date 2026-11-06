@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path"
 	"sync"
 	"syscall"
 
@@ -26,19 +25,6 @@ func (d *Driver) closeFile(file *os.File) error {
 	return err
 }
 
-func (d *Driver) changeTarget(ctx context.Context, rel string, existing bool) error {
-	if err := core.ValidatePath(rel); err != nil {
-		return err
-	}
-	if rel == "/" {
-		return core.Fail(core.InvalidRequest, nil)
-	}
-	if existing {
-		return d.exact(ctx, rel)
-	}
-	return d.exact(ctx, path.Dir(rel))
-}
-
 func nativeChange(err error, conflict core.Code) (core.Change, error) {
 	if err == nil {
 		return core.Change{Effect: core.Applied}, nil
@@ -46,71 +32,79 @@ func nativeChange(err error, conflict core.Code) (core.Change, error) {
 	if errors.Is(err, fs.ErrExist) {
 		return core.Change{Effect: core.Unchanged}, core.Fail(conflict, err)
 	}
+	var checked *core.Error
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &checked) {
+		return core.Change{Effect: core.Unchanged}, err
+	}
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
 		return core.Change{Effect: core.Unchanged}, localError(err)
 	}
 	return core.Change{Effect: core.Unknown}, localError(err)
 }
 
-func (d *Driver) Mkdir(ctx context.Context, relAddress core.NativeAddress) (core.Change, error) {
+func (d *Driver) Mkdir(ctx context.Context, relAddress core.NativeAddress) (change core.Change, err error) {
+	change.Effect = core.Unchanged
 	if relAddress.Namespace() != core.TreeNamespace {
-		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+		return change, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Value()
-
-	if err := d.changeTarget(ctx, rel, false); err != nil {
-		return core.Change{Effect: core.Unchanged}, err
+	parent, name, err := d.openParent(ctx, relAddress.Value())
+	if err != nil {
+		return change, err
 	}
+	defer func() { err = errors.Join(err, d.closeFile(parent)) }()
 	if err := ctx.Err(); err != nil {
-		return core.Change{Effect: core.Unchanged}, err
+		return change, err
 	}
-	return nativeChange(d.root.Mkdir(native(rel), 0700), core.AlreadyExists)
+	return d.mkdirAt(ctx, parent, name)
 }
 
-func (d *Driver) Remove(ctx context.Context, relAddress core.NativeAddress, policies ...core.RemoveOptions) (core.Change, error) {
+func (d *Driver) Remove(ctx context.Context, relAddress core.NativeAddress, policies ...core.RemoveOptions) (change core.Change, err error) {
+	change.Effect = core.Unchanged
 	if len(policies) > 1 {
-		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
+		return change, core.Fail(core.InvalidRequest, nil)
 	}
-	if len(policies) == 1 && !policies[0].When.Empty() {
-		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	var options core.RemoveOptions
+	if len(policies) == 1 {
+		options = policies[0]
 	}
-	if relAddress.Namespace() != core.TreeNamespace {
-		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	if relAddress.Namespace() != core.TreeNamespace || !options.When.Empty() {
+		return change, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Value()
-
-	if err := d.changeTarget(ctx, rel, true); err != nil {
-		return core.Change{Effect: core.Unchanged}, err
+	parent, name, err := d.openParent(ctx, relAddress.Value())
+	if err != nil {
+		return change, err
 	}
-	if err := ctx.Err(); err != nil {
-		return core.Change{Effect: core.Unchanged}, err
-	}
-	return nativeChange(d.root.Remove(native(rel)), core.DirectoryNotEmpty)
+	defer func() { err = errors.Join(err, d.closeFile(parent)) }()
+	return d.removeWith(ctx, parent, name, options)
 }
 
 func (d *Driver) Create(ctx context.Context, relAddress core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {
 	if relAddress.Namespace() != core.TreeNamespace {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Value()
-
 	if input == nil || (length != nil && *length < 0) {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
 	}
-	if err := d.changeTarget(ctx, rel, false); err != nil {
+	parent, name, err := d.openParent(ctx, relAddress.Value())
+	if err != nil {
 		return core.Change{Effect: core.Unchanged}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return core.Change{Effect: core.Unchanged}, err
+		return core.Change{Effect: core.Unchanged}, errors.Join(err, d.closeFile(parent))
 	}
-	file, err := d.root.OpenFile(native(rel), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
+	file, _, err := d.openEdit(ctx, parent, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	parentErr := d.closeFile(parent)
+	if file == nil {
 		// Some platforms report an existing directory as EISDIR rather than
 		// EEXIST. Exclusive creation has not changed that target.
 		if errors.Is(err, syscall.EISDIR) {
-			return core.Change{Effect: core.Unchanged}, core.Fail(core.AlreadyExists, err)
+			return core.Change{Effect: core.Unchanged}, errors.Join(core.Fail(core.AlreadyExists, err), parentErr)
 		}
-		return nativeChange(err, core.AlreadyExists)
+		change, err := nativeChange(err, core.AlreadyExists)
+		return change, errors.Join(err, parentErr)
+	}
+	if err != nil || parentErr != nil {
+		return core.Change{Effect: core.Incomplete}, errors.Join(localError(err), parentErr, d.closeFile(file))
 	}
 	var once sync.Once
 	var closeErr error

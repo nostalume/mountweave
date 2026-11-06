@@ -23,15 +23,15 @@ type DirectoryScope interface {
 }
 
 // ChildRemover is an optional capability of a DirectoryScope, not of Driver.
-// It removes one current child name without resolving the parent again. File
-// means a non-directory unlink (never following a final link); Directory means
-// empty-directory removal only. It does not bind a discovered object version.
+// It removes one exact current child name without resolving the parent again.
+// The target and condition must hold at the native effect point. Removal never
+// follows a final link. An unsupported combination fails before effects.
 // No enumeration is required. Calls may overlap each other, but must not overlap
 // Next, OpenFile or Close. Native work finishes before return; failed cleanup
 // stays owned by the scope/Driver. Applied confirms name removal, not storage
 // reclamation.
 type ChildRemover interface {
-	RemoveChild(context.Context, string, Kind) (Change, error)
+	RemoveChild(context.Context, string, RemoveOptions) (Change, error)
 }
 
 // directory owns its native scope and the exact captured parent address. The
@@ -98,7 +98,7 @@ func (d *directory) openFile(ctx context.Context, p Principal, at *location) (Co
 	return c.openUse(ctx, p, u, OpenOptions{}, err, func(call context.Context) (Opened, error) { return d.native.OpenFile(call, path.Base(at.path)) })
 }
 
-func (d *directory) removeChild(u *use, kind Kind) (Change, error) {
+func (d *directory) removeChild(u *use, options RemoveOptions) (Change, error) {
 	if u.binding != d.at.binding || path.Dir(u.path) != d.at.path {
 		return Change{Effect: Unchanged}, Fail(InvalidRequest, nil)
 	}
@@ -109,7 +109,7 @@ func (d *directory) removeChild(u *use, kind Kind) (Change, error) {
 	if err := u.ctx.Err(); err != nil {
 		return Change{Effect: Unchanged}, err
 	}
-	result, err := remover.RemoveChild(u.ctx, path.Base(u.path), kind)
+	result, err := remover.RemoveChild(u.ctx, path.Base(u.path), options)
 	return u.mount.core.finishChange(u, result, err)
 }
 

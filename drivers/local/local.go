@@ -35,6 +35,7 @@ type Driver struct {
 	stagingBytes  int64
 	failedStages  []*stagedFile
 	commits       chan struct{}
+	names         nameLocks
 }
 
 func New(directory string, options ...Options) (_ *Driver, err error) {
@@ -109,12 +110,6 @@ func (d *Driver) Close() error {
 	defer d.mu.Unlock()
 	return errors.Join(err, d.cleanupErr)
 }
-func native(rel string) string {
-	if rel == "/" {
-		return "."
-	}
-	return filepath.FromSlash(strings.TrimPrefix(rel, "/"))
-}
 func localError(err error) error {
 	if err == nil {
 		return nil
@@ -135,71 +130,6 @@ func localError(err error) error {
 	return core.Fail(core.UpstreamFailure, err)
 }
 
-// exact checks stored directory-entry names, not File.Stat().Name(). The root
-// remains the anchor while following links. This is not a filesystem snapshot.
-func (d *Driver) exact(ctx context.Context, rel string) error {
-	if err := core.ValidatePath(rel); err != nil {
-		return err
-	}
-	if rel == "/" {
-		return ctx.Err()
-	}
-	parent := "/"
-	for _, name := range strings.Split(rel[1:], "/") {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		dir, err := d.root.Open(native(parent))
-		if err != nil {
-			return localError(err)
-		}
-		info, err := dir.Stat()
-		if err != nil {
-			return localError(errors.Join(err, d.closeFile(dir)))
-		}
-		if !info.IsDir() {
-			return core.Fail(core.NotDirectory, d.closeFile(dir))
-		}
-		found := false
-		for !found {
-			if err = ctx.Err(); err != nil {
-				break
-			}
-			batch, readErr := dir.ReadDir(core.MaxPage)
-			for _, entry := range batch {
-				if entry.Name() == name {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-			if readErr != nil {
-				if !errors.Is(readErr, io.EOF) {
-					err = readErr
-				}
-				break
-			}
-		}
-		closeErr := d.closeFile(dir)
-		if err != nil {
-			return localError(errors.Join(err, closeErr))
-		}
-		if closeErr != nil {
-			return localError(closeErr)
-		}
-		if !found {
-			return core.Fail(core.NotFound, nil)
-		}
-		if parent == "/" {
-			parent += name
-		} else {
-			parent += "/" + name
-		}
-	}
-	return nil
-}
 func metadata(name string, info fs.FileInfo) (core.Metadata, error) {
 	m := core.Metadata{Name: name, Kind: core.File}
 	t := info.ModTime().UTC()
@@ -238,21 +168,47 @@ func (d *Driver) Stat(ctx context.Context, relAddress core.NativeAddress, select
 			err = selection.Check(meta.Evidence)
 		}
 	}()
-	if relAddress.Namespace() != core.TreeNamespace {
-		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+	return d.statPath(ctx, relAddress, inspectChild)
+}
+
+func (d *Driver) Lstat(ctx context.Context, address core.NativeAddress) (core.Metadata, error) {
+	return d.statPath(ctx, address, leafChild)
+}
+
+func (d *Driver) statPath(ctx context.Context, address core.NativeAddress, mode childMode) (meta core.Metadata, err error) {
+	if address.Namespace() != core.TreeNamespace {
+		return meta, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Value()
-	if err := d.exact(ctx, rel); err != nil {
-		return core.Metadata{}, err
+	if err = ctx.Err(); err != nil {
+		return meta, err
 	}
-	info, err := d.root.Stat(native(rel))
+	if address.Value() == "/" {
+		info, err := d.root.Stat(".")
+		if err != nil {
+			return meta, localError(err)
+		}
+		return metadata("", info)
+	}
+	parent, name, err := d.openParent(ctx, address.Value())
+	if err != nil {
+		return meta, err
+	}
+	defer func() { err = errors.Join(err, d.closeFile(parent)) }()
+	return d.statChild(ctx, parent, name, mode)
+}
+
+func (d *Driver) statChild(ctx context.Context, parent *os.File, name string, mode childMode) (core.Metadata, error) {
+	file, info, err := d.openChild(parent, name, mode)
 	if err != nil {
 		return core.Metadata{}, localError(err)
 	}
-	if err = ctx.Err(); err != nil {
+	if err = errors.Join(d.closeFile(file), ctx.Err()); err != nil {
 		return core.Metadata{}, err
 	}
-	return metadata(leaf(rel), info)
+	if info.Mode()&os.ModeSymlink != 0 {
+		return core.Metadata{Name: name, Kind: core.SymbolicLink}, nil
+	}
+	return metadata(name, info)
 }
 func (d *Driver) Open(ctx context.Context, relAddress core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
 	if err := options.Validate(); err != nil {
@@ -272,7 +228,7 @@ func (d *Driver) Open(ctx context.Context, relAddress core.NativeAddress, option
 	if options.Mode == core.LiveEdit {
 		return d.edit(ctx, rel, options)
 	}
-	file, info, err := d.readFile(ctx, rel, options.NoFollow)
+	file, info, err := d.readFile(ctx, rel)
 	if err != nil {
 		return core.Opened{}, localError(err)
 	}
@@ -344,51 +300,21 @@ func (f *boundFile) Stat(ctx context.Context) (core.Metadata, error) {
 
 func (f *boundFile) Close() error { return f.driver.closeFile(f.file) }
 
-func (d *Driver) readFile(ctx context.Context, rel string, noFollow bool) (*os.File, os.FileInfo, error) {
-	if noFollow {
-		if rel == "/" {
-			return nil, nil, core.Fail(core.NotFile, nil)
-		}
-		scope, err := d.OpenDirectory(ctx, core.NativePath(path.Dir(rel)))
-		if err != nil {
-			return nil, nil, err
-		}
-		parent := scope.(*directoryScope).file
-		if err := findChild(ctx, parent, path.Base(rel)); err != nil {
-			return nil, nil, errors.Join(err, scope.Close())
-		}
-		file, info, err := d.openChild(parent, path.Base(rel), readChild)
-		closeErr := scope.Close()
-		if err != nil || closeErr != nil {
-			if file != nil {
-				closeErr = errors.Join(closeErr, d.closeFile(file))
-			}
-			return nil, nil, errors.Join(localError(err), closeErr)
-		}
-		return file, info, nil
-	}
-	if err := d.exact(ctx, rel); err != nil {
-		return nil, nil, err
-	}
-	// Reject known special files before opening; platform flags also cover a
-	// FIFO replacement. Regular-file I/O retains its existing cancel boundary.
-	before, err := d.root.Stat(native(rel))
-	if err != nil {
-		return nil, nil, localError(err)
-	}
-	if before.IsDir() {
+func (d *Driver) readFile(ctx context.Context, rel string) (*os.File, os.FileInfo, error) {
+	if rel == "/" {
 		return nil, nil, core.Fail(core.NotFile, nil)
 	}
-	if !before.Mode().IsRegular() {
-		return nil, nil, core.Fail(core.UnrepresentableName, nil)
-	}
-	file, err := d.root.OpenFile(native(rel), readFlags(), 0)
+	parent, name, err := d.openParent(ctx, rel)
 	if err != nil {
-		return nil, nil, localError(err)
+		return nil, nil, err
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return nil, nil, errors.Join(localError(err), d.closeFile(file))
+	file, info, err := d.openChild(parent, name, readChild)
+	closeErr := d.closeFile(parent)
+	if err != nil || closeErr != nil {
+		if file != nil {
+			closeErr = errors.Join(closeErr, d.closeFile(file))
+		}
+		return nil, nil, errors.Join(localError(err), closeErr)
 	}
 	return file, info, nil
 }
@@ -403,67 +329,22 @@ func (d *Driver) Enumerate(ctx context.Context, relAddress core.NativeQuery) (co
 	if relAddress.Address().Namespace() != core.TreeNamespace || relAddress.Delimiter() != "" || relAddress.StartAfter() != "" {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Address().Value()
-
-	if err := d.exact(ctx, rel); err != nil {
+	file, err := d.openDirectory(ctx, relAddress.Address().Value())
+	if err != nil {
 		return nil, err
 	}
-	f, err := d.root.OpenFile(native(rel), readFlags(), 0)
-	if err != nil {
-		return nil, localError(err)
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return nil, localError(errors.Join(err, d.closeFile(f)))
-	}
-	if !info.IsDir() {
-		return nil, core.Fail(core.NotDirectory, d.closeFile(f))
-	}
-	return &iterator{driver: d, file: f, relative: rel}, nil
+	return &iterator{driver: d, file: file}, nil
 }
 
 type iterator struct {
-	driver   *Driver
-	file     *os.File
-	relative string
+	driver *Driver
+	file   *os.File
 }
 
 func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	entries, err := i.file.ReadDir(n)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, localError(err)
-	}
-	result := make([]core.Metadata, 0, len(entries))
-	for _, e := range entries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !core.ValidName(e.Name()) {
-			return nil, core.Fail(core.UnrepresentableName, nil)
-		}
-
-		// Read metadata through the anchored root as well: a DirEntry may
-		// otherwise resolve its original pathname after an external rename.
-		rel := i.relative
-		if rel != "/" {
-			rel += "/"
-		}
-		rel += e.Name()
-		info, statErr := i.driver.root.Stat(native(rel))
-		if statErr != nil {
-			return nil, localError(statErr)
-		}
-		m, metaErr := metadata(e.Name(), info)
-		if metaErr != nil {
-			return nil, metaErr
-		}
-		result = append(result, m)
-	}
-	return result, err
+	return i.driver.readDirectory(ctx, i.file, n)
 }
-func (i *iterator) Close() error { return i.file.Close() }
+
+func (i *iterator) Close() error { return i.driver.closeFile(i.file) }
 
 var _ core.Driver = (*Driver)(nil)

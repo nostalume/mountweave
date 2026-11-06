@@ -72,7 +72,9 @@ func CodeOf(err error) Code {
 // Driver is rooted when constructed. Tree addresses start at /; key addresses
 // preserve literal keys. Metadata.Name is a child name for tree listings and a
 // complete root-relative key for key listings/reads. PrefixGroup is listing-only.
-// Provider IDs and physical paths remain inside it.
+// Provider IDs and physical paths remain inside it. Tree operations must use
+// exact stored names without traversing native redirects. The operation may
+// explicitly observe or unlink a final link without following it.
 // Open transfers every returned Body/File to the caller, including on error.
 // BoundRead/LiveEdit return File only. They must not retain the opening call's context;
 // subsequent calls and Close own the resource lifetime. LiveEdit must report
@@ -84,6 +86,14 @@ type Driver interface {
 	Enumerate(context.Context, NativeQuery) (Iterator, error)
 	Open(context.Context, NativeAddress, OpenOptions) (Opened, error)
 	Close() error
+}
+
+// LeafStatter optionally observes the entry itself at a rooted tree address.
+// It must refuse intermediate links/redirects and may report SymbolicLink for
+// the final entry without inspecting its target. A namespace with no links can
+// use the same lookup as Stat. No native handles are transferred.
+type LeafStatter interface {
+	Lstat(context.Context, NativeAddress) (Metadata, error)
 }
 
 const (

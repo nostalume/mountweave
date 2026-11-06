@@ -76,7 +76,7 @@ func TestMaintenanceProtocolRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer q.Close(ctx)
-	h, err := httpapi.New(c, func(_ context.Context, token string) (core.Principal, error) { return core.Principal(token), nil }, time.Minute, httpapi.Options{JobSources: map[string]httpapi.JobSource{"archive": source}, Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: func(context.Context, core.Principal, httpapi.TaskAction, httpapi.TaskInfo) error { return nil }})
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: func(_ context.Context, token string) (core.Principal, error) { return core.Principal(token), nil }, CursorTTL: time.Minute, JobSources: map[string]httpapi.JobSource{"archive": source}, Queue: q, MaxTasks: 4, MaxJSONBytes: 4096, AuthorizeTask: func(context.Context, core.Principal, httpapi.TaskAction, httpapi.TaskInfo) error { return nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

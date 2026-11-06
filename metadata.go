@@ -10,9 +10,10 @@ import (
 type Kind string
 
 const (
-	File        Kind = "file"
-	Directory   Kind = "directory"
-	PrefixGroup Kind = "prefix"
+	File         Kind = "file"
+	Directory    Kind = "directory"
+	PrefixGroup  Kind = "prefix"
+	SymbolicLink Kind = "symlink" // Only returned by Lstat.
 )
 
 // Metadata contains observations, not an object identity or an owned handle.
@@ -43,10 +44,14 @@ func virtualEntry(p Address) Entry {
 }
 
 func project(p Address, m Metadata) (Entry, error) {
+	return projectMetadata(p, m, false)
+}
+
+func projectMetadata(p Address, m Metadata, leaf bool) (Entry, error) {
 	if m.Evidence.Validator != (Validator{}) && !m.Evidence.Validator.Valid() {
 		return Entry{}, Fail(InvalidUpstreamResponse, errors.New("invalid native validator"))
 	}
-	if m.Kind != File && m.Kind != Directory && !(p.prefix && m.Kind == PrefixGroup) {
+	if m.Kind != File && m.Kind != Directory && !(p.prefix && m.Kind == PrefixGroup) && !(leaf && m.Kind == SymbolicLink) {
 		return Entry{}, Fail(InvalidUpstreamResponse, nil)
 	}
 	if m.Size != nil && (*m.Size < 0 || m.Kind != File) {
@@ -77,8 +82,19 @@ func (c *Core) Stat(ctx context.Context, p Principal, target Address, selections
 	return c.Inspect(ctx, p, StatAction, target, selections...)
 }
 
+// Lstat observes the final entry of a tree path without following a link.
+// Intermediate links are refused. It uses the same authority as Stat and does
+// not bind the entry for later operations.
+func (c *Core) Lstat(ctx context.Context, p Principal, target Address) (Entry, error) {
+	return c.inspect(ctx, p, StatAction, target, true)
+}
+
 // Inspect checks metadata under the requested action without opening content.
 func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target Address, selections ...ReadSelection) (Entry, error) {
+	return c.inspect(ctx, p, action, target, false, selections...)
+}
+
+func (c *Core) inspect(ctx context.Context, p Principal, action Action, target Address, leaf bool, selections ...ReadSelection) (Entry, error) {
 	ctx, turn, err := enterOrder(ctx, nil)
 	if err != nil {
 		return Entry{}, err
@@ -97,6 +113,9 @@ func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target A
 	if action != StatAction && action != ListAction && action != ReadAction {
 		return Entry{}, Fail(InvalidRequest, nil)
 	}
+	if leaf && target.Namespace() != TreeNamespace {
+		return Entry{}, Fail(UnsupportedOperation, nil)
+	}
 	u, _, err := c.admit(ctx, p, action, target)
 	if err != nil {
 		return Entry{}, err
@@ -109,6 +128,14 @@ func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target A
 		return entry, selection.Check(entry.Evidence)
 	}
 	defer u.release()
+	if leaf {
+		driver, ok := u.mount.driver.(LeafStatter)
+		if !ok {
+			return Entry{}, Fail(UnsupportedOperation, errors.New("driver cannot observe the final entry without following links"))
+		}
+		meta, err := driver.Lstat(u.ctx, u.native())
+		return observedEntry(u, meta, err, true)
+	}
 	// Stat already returns the selected observation. Compare it once here, after
 	// validating the endpoint kind; never use this as a precheck for Open/commit.
 	entry, err := c.observe(u, selection.Version)
@@ -123,6 +150,10 @@ func (c *Core) Inspect(ctx context.Context, p Principal, action Action, target A
 
 func (c *Core) observe(u *use, version Version) (Entry, error) {
 	meta, err := u.mount.driver.Stat(u.ctx, u.native(), ReadSelection{Version: version})
+	return observedEntry(u, meta, err, false)
+}
+
+func observedEntry(u *use, meta Metadata, err error, leaf bool) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
@@ -132,7 +163,7 @@ func (c *Core) observe(u *use, version Version) (Entry, error) {
 	if err = checkNativeName(meta, u.native()); err != nil {
 		return Entry{}, err
 	}
-	return project(u.address(), meta)
+	return projectMetadata(u.address(), meta, leaf)
 }
 
 func checkNativeName(m Metadata, rel NativeAddress) error {

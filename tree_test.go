@@ -519,15 +519,15 @@ func (d *removalReader) OpenDirectory(ctx context.Context, nameAddress core.Nati
 
 type removalScope struct {
 	core.DirectoryScope
-	remove   func(context.Context, string, core.Kind) (core.Change, error)
+	remove   func(context.Context, string, core.RemoveOptions) (core.Change, error)
 	closeErr error
 }
 
-func (s *removalScope) RemoveChild(ctx context.Context, name string, kind core.Kind) (core.Change, error) {
+func (s *removalScope) RemoveChild(ctx context.Context, name string, options core.RemoveOptions) (core.Change, error) {
 	if s.remove != nil {
-		return s.remove(ctx, name, kind)
+		return s.remove(ctx, name, options)
 	}
-	return s.DirectoryScope.(core.ChildRemover).RemoveChild(ctx, name, kind)
+	return s.DirectoryScope.(core.ChildRemover).RemoveChild(ctx, name, options)
 }
 
 func (s *removalScope) Close() error {
@@ -791,8 +791,8 @@ func TestTreeRemovalEffectsAndCleanup(t *testing.T) {
 						wrapped.closeErr = fault
 					case "cancel", "retire":
 						parent := name
-						wrapped.remove = func(ctx context.Context, name string, kind core.Kind) (core.Change, error) {
-							change, err := scope.(core.ChildRemover).RemoveChild(ctx, name, kind)
+						wrapped.remove = func(ctx context.Context, name string, options core.RemoveOptions) (core.Change, error) {
+							change, err := scope.(core.ChildRemover).RemoveChild(ctx, name, options)
 							acknowledged <- parent + "/" + name
 							<-ctx.Done()
 							<-release

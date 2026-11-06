@@ -1,7 +1,8 @@
 # Third-party notices
 
 Mountweave does not relicense its dependencies. This inventory covers the pinned
-non-standard-library modules used by S3 and Pool, including their platform code.
+non-standard-library modules used by S3, Pool and optional SFTP, including their
+platform code and the independent SFTP test client.
 Core and Alipan use only the standard library and Mountweave code. External
 modules remain separate; their source archives retain per-file notices. Binary
 redistributors should carry the notices for the components they include.
@@ -22,7 +23,11 @@ redistributors should carry the notices for the components they include.
 | `github.com/klauspost/reedsolomon` | v1.13.3 | MIT |
 | `go.etcd.io/bbolt` | v1.4.3 | MIT |
 | `github.com/klauspost/cpuid/v2` | v2.3.0 | MIT |
-| `golang.org/x/sys` | v0.30.0 | BSD-3-Clause |
+| `golang.org/x/sys` | v0.30.0; v0.47.0 (SFTP tests) | BSD-3-Clause |
+| `github.com/pkg/sftp/v2` | v2.0.0-alpha2 | BSD-2-Clause |
+| `github.com/pkg/sftp` | v1.13.12 (test client) | BSD-2-Clause |
+| `github.com/kr/fs` | v0.1.0 (SFTP tests) | BSD-3-Clause |
+| `golang.org/x/crypto` | v0.54.0 (SFTP tests) | BSD-3-Clause |
 
 ## Legal text 1
 
@@ -607,6 +612,8 @@ SOFTWARE.
 ## Legal text 10
 
 - golang.org/x/sys@v0.30.0/LICENSE
+- golang.org/x/sys@v0.47.0/LICENSE
+- golang.org/x/crypto@v0.54.0/LICENSE
 - Go standard library/runtime: LICENSE (BSD-3-Clause)
 
 ```text
@@ -637,4 +644,58 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+
+## Legal text 11
+
+- github.com/pkg/sftp/v2@v2.0.0-alpha2/LICENSE
+- github.com/pkg/sftp@v1.13.12/LICENSE
+
+```text
+Copyright (c) 2013, Dave Cheney
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## Legal text 12
+
+- github.com/kr/fs@v0.1.0/LICENSE
+
+```text
+Copyright (c) 2012 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 ```

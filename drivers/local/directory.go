@@ -14,11 +14,12 @@ type childMode uint8
 
 const (
 	inspectChild childMode = iota
+	leafChild
 	directoryChild
 	readChild
 	relocateChild
-	unlinkChild
-	removeDirectoryChild
+	deleteChild
+	mkdirChild
 	stageChild
 	editChild
 )
@@ -35,8 +36,14 @@ func (d *Driver) OpenDirectory(ctx context.Context, relAddress core.NativeAddres
 	if relAddress.Namespace() != core.TreeNamespace {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}
-	rel := relAddress.Value()
+	file, err := d.openDirectory(ctx, relAddress.Value())
+	if err != nil {
+		return nil, err
+	}
+	return &directoryScope{driver: d, file: file, items: make(map[string]core.Kind)}, nil
+}
 
+func (d *Driver) openDirectory(ctx context.Context, rel string) (*os.File, error) {
 	if !directoryScopesSupported {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -47,13 +54,13 @@ func (d *Driver) OpenDirectory(ctx context.Context, relAddress core.NativeAddres
 	if err != nil {
 		return nil, localError(err)
 	}
-	fail := func(err error) (core.DirectoryScope, error) { return nil, errors.Join(err, d.closeFile(file)) }
+	fail := func(err error) (*os.File, error) { return nil, errors.Join(err, d.closeFile(file)) }
+	if err = exactDirectory(file); err != nil {
+		return fail(err)
+	}
 	if rel != "/" {
 		for _, name := range strings.Split(rel[1:], "/") {
 			if err = ctx.Err(); err != nil {
-				return fail(err)
-			}
-			if err = findChild(ctx, file, name); err != nil {
 				return fail(err)
 			}
 			next, _, openErr := d.openChild(file, name, directoryChild)
@@ -64,50 +71,72 @@ func (d *Driver) OpenDirectory(ctx context.Context, relAddress core.NativeAddres
 				return nil, errors.Join(closeErr, d.closeFile(next))
 			}
 			file = next
+			if err = exactDirectory(file); err != nil {
+				return fail(err)
+			}
 		}
 	}
 	if err = ctx.Err(); err != nil {
 		return fail(err)
 	}
-	return &directoryScope{driver: d, file: file, items: make(map[string]core.Kind)}, nil
+	return file, nil
 }
 
-// findChild checks stored spelling in an already bound parent, including on
-// native filesystems whose lookup accepts case variants.
-func findChild(ctx context.Context, parent *os.File, name string) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		names, err := parent.Readdirnames(core.MaxPage)
-		for _, stored := range names {
-			if stored == name {
-				return nil
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			return core.Fail(core.NotFound, nil)
-		}
-		if err != nil {
-			return localError(err)
-		}
+func (d *Driver) openParent(ctx context.Context, rel string) (*os.File, string, error) {
+	if err := core.ValidatePath(rel); err != nil {
+		return nil, "", err
 	}
+	if rel == "/" {
+		return nil, "", core.Fail(core.InvalidRequest, nil)
+	}
+	cut := strings.LastIndexByte(rel, '/')
+	parent, err := d.openDirectory(ctx, rel[:max(cut, 1)])
+	return parent, rel[cut+1:], err
 }
 
 func (s *directoryScope) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 	if s.closed {
 		return nil, io.ErrClosedPipe
 	}
+	if s.done {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if n < 1 {
+			return nil, core.Fail(core.InvalidRequest, nil)
+		}
+		return nil, io.EOF
+	}
+	items, err := s.driver.readDirectory(ctx, s.file, n)
+	for _, item := range items {
+		if _, exists := s.items[item.Name]; exists {
+			return nil, core.Fail(core.PathAmbiguous, nil)
+		}
+		s.items[item.Name] = item.Kind
+	}
+	s.done = errors.Is(err, io.EOF)
+	return items, err
+}
+
+func (d *Driver) openEdit(ctx context.Context, parent *os.File, name string, flags int) (*os.File, os.FileInfo, error) {
+	if flags&os.O_EXCL != 0 {
+		unlock, err := d.names.lock(ctx, parent, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer unlock()
+	}
+	return openChild(parent, name, editChild, flags)
+}
+
+func (d *Driver) readDirectory(ctx context.Context, parent *os.File, n int) ([]core.Metadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if n < 1 {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
-	if s.done {
-		return nil, io.EOF
-	}
-	names, err := s.file.Readdirnames(n)
+	names, err := parent.Readdirnames(n)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, localError(err)
 	}
@@ -119,24 +148,12 @@ func (s *directoryScope) Next(ctx context.Context, n int) ([]core.Metadata, erro
 		if !core.ValidName(name) {
 			return nil, core.Fail(core.UnrepresentableName, nil)
 		}
-		if _, exists := s.items[name]; exists {
-			return nil, core.Fail(core.PathAmbiguous, nil)
-		}
-		file, info, openErr := s.driver.openChild(s.file, name, inspectChild)
-		if openErr != nil {
-			return nil, localError(openErr)
-		}
-		if err := s.driver.closeFile(file); err != nil {
-			return nil, localError(err)
-		}
-		meta, metaErr := metadata(name, info)
+		meta, metaErr := d.statChild(ctx, parent, name, inspectChild)
 		if metaErr != nil {
 			return nil, metaErr
 		}
-		s.items[name] = meta.Kind
 		items = append(items, meta)
 	}
-	s.done = errors.Is(err, io.EOF)
 	return items, err
 }
 
@@ -167,19 +184,30 @@ func (s *directoryScope) OpenFile(ctx context.Context, name string) (core.Opened
 }
 
 // RemoveChild operates on the bound parent, without requiring enumeration.
-func (s *directoryScope) RemoveChild(ctx context.Context, name string, kind core.Kind) (change core.Change, err error) {
+func (s *directoryScope) RemoveChild(ctx context.Context, name string, options core.RemoveOptions) (change core.Change, err error) {
 	change.Effect = core.Unchanged
-	if s.closed || !core.ValidName(name) || (kind != core.File && kind != core.Directory) {
+	if s.closed || !core.ValidName(name) {
 		return change, core.Fail(core.InvalidRequest, nil)
 	}
-	if err = ctx.Err(); err != nil {
-		return change, err
-	}
-	change, err = s.driver.removeChild(ctx, s.file, name, kind)
+	change, err = s.driver.removeWith(ctx, s.file, name, options)
 	if cause := ctx.Err(); cause != nil && !errors.Is(err, cause) {
 		err = errors.Join(err, cause)
 	}
 	return change, err
+}
+
+func (d *Driver) removeWith(ctx context.Context, parent *os.File, name string, options core.RemoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if !options.When.Empty() {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if options.Target != "" && options.Target != core.RemoveNonDirectory && options.Target != core.RemoveEmptyDirectory {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return unchanged, err
+	}
+	return d.removeChild(ctx, parent, name, options.Target)
 }
 
 var _ core.ChildRemover = (*directoryScope)(nil)

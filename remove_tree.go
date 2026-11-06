@@ -339,7 +339,11 @@ func (c *Core) removeTree(ctx context.Context, p Principal, targetAddress Addres
 						if scope == nil {
 							row.Change, row.Err = removeNative(u, entry.kind)
 						} else {
-							row.Change, row.Err = scope.removeChild(u, entry.kind)
+							target := RemoveNonDirectory
+							if entry.kind == Directory {
+								target = RemoveEmptyDirectory
+							}
+							row.Change, row.Err = scope.removeChild(u, RemoveOptions{Target: target})
 						}
 					}
 					return row, row.Err

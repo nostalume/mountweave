@@ -44,7 +44,7 @@ func TestDurableInputAndSharedFileExecution(t *testing.T) {
 		return errors.New("private input policy")
 	}
 	makeHandler := func() *httpapi.Handler {
-		h, err := httpapi.New(c, identity, time.Minute, httpapi.Options{Inputs: s, AuthorizeInput: policy, Queue: q, AuthorizeTask: taskPolicy, MaxTasks: 8})
+		h, err := httpapi.New(c, httpapi.Options{Authenticate: identity, CursorTTL: time.Minute, Inputs: s, AuthorizeInput: policy, Queue: q, AuthorizeTask: taskPolicy, MaxTasks: 8})
 		if err != nil {
 			t.Fatal(err)
 		}

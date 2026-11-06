@@ -169,13 +169,9 @@ func TestLinksAndNames(t *testing.T) {
 	if err := os.Symlink("../outside.txt", filepath.Join(root, "outside-link")); err != nil {
 		t.Fatal(err)
 	}
-	o, err := c.Open(context.Background(), "alice", core.Path("/files/inside-link"), core.OpenOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := io.ReadAll(o.Body)
-	if err != nil || string(b) != "inside" {
-		t.Fatal(string(b), err)
+	if o, err := c.Open(context.Background(), "alice", core.Path("/files/inside-link"), core.OpenOptions{}); err == nil {
+		_ = o.Body.Close()
+		t.Fatal("inside link opened")
 	}
 	if _, err := c.Open(context.Background(), "alice", core.Path("/files/outside-link"), core.OpenOptions{}); err == nil {
 		t.Fatal("outside link opened")

@@ -5,24 +5,20 @@ import (
 	"errors"
 	"os"
 	"runtime"
-	"strings"
 	"syscall"
 	"unsafe"
 
 	core "github.com/nostalume/mountweave"
 )
 
-func (d *Driver) removeChild(ctx context.Context, parent *os.File, name string, kind core.Kind) (change core.Change, err error) {
+func (d *Driver) removeChild(ctx context.Context, parent *os.File, name string, target core.RemoveTarget) (change core.Change, err error) {
 	change.Effect = core.Unchanged
-	// A child name cannot select an alternate data stream.
-	if strings.ContainsRune(name, ':') {
-		return change, core.Fail(core.UnrepresentableName, nil)
+	unlock, err := d.names.lock(ctx, parent, nil)
+	if err != nil {
+		return change, err
 	}
-	mode := unlinkChild
-	if kind == core.Directory {
-		mode = removeDirectoryChild
-	}
-	file, _, err := d.openChild(parent, name, mode)
+	defer unlock()
+	file, info, err := d.openChild(parent, name, deleteChild)
 	if err != nil {
 		return change, localError(err)
 	}
@@ -34,6 +30,12 @@ func (d *Driver) removeChild(ctx context.Context, parent *os.File, name string, 
 		}
 		err = errors.Join(err, localError(closeErr))
 	}()
+	if target == core.RemoveEmptyDirectory && !info.IsDir() {
+		return change, core.Fail(core.NotDirectory, nil)
+	}
+	if target == core.RemoveNonDirectory && info.IsDir() {
+		return change, core.Fail(core.NotFile, nil)
+	}
 	if err = ctx.Err(); err != nil {
 		return change, err
 	}

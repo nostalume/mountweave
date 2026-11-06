@@ -265,6 +265,15 @@ func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...c
 	}
 	return d.statKey(ctx, d.key(p), name(p), selection.Version)
 }
+
+// Lstat uses the same lookup because tree objects and prefixes never redirect.
+func (d *Driver) Lstat(ctx context.Context, p core.NativeAddress) (core.Metadata, error) {
+	if p.Namespace() != core.TreeNamespace {
+		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	return d.Stat(ctx, p)
+}
+
 func (d *Driver) Enumerate(ctx context.Context, query core.NativeQuery) (core.Iterator, error) {
 	p := query.Address()
 	if p.Namespace() == core.KeyNamespace {

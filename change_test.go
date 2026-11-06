@@ -526,6 +526,21 @@ func TestPublicationCompetitionAndBudget(t *testing.T) {
 	if err != nil || change.Effect != core.Applied {
 		t.Fatal("completed calls did not release staging reservations", change, err)
 	}
+	if runtime.GOOS == "windows" {
+		pause := &blockingBody{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+		go func() {
+			change, err := c.Write(ctx, "alice", core.Path("/files/draft"), io.MultiReader(strings.NewReader("x"), pause), ptr(1), replace)
+			done <- outcome{change, err}
+		}()
+		await(t, pause.started)
+		_, created := c.Write(ctx, "alice", core.Path("/files/Draft"), strings.NewReader("peer"), ptr(4))
+		close(pause.release)
+		got := <-done
+		data, readErr := os.ReadFile(filepath.Join(root, "Draft"))
+		if created != nil || readErr != nil || string(data) != "peer" || got.err == nil || got.change.Effect != core.Unchanged {
+			t.Fatal("commit replaced a competing spelling", created, string(data), readErr, got)
+		}
+	}
 }
 
 func TestExclusivePublicationCompetition(t *testing.T) {

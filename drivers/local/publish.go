@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path"
 	"sync"
 
 	core "github.com/nostalume/mountweave"
@@ -27,37 +26,26 @@ func (d *Driver) Publish(ctx context.Context, relAddress core.NativeAddress, inp
 	if input == nil || (length != nil && *length < 0) {
 		return change, core.Fail(core.InvalidRequest, nil)
 	}
-	if err = core.ValidatePath(rel); err != nil {
-		return change, err
-	}
-	if rel == "/" {
-		return change, core.Fail(core.InvalidRequest, nil)
-	}
 	if d.staging == nil || !directoryScopesSupported {
 		return change, core.Fail(core.UnsupportedOperation, nil)
 	}
-	if err = publicationName(path.Base(rel)); err != nil {
-		return change, err
-	}
-	parent, err := d.OpenDirectory(ctx, core.NativePath(path.Dir(rel)))
+	to, name, err := d.openParent(ctx, rel)
 	if err != nil {
 		return change, err
 	}
-	defer func() { err = errors.Join(err, parent.Close()) }()
-	to := parent.(*directoryScope).file
+	defer func() { err = errors.Join(err, d.closeFile(to)) }()
+	if err = publicationName(name); err != nil {
+		return change, err
+	}
 	if err = sameFilesystem(d.stagingParent, to); err != nil {
 		return change, err
 	}
 	// Observed directories and links are refused. This is not a version guard:
 	// a compatible replacement can race, and the final name is never followed.
-	existing, info, checkErr := d.openChild(to, path.Base(rel), inspectChild)
+	existing, info, checkErr := d.openChild(to, name, inspectChild)
 	if checkErr == nil {
 		change.Before = core.TargetPresent
-		nameErr := findChild(ctx, to, path.Base(rel))
 		closeErr := d.closeFile(existing)
-		if nameErr != nil {
-			return change, errors.Join(nameErr, closeErr)
-		}
 		if !info.Mode().IsRegular() {
 			return change, errors.Join(core.Fail(core.NotFile, nil), closeErr)
 		}
@@ -117,7 +105,7 @@ func (d *Driver) Publish(ctx context.Context, relAddress core.NativeAddress, inp
 		}
 	}
 	before := change.Before
-	change, moved, err = d.publishNative(ctx, stage.file, to, stage.name, path.Base(rel), options.When.IsAbsent())
+	change, moved, err = d.publishNative(ctx, stage.file, to, stage.name, name, options.When.IsAbsent())
 	change.Before = before
 	return
 }

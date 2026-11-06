@@ -3,7 +3,7 @@ package local
 import (
 	"context"
 	"errors"
-	"path"
+	"os"
 
 	core "github.com/nostalume/mountweave"
 )
@@ -25,45 +25,34 @@ func (d *Driver) Relocate(ctx context.Context, sourceAddress, targetAddress core
 	target := targetAddress.Value()
 
 	change.Effect = core.Unchanged
-	if err = d.changeTarget(ctx, source, true); err != nil {
+	from, oldName, err := d.openParent(ctx, source)
+	if err != nil {
 		err = &core.OperationError{Side: core.SourceSide, Phase: core.RemovePhase, Cause: err}
 		return
 	}
-	if err = d.changeTarget(ctx, target, false); err != nil {
-		err = &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
-		return
-	}
+	defer func() { err = errors.Join(err, d.closeFile(from)) }()
 	if core.Within(target, source) {
 		return change, core.Fail(core.InvalidRequest, nil)
 	}
-	info, err := d.root.Lstat(native(source))
+	to, newName, err := d.openParent(ctx, target)
 	if err != nil {
-		return change, localError(err)
-	}
-	if !info.Mode().IsRegular() && !info.IsDir() {
-		return change, core.Fail(core.UnsupportedOperation, nil)
-	}
-	// Normalize the exclusive conflict across file/directory combinations.
-	// The final rename still excludes peers created after this observation.
-	if _, err := d.root.Lstat(native(target)); err == nil {
-		return change, core.Fail(core.AlreadyExists, nil)
-	} else if core.CodeOf(localError(err)) != core.NotFound {
-		return change, &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: localError(err)}
-	}
-	from, err := d.root.Open(native(path.Dir(source)))
-	if err != nil {
-		return change, localError(err)
-	}
-	defer func() { err = errors.Join(err, d.closeFile(from)) }()
-	to, err := d.root.Open(native(path.Dir(target)))
-	if err != nil {
-		return change, localError(err)
+		return change, &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
 	}
 	defer func() { err = errors.Join(err, d.closeFile(to)) }()
-	if err = ctx.Err(); err != nil {
-		return
+	return d.relocateNative(ctx, from, to, oldName, newName)
+}
+
+// Check after the source is admitted. Core may act on an existing-target
+// conflict, and the final native rename still excludes concurrent creation.
+func (d *Driver) checkRelocateTarget(ctx context.Context, parent *os.File, name string) error {
+	_, err := d.statChild(ctx, parent, name, leafChild)
+	if err == nil {
+		return core.Fail(core.AlreadyExists, nil)
 	}
-	return d.relocateNative(ctx, from, to, path.Base(source), path.Base(target))
+	if core.CodeOf(err) == core.NotFound {
+		return ctx.Err()
+	}
+	return &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
 }
 
 func relocationResult(err error) (core.Change, error) {

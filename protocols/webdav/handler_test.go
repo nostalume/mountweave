@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -35,6 +37,9 @@ func TestBasicFileWorkflow(t *testing.T) {
 		}
 		if p == "creator" && a == core.WriteAction {
 			return errors.New("replacement denied")
+		}
+		if core.Within(address.Value(), "/files/private") || address == core.Path("/files/protected/Draft") {
+			return errors.New("private entry")
 		}
 		return nil
 	}})
@@ -237,6 +242,74 @@ func TestBasicFileWorkflow(t *testing.T) {
 	if entries, err := os.ReadDir(staging); err != nil || len(entries) != 0 {
 		t.Fatal("HTTP leaked staging", entries, err)
 	}
+	t.Run("native tree authority", func(t *testing.T) {
+		for _, name := range []string{"private", "export", "protected"} {
+			if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, name := range []string{"private/item", "protected/Draft"} {
+			if err := os.WriteFile(filepath.Join(root, name), []byte("hidden"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Symlink(filepath.Join("..", "private"), filepath.Join(root, "export", "bridge")); err != nil {
+			if runtime.GOOS == "windows" && (errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.Errno(1314))) {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if _, err := c.Stat(ctx, "writer", core.Path("/files/private/item")); core.CodeOf(err) != core.PermissionDenied {
+			t.Fatal("fixture did not deny the direct target", err)
+		}
+		for _, name := range []string{"/files/export/bridge/item", "/alias/export/bridge/item", "/alias/protected/DRAFT"} {
+			address := core.Path(name)
+			if _, err := c.Stat(ctx, "writer", address); err == nil {
+				t.Errorf("stat exposed %s", name)
+			}
+			if body, err := c.Open(ctx, "writer", address, core.OpenOptions{}); err == nil {
+				_ = body.Body.Close()
+				t.Errorf("open exposed %s", name)
+			}
+		}
+		link := core.Path("/alias/export/bridge")
+		if _, err := c.List(ctx, "writer", core.ListRequest{Query: core.Children(link), Limit: core.MaxPage, CursorTTL: time.Minute}); err == nil {
+			t.Error("list followed the link")
+		}
+		if change, err := c.Mkdir(ctx, "writer", core.Path(link.Value()+"/added")); err == nil || change.Effect != core.Unchanged {
+			t.Error("mkdir crossed the link", change, err)
+		}
+		if result, err := c.Move(ctx, "writer", core.Path(link.Value()+"/item"), core.Path("/alias/export/moved")); err == nil || result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged {
+			t.Error("move crossed the link", result, err)
+		}
+		for _, tc := range []struct {
+			path   string
+			target core.RemoveTarget
+			code   core.Code
+		}{
+			{"/alias/protected/DRAFT", core.RemoveNonDirectory, core.NotFound},
+			{"/files/export", core.RemoveNonDirectory, core.NotFile},
+			{"/alias/protected", core.RemoveEmptyDirectory, core.DirectoryNotEmpty},
+		} {
+			change, err := c.Remove(ctx, "writer", core.Path(tc.path), core.RemoveOptions{Target: tc.target})
+			if core.CodeOf(err) != tc.code || change.Effect != core.Unchanged {
+				t.Error("unsafe removal", tc.path, change, err)
+			}
+		}
+		for _, endpoint := range []string{"/dav/export/bridge/item", "/dav/protected/DRAFT"} {
+			r := httptest.NewRequest("GET", endpoint, nil)
+			r.Header.Set("X-Actor", "writer")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code < 400 || strings.Contains(w.Body.String(), "hidden") {
+				t.Error("WebDAV escaped tree authority", endpoint, w.Code, w.Body.String())
+			}
+		}
+		if data, err := os.ReadFile(filepath.Join(root, "private", "item")); err != nil || string(data) != "hidden" {
+			t.Fatal("protected source changed", err)
+		}
+	})
 }
 
 type cancelInput struct {

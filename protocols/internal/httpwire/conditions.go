@@ -14,6 +14,15 @@ type Conditions struct{ When core.Condition }
 
 // ParseConditions owns HTTP syntax and precedence, not file observations.
 func ParseConditions(h http.Header) (Conditions, error) {
+	return parseConditions(h, ParseValidator)
+}
+
+// ParseRawConditions preserves native ETags without interpreting an HTTP API envelope.
+func ParseRawConditions(h http.Header) (Conditions, error) {
+	return parseConditions(h, rawValidator)
+}
+
+func parseConditions(h http.Header, parseValidator func(string) (core.Validator, error)) (Conditions, error) {
 	if len(h.Values("If")) != 0 ||
 		len(h.Values("If-Modified-Since")) != 0 && len(h.Values("If-None-Match")) == 0 ||
 		len(h.Values("If-Unmodified-Since")) != 0 && len(h.Values("If-Match")) == 0 {
@@ -49,7 +58,7 @@ func ParseConditions(h http.Header) (Conditions, error) {
 				return Conditions{}, core.Fail(core.InvalidRequest, nil)
 			}
 			end += start + 1
-			tag, err := ParseValidator(raw[:end])
+			tag, err := parseValidator(raw[:end])
 			if err != nil {
 				return Conditions{}, err
 			}
@@ -88,10 +97,18 @@ func WireValidator(v core.Validator) string {
 	}
 	return prefix + `"mw.` + base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(len(v.Domain))+":"+v.Domain+strings.TrimPrefix(v.Tag, "W/"))) + `"`
 }
-func ParseValidator(tag string) (core.Validator, error) {
+func rawValidator(tag string) (core.Validator, error) {
 	v := core.Validator{Tag: tag}
 	if !v.Valid() {
 		return v, core.Fail(core.InvalidRequest, nil)
+	}
+	return v, nil
+}
+
+func ParseValidator(tag string) (core.Validator, error) {
+	v, err := rawValidator(tag)
+	if err != nil {
+		return v, err
 	}
 	raw := strings.TrimPrefix(tag, "W/")
 	if !strings.HasPrefix(raw, `"mw.`) {

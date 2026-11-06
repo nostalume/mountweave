@@ -38,30 +38,29 @@ func treeEntry(e core.Entry) entryView {
 }
 
 type Handler struct {
-	core          *core.Core
-	verify        Verifier
-	cursorTTL     time.Duration
-	OnStreamError func(string, error)
-	options       Options
-	files, kinds  map[string]TaskKind
-	jobKinds      map[string]TaskKind
-	jobs          map[string]JobSource
-	tasks         taskIndex
-	failed        []failedTask
-	life          sync.Mutex
-	closed        bool
-	requests      sync.WaitGroup
-	closeOnce     sync.Once
-	closeDone     chan struct{}
+	core         *core.Core
+	verify       Verifier
+	cursorTTL    time.Duration
+	options      Options
+	files, kinds map[string]TaskKind
+	jobKinds     map[string]TaskKind
+	jobs         map[string]JobSource
+	tasks        taskIndex
+	failed       []failedTask
+	life         sync.Mutex
+	closed       bool
+	requests     sync.WaitGroup
+	closeOnce    sync.Once
+	closeDone    chan struct{}
 }
 
-func New(c *core.Core, verify Verifier, cursorTTL time.Duration, options ...Options) (*Handler, error) {
-	if c == nil || verify == nil || cursorTTL <= 0 {
-		return nil, errors.New("a core, bearer verifier, and positive cursor lifetime are required")
+func New(c *core.Core, options Options) (*Handler, error) {
+	if c == nil || options.Authenticate == nil || options.CursorTTL <= 0 {
+		return nil, core.Fail(core.InvalidRequest, nil)
 	}
-	h := &Handler{core: c, verify: verify, cursorTTL: cursorTTL}
-	if err := h.configure(options); err != nil {
-		return nil, err
+	h := &Handler{core: c, verify: options.Authenticate, cursorTTL: options.CursorTTL, options: options}
+	if err := h.configure(); err != nil {
+		return nil, core.Fail(core.InvalidRequest, err)
 	}
 	return h, nil
 }
@@ -373,8 +372,8 @@ func (h *Handler) content(w http.ResponseWriter, r *http.Request, id string, pri
 	closeErr := opened.Body.Close()
 	err = errors.Join(copyErr, closeErr)
 	if err != nil {
-		if h.OnStreamError != nil {
-			h.OnStreamError(id, err)
+		if h.options.OnStreamError != nil {
+			h.options.OnStreamError(id, err)
 		}
 		panic(http.ErrAbortHandler)
 	}

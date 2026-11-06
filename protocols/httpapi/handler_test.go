@@ -66,7 +66,7 @@ func assemble(root string) (*core.Core, http.Handler, error) {
 		_ = d.Close()
 		return nil, nil, err
 	}
-	h, err := httpapi.New(c, func(ctx context.Context, token string) (core.Principal, error) {
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: func(ctx context.Context, token string) (core.Principal, error) {
 		switch token {
 		case "read-token":
 			return "reader", nil
@@ -76,7 +76,7 @@ func assemble(root string) (*core.Core, http.Handler, error) {
 			return "denied", nil
 		}
 		return "", errors.New("invalid token")
-	}, time.Minute)
+	}, CursorTTL: time.Minute})
 	return c, h, err
 }
 func request(t *testing.T, h http.Handler, method, target, token string, headers map[string]string, bodies ...io.Reader) *httptest.ResponseRecorder {
@@ -366,12 +366,12 @@ func TestCommittedShortReadAbortsTransfer(t *testing.T) {
 	if _, err = c.Install("/broken", &shortDriver{}); err != nil {
 		t.Fatal(err)
 	}
-	h, err := httpapi.New(c, func(context.Context, string) (core.Principal, error) { return "reader", nil }, time.Minute)
+	observed := make(chan error, 1)
+	h, err := httpapi.New(c, httpapi.Options{Authenticate: func(context.Context, string) (core.Principal, error) { return "reader", nil }, CursorTTL: time.Minute, OnStreamError: func(_ string, err error) { observed <- err }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed := make(chan error, 1)
-	h.OnStreamError = func(_ string, err error) { observed <- err }
+
 	server := httptest.NewServer(h)
 	defer server.Close()
 	defer c.Close(context.Background())
@@ -402,7 +402,7 @@ func TestCommittedShortReadAbortsTransfer(t *testing.T) {
 }
 func TestMissingVerifierFailsClosed(t *testing.T) {
 	c, _, _ := setup(t)
-	if _, err := httpapi.New(c, nil, time.Minute); err == nil {
+	if _, err := httpapi.New(c, httpapi.Options{Authenticate: nil, CursorTTL: time.Minute}); err == nil {
 		t.Fatal("accepted a missing verifier")
 	}
 }

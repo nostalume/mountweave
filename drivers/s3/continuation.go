@@ -24,6 +24,7 @@ type resumeBinding struct {
 type uploadState struct {
 	Phase, Token, UploadID string
 	Parts                  map[int]string
+	Evidence               core.Evidence
 }
 
 func resumeError(message string) error { return core.Fail(core.UpstreamFailure, errors.New(message)) }
@@ -65,7 +66,10 @@ func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source
 		return result, err
 	}
 	save := func(saveCtx context.Context) error {
-		record := uploadRecord{Version: 3, Kind: "phase", Phase: state.Phase, UploadID: state.UploadID}
+		record := uploadRecord{Version: 4, Kind: "phase", Phase: state.Phase, UploadID: state.UploadID}
+		if state.Phase == "done" {
+			record.Evidence = &state.Evidence
+		}
 		if state.Phase == "initializing" {
 			record.Kind = "start"
 			record.Binding = &binding
@@ -75,7 +79,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source
 	}
 	acknowledged := context.WithoutCancel(ctx)
 	if state.Phase == "done" {
-		return core.Change{Effect: core.Applied}, nil
+		return core.Change{Effect: core.Applied, Evidence: state.Evidence}, nil
 	}
 	if state.Phase == "aborted" {
 		if c.Abort {
@@ -87,9 +91,11 @@ func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source
 		// NoSuchUpload or a missing/different object does not distinguish a lost
 		// completion from a subsequent replacement/deletion. Never replay blindly.
 		out, e := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key)})
-		if e == nil && out.Metadata["mountweave-upload"] == state.Token && out.ContentLength != nil && *out.ContentLength == length && aws.ToString(out.ETag) != "" {
-			state.Phase = "done"
-			return core.Change{Effect: core.Applied, Evidence: evidence(out.ETag, out.VersionId)}, save(acknowledged)
+		if e == nil && out.Metadata["mountweave-upload"] == state.Token && out.ContentLength != nil && *out.ContentLength == length {
+			if observed := evidence(out.ETag, out.VersionId); observed.Validator.Valid() {
+				state.Phase, state.Evidence = "done", observed
+				return core.Change{Effect: core.Applied, Evidence: observed}, save(acknowledged)
+			}
 		}
 		return core.Change{Effect: core.Unknown}, errors.Join(resumeError("multipart publication is unresolved"), translate(e))
 	}
@@ -209,7 +215,7 @@ func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source
 			checkpointMu.Lock()
 			defer checkpointMu.Unlock()
 			state.Parts[n] = tag
-			return appendUpload(context.WithoutCancel(partCtx), c.Append, uploadRecord{Version: 3, Kind: "part", Part: n, ETag: tag})
+			return appendUpload(context.WithoutCancel(partCtx), c.Append, uploadRecord{Version: 4, Kind: "part", Part: n, ETag: tag})
 		})
 		err = errors.Join(inputError(err), reader.Close())
 		if err != nil {
@@ -247,11 +253,12 @@ func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source
 		}
 		return core.Change{Effect: core.Unknown}, translate(e)
 	}
-	if aws.ToString(ack.ETag) == "" {
+	state.Evidence = evidence(ack.ETag, ack.VersionId)
+	if !state.Evidence.Validator.Valid() {
 		return core.Change{Effect: core.Unknown}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	state.Phase = "done"
-	return core.Change{Effect: core.Applied, Evidence: evidence(ack.ETag, ack.VersionId)}, save(acknowledged)
+	return core.Change{Effect: core.Applied, Evidence: state.Evidence}, save(acknowledged)
 }
 
 // missingInput concatenates only missing native ranges for the existing bounded

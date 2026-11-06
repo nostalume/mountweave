@@ -60,6 +60,9 @@ func (d *Driver) Remove(ctx context.Context, p core.NativeAddress, policies ...c
 	if len(policies) == 1 {
 		policy = policies[0]
 	}
+	if policy.Target != "" {
+		return u, core.Fail(core.UnsupportedOperation, nil)
+	}
 	var match, none *string
 	var conditionErr error
 	if policy.When.IsPresent() {
@@ -84,6 +87,9 @@ func (d *Driver) Remove(ctx context.Context, p core.NativeAddress, policies ...c
 		meta, err = d.statKey(ctx, d.key(p), name(p))
 	}
 	if err != nil {
+		if p.Namespace() == core.KeyNamespace && core.CodeOf(err) == core.NotFound {
+			u.Before = core.TargetMissing
+		}
 		return u, err
 	}
 	// Prefix membership is independent of the marker object: S3 has no native
