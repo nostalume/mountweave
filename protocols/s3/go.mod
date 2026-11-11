@@ -5,8 +5,8 @@ go 1.24.0
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.6
-	github.com/nostalume/mountweave v0.1.0
-	github.com/nostalume/mountweave/drivers/s3 v0.1.0
+	github.com/nostalume/mountweave v0.2.0
+	github.com/nostalume/mountweave/drivers/s3 v0.2.0
 	go.etcd.io/bbolt v1.4.3
 )
 

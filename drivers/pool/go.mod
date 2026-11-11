@@ -4,8 +4,8 @@ go 1.24.0
 
 require (
 	github.com/klauspost/reedsolomon v1.13.3
+	github.com/nostalume/mountweave v0.2.0
 	go.etcd.io/bbolt v1.4.3
-	github.com/nostalume/mountweave v0.1.0
 )
 
 require (

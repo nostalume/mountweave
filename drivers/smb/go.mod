@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/hirochachacha/go-smb2/v2 v2.0.0-20261011164520-7f69f6587832
-	github.com/nostalume/mountweave v0.1.0
+	github.com/nostalume/mountweave v0.2.0
 	github.com/sonroyaalmerol/go-smb-server v0.2.0
 )
 
