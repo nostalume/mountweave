@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            test-flag: -race
+          - os: windows-2025
+            test-flag: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      GOWORK: 'off'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: |
+            **/go.mod
+            **/go.sum
+      - name: Test and vet tracked modules
+        shell: bash
+        env:
+          TEST_FLAG: ${{ matrix.test-flag }}
+        run: |
+          modules=$(git ls-files -- 'go.mod' ':(glob)**/go.mod')
+          test_flags=(-count=1 -v)
+          if [[ -n "$TEST_FLAG" ]]; then
+            test_flags+=("$TEST_FLAG")
+          fi
+          while IFS= read -r mod; do
+            dir=$(dirname "$mod")
+            printf '::group::%s\n' "$dir"
+            go -C "$dir" test "${test_flags[@]}" ./...
+            go -C "$dir" vet ./...
+            echo '::endgroup::'
+          done <<< "$modules"

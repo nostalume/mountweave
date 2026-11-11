@@ -35,6 +35,10 @@ effects. For an injected fault, check the error, effect and resource cleanup.
 Retire a duplicate case when a surviving test detects the same fault and
 checks the same effects. Record the setup when reporting a benchmark.
 
+## Prepare a module release
+
+Use the batch tool to plan and verify candidate versions. [Release guide](docs/releases.md)
+
 ## Prepare a contribution
 
 - Keep optional dependencies in the modules that use them.
