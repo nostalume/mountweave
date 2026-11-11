@@ -20,7 +20,7 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	}
 	p := pAddress.Value()
 
-	return d.write(ctx, p, input, length, core.PublicationOptions{When: core.IfAbsent()})
+	return d.write(ctx, p, input, length, core.PublicationOptions{When: core.IfAbsent()}, core.Validator{})
 }
 func (d *Driver) Publish(ctx context.Context, pAddress core.NativeAddress, input io.Reader, length *int64, options core.PublicationOptions) (core.Change, error) {
 	if pAddress.Namespace() != core.TreeNamespace {
@@ -29,12 +29,19 @@ func (d *Driver) Publish(ctx context.Context, pAddress core.NativeAddress, input
 	}
 	p := pAddress.Value()
 
-	return d.write(ctx, p, input, length, options)
+	return d.write(ctx, p, input, length, options, core.Validator{})
+}
+
+func (d *Driver) PublishForMove(ctx context.Context, p core.NativeAddress, parent core.Validator, input io.Reader, length *int64) (core.Change, error) {
+	if p.Namespace() != core.TreeNamespace || parent == (core.Validator{}) {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	return d.write(ctx, p.Value(), input, length, core.PublicationOptions{When: core.IfAbsent()}, parent)
 }
 
 // The parent identity is captured before input. The final name is resolved in
 // that same directory, even after a rename; an unlinked parent cannot publish.
-func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *int64, options core.PublicationOptions) (result core.Change, err error) {
+func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *int64, options core.PublicationOptions, expected core.Validator) (result core.Change, err error) {
 	replace := !options.When.IsAbsent()
 	if err := options.When.ForDomain("pool-generation"); err != nil {
 		return core.Change{Effect: core.Unchanged}, err
@@ -62,6 +69,9 @@ func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *i
 		parent, name, e = parentAt(tx, p)
 		if e != nil {
 			return e
+		}
+		if expected != (core.Validator{}) && expected != directoryValidator(parent) {
+			return core.Fail(core.PreconditionFailed, nil)
 		}
 		if raw := tx.Bucket(entriesKey).Get(entryKey(parent, name)); raw != nil {
 			var old entryRecord
@@ -152,6 +162,15 @@ func (d *Driver) write(ctx context.Context, p string, input io.Reader, length *i
 	}
 	before := core.TargetUnknown
 	result, err = d.commit(o.ctx, func(tx *bolt.Tx) error {
+		if expected != (core.Validator{}) {
+			current, _, err := parentAt(tx, p)
+			if err != nil {
+				return err
+			}
+			if current != parent {
+				return core.Fail(core.PreconditionFailed, nil)
+			}
+		}
 		if tx.Bucket(dirsKey).Get([]byte(parent)) == nil {
 			return core.Fail(core.NotFound, nil)
 		}

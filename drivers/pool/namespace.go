@@ -141,6 +141,16 @@ func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selectio
 	return
 }
 func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.Change, error) {
+	change, err := d.MkdirForMove(ctx, pAddress, core.Validator{})
+	change.Evidence = core.Evidence{}
+	return change, err
+}
+
+func directoryValidator(id string) core.Validator {
+	return core.Validator{Domain: "pool-directory", Tag: `"` + id + `"`}
+}
+
+func (d *Driver) MkdirForMove(ctx context.Context, pAddress core.NativeAddress, expected core.Validator) (core.Change, error) {
 	if pAddress.Namespace() != core.TreeNamespace {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -154,22 +164,38 @@ func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.C
 		return core.Change{Effect: core.Unchanged}, err
 	}
 	defer o.finish()
-	return d.commit(o.ctx, func(tx *bolt.Tx) error {
+	e := entryRecord{ID: rand.Text(), Directory: true}
+	change, err := d.commit(o.ctx, func(tx *bolt.Tx) error {
 		parent, name, err := parentAt(tx, p)
 		if err != nil {
 			return err
+		}
+		if expected != (core.Validator{}) && expected != directoryValidator(parent) {
+			return core.Fail(core.PreconditionFailed, nil)
 		}
 		key := entryKey(parent, name)
 		if tx.Bucket(entriesKey).Get(key) != nil {
 			return core.Fail(core.AlreadyExists, nil)
 		}
-		e := entryRecord{ID: rand.Text(), Directory: true}
 		if err := tx.Bucket(dirsKey).Put([]byte(e.ID), []byte(parent)); err != nil {
 			return err
 		}
 		return tx.Bucket(entriesKey).Put(key, encode(e))
 	})
+	if change.Effect == core.Applied {
+		change.Evidence.Validator = directoryValidator(e.ID)
+	}
+	return change, err
 }
+
+func (d *Driver) MoveFileValidator(p core.NativeAddress, evidence core.Evidence) (core.Validator, error) {
+	if p.Namespace() != core.TreeNamespace || evidence.Version == "" ||
+		evidence.Validator != (core.Validator{Domain: "pool-generation", Tag: `"` + string(evidence.Version) + `"`}) {
+		return core.Validator{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	return evidence.Validator, nil
+}
+
 func unlink(tx *bolt.Tx, parent, name string, options core.RemoveOptions) error {
 	if tx.Bucket(dirsKey).Get([]byte(parent)) == nil {
 		return core.Fail(core.NotFound, nil)
@@ -190,7 +216,11 @@ func unlink(tx *bolt.Tx, parent, name string, options core.RemoveOptions) error 
 		return core.Fail(core.NotDirectory, nil)
 	}
 	if !options.When.Empty() {
-		if err := options.When.Check(metadata(name, e, fileRecord{ID: e.Generation}).Evidence, true); err != nil {
+		evidence := metadata(name, e, fileRecord{ID: e.Generation}).Evidence
+		if e.Directory && options.When.Domain() == "pool-directory" {
+			evidence.Validator = directoryValidator(e.ID)
+		}
+		if err := options.When.Check(evidence, true); err != nil {
 			return err
 		}
 	}
@@ -219,7 +249,11 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 	if policy.Target != "" && policy.Target != core.RemoveNonDirectory && policy.Target != core.RemoveEmptyDirectory {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
 	}
-	if err := policy.When.ForDomain("pool-generation"); err != nil {
+	domain := "pool-generation"
+	if policy.Target == core.RemoveEmptyDirectory && policy.When.Domain() == "pool-directory" {
+		domain = "pool-directory"
+	}
+	if err := policy.When.ForDomain(domain); err != nil {
 		return core.Change{Effect: core.Unchanged}, err
 	}
 	if pAddress.Namespace() != core.TreeNamespace {
@@ -479,6 +513,8 @@ func (i *iterator) OpenFile(ctx context.Context, name string) (core.Opened, erro
 		return e, err
 	})
 }
+func (i *iterator) DirectoryValidator() core.Validator { return directoryValidator(i.parent) }
+
 func (i *iterator) RemoveChild(ctx context.Context, name string, options core.RemoveOptions) (core.Change, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -506,3 +542,6 @@ var _ core.Remover = (*Driver)(nil)
 var _ core.Relocator = (*Driver)(nil)
 var _ core.DirectoryReader = (*Driver)(nil)
 var _ core.ChildRemover = (*iterator)(nil)
+var _ core.MoveSource = (*Driver)(nil)
+var _ core.MoveDirectoryWriter = (*Driver)(nil)
+var _ core.DirectoryIdentity = (*iterator)(nil)
