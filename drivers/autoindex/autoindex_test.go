@@ -78,10 +78,10 @@ func TestRootedJSONDirectory(t *testing.T) {
 				fmt.Fprint(w, "[{\"name\":\"\xff\",\"type\":\"file\",\"size\":1}]")
 				return
 			case "duplicate":
-				fmt.Fprint(w, "["+entry+","+entry+"]")
+				io.WriteString(w, "["+entry+","+entry+"]")
 				return
 			}
-			fmt.Fprint(w, "["+entry+"]")
+			io.WriteString(w, "["+entry+"]")
 		case file:
 			contents.Add(1)
 			switch mode.Load() {
