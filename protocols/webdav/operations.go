@@ -111,7 +111,7 @@ func (h *Handler) manage(w http.ResponseWriter, r *http.Request, p core.Principa
 		h.treeResponse(w, r, source, target, result, err, overwrite == "F")
 		return
 	}
-	result, err := h.files.Move(r.Context(), p, source, target, core.MoveOptions{Source: conditions.When, Existing: existing, Tree: h.options.Tree})
+	result, err := h.files.Move(r.Context(), p, source, target, core.MoveOptions{Source: conditions.When, Existing: existing, Tree: h.options.Tree, NoCopy: true})
 	if err != nil {
 		if result.Removed != nil && len(result.Removed.Items) != 0 {
 			rows := result.Removed.Items

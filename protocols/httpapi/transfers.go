@@ -52,7 +52,7 @@ func TransferJobs(s *transfer.Service) (JobSource, error) {
 	if s == nil || !s.SupportsListing() {
 		return JobSource{}, errors.New("transfer job discovery requires a metadata lister")
 	}
-	source := JobSource{Kind: "transfer", Version: 1,
+	source := JobSource{Kind: "transfer", Version: 2,
 		Create: func(ctx context.Context, p core.Principal, id string, raw json.RawMessage) (JobView, error) {
 			var i transferInput
 			if err := decode(raw, &i); err != nil {
@@ -64,11 +64,14 @@ func TransferJobs(s *transfer.Service) (JobSource, error) {
 			if i.Policy != nil && i.Replace != nil {
 				return JobView{}, core.Fail(core.InvalidRequest, nil)
 			}
-			policy := core.Publish(core.IfAbsent())
+			var policy core.WritePolicy
 			if i.Policy != nil {
 				policy = *i.Policy
-			} else if i.Replace != nil && *i.Replace {
-				policy = core.Publish()
+			} else if i.Replace != nil {
+				policy = core.Publish(core.IfAbsent())
+				if *i.Replace {
+					policy = core.Publish()
+				}
 			}
 			var address core.Address
 			if i.Target.Address != nil {

@@ -236,57 +236,41 @@ func TestCloseWaitsForRefreshAcknowledgement(t *testing.T) {
 	}
 }
 
-func TestExpiredRefreshResultIsSavedBeforeFailingAccess(t *testing.T) {
-	var saved credential.Token
-	source, err := credential.New(credential.Record{Token: credential.Token{Refresh: "old"}}, func(context.Context, string) (credential.Token, error) {
-		token := fresh()
-		token.ExpiresAt = time.Now().Add(-time.Minute)
-		return token, nil
-	}, func(_ context.Context, record credential.Record) error {
-		if record.Pending {
-			return nil
-		}
-		token := record.Token
-		saved = token
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = source.Access(context.Background())
-	if !errors.Is(err, credential.ErrUnusableAccess) || saved.Refresh != "new-refresh" {
-		t.Fatal("known rotated token was discarded")
-	}
-	if err = source.Close(); err != nil {
-		t.Fatal("completed durable rotation was confused with unfinished cleanup", err)
-	}
-}
-func TestKnownRotationSurvivesAssociatedFailure(t *testing.T) {
+func TestKnownRotationSurvivesAccessFailure(t *testing.T) {
 	issue := errors.New("response cleanup failed")
-	var saved credential.Token
-	source, err := credential.New(credential.Record{Token: credential.Token{Refresh: "old"}}, func(context.Context, string) (credential.Token, error) {
-		token := fresh()
-		token.ExpiresAt = time.Now().Add(-time.Minute)
-		return token, issue
-	}, func(_ context.Context, record credential.Record) error {
-		if record.Pending {
-			return nil
-		}
-		token := record.Token
-		saved = token
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = source.Access(context.Background())
-	if !errors.Is(err, issue) || saved.Refresh != "new-refresh" {
-		t.Fatal("known rotation was discarded on associated failure")
-	}
-	if err = source.Close(); !errors.Is(err, issue) {
-		t.Fatal("unfinished cleanup was discarded", err)
+	for _, tc := range []struct {
+		name                            string
+		refreshErr, accessErr, closeErr error
+	}{
+		{"expired", nil, credential.ErrUnusableAccess, nil},
+		{"cleanup-failed", issue, issue, issue},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var saved credential.Token
+			source, err := credential.New(credential.Record{Token: credential.Token{Refresh: "old"}}, func(context.Context, string) (credential.Token, error) {
+				token := fresh()
+				token.ExpiresAt = time.Now().Add(-time.Minute)
+				return token, tc.refreshErr
+			}, func(_ context.Context, record credential.Record) error {
+				if !record.Pending {
+					saved = record.Token
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = source.Access(context.Background())
+			if !errors.Is(err, tc.accessErr) || saved.Refresh != "new-refresh" {
+				t.Fatal("known rotated token was discarded", err)
+			}
+			if err = source.Close(); !errors.Is(err, tc.closeErr) {
+				t.Fatal("close lost the rotation outcome", err)
+			}
+		})
 	}
 }
+
 func TestSaveRecoveryDoesNotClearAssociatedRefreshFailure(t *testing.T) {
 	issue := errors.New("response cleanup unfinished")
 	saves := 0

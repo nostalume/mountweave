@@ -1,7 +1,6 @@
 package s3
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -18,247 +17,308 @@ import (
 type resumeBinding struct {
 	Scope, Bucket, Key, Source string
 	Length, PartSize           int64
-	Replace                    bool           `json:",omitempty"` // Decode version-2 checkpoints only.
-	When                       core.Condition `json:",omitzero"`
+	Replace                    bool              `json:",omitempty"` // Decode version-2 checkpoints only.
+	When                       core.Condition    `json:",omitzero"`  // Decode version-3/4 checkpoints only.
+	Policy                     *core.WritePolicy `json:"policy,omitempty"`
 }
+
 type uploadState struct {
 	Phase, Token, UploadID string
-	Parts                  map[int]string
+	Parts                  []types.CompletedPart
+	Confirmed              int
 	Evidence               core.Evidence
+}
+
+func (s *uploadState) acknowledge(number int, tag *string) {
+	if number > len(s.Parts) {
+		s.Parts = append(s.Parts, make([]types.CompletedPart, number-len(s.Parts))...)
+	}
+	if s.Parts[number-1].ETag == nil {
+		s.Confirmed++
+	}
+	s.Parts[number-1] = types.CompletedPart{ETag: tag, PartNumber: aws.Int32(int32(number))}
 }
 
 func resumeError(message string) error { return core.Fail(core.UpstreamFailure, errors.New(message)) }
 
-// ContinueWrite retains native uploads on cancellation/failure. The protected
-// checkpoint consumer owns them after return; ordinary PendingUploads/Cleanup
-// never aborts these independently owned sessions. No credentials/URLs are saved.
-func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source core.Replayable, length int64, options core.PublicationOptions, c core.WriteContinuation) (result core.Change, err error) {
-	result.Effect = core.Unchanged
-	// Observation for
-	// a new HTTP response is not reconstructed from a durable prior attempt.
+// ContinueWrite uses the same native multipart flow as ordinary buffered writes.
+// The protected checkpoint consumer owns retained sessions; ordinary Cleanup does
+// not abort them. Direct creation retains its policy and never overwrites.
+func (d *Driver) ContinueWrite(ctx context.Context, p core.NativeAddress, source core.Replayable, length int64, options core.WriteOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
 	if options.ObserveTarget {
-		return result, core.Fail(core.UnsupportedOperation, nil)
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
 	}
-	match, none, err := nativeCondition(options.When, false)
+	if err := options.Policy.Validate(); err != nil {
+		return unchanged, err
+	}
+	when := options.Policy.When()
+	if !options.Policy.Complete() {
+		when = core.IfAbsent()
+	}
+	match, none, err := nativeCondition(when, false)
 	if err != nil {
-		return result, err
+		return unchanged, err
 	}
 	if d.buffer == nil || d.opts.ResumeScope == "" {
-		return result, core.Fail(core.UnsupportedOperation, nil)
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
 	}
-	if length < 0 || source == nil || source.SourceVersion() == "" || c.Append == nil {
-		return result, core.Fail(core.InvalidRequest, nil)
+	c := options.Continuation
+	if length < 0 || source == nil || source.SourceVersion() == "" || c == nil || c.Append == nil {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
 	}
-	if err = d.target(ctx, p); err != nil {
-		return
+	if err := d.target(ctx, p); err != nil {
+		return unchanged, err
 	}
-	count := length / d.opts.PartSize
-	if length%d.opts.PartSize != 0 {
+	count := partsFor(length, d.opts.PartSize)
+	if count > 10000 {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	policy := options.Policy
+	binding := resumeBinding{Scope: d.opts.ResumeScope, Bucket: d.bucket, Key: d.key(p), Source: source.SourceVersion(), Length: length, PartSize: d.opts.PartSize, Policy: &policy}
+	state, err := restoreUpload(c.Checkpoint, binding, count)
+	if err != nil {
+		return unchanged, err
+	}
+	write := multipartWrite{driver: d, key: binding.Key, when: when, match: match, none: none, state: state, binding: binding, continuation: c}
+	return write.run(ctx, p, source, &length)
+}
+
+func partsFor(length, size int64) int {
+	count := length / size
+	if length%size != 0 {
 		count++
 	}
-	if count > 10000 {
-		return result, core.Fail(core.UnsupportedOperation, nil)
+	// The native limit is checked before converting a count to int.
+	return int(min(max(count, 1), 10001))
+}
+
+// multipartWrite owns one native attempt. Its source and buffers remain borrowed;
+// only the optional recorder changes who owns the session after an attempt ends.
+type multipartWrite struct {
+	driver       *Driver
+	key          string
+	when         core.Condition
+	match, none  *string
+	state        uploadState
+	binding      resumeBinding
+	continuation *core.WriteContinuation
+}
+
+func (w *multipartWrite) save(ctx context.Context) error {
+	if w.continuation == nil {
+		return nil
 	}
-	count = max(count, 1)
-	binding := resumeBinding{Scope: d.opts.ResumeScope, Bucket: d.bucket, Key: d.key(p), Source: source.SourceVersion(), Length: length, PartSize: d.opts.PartSize, When: options.When}
-	state, err := restoreUpload(c.Checkpoint, binding, int(count))
-	if err != nil {
-		return result, err
+	record := uploadRecord{Version: 5, Kind: "phase", Phase: w.state.Phase, UploadID: w.state.UploadID}
+	if w.state.Phase == "done" {
+		record.Evidence = &w.state.Evidence
 	}
-	save := func(saveCtx context.Context) error {
-		record := uploadRecord{Version: 4, Kind: "phase", Phase: state.Phase, UploadID: state.UploadID}
-		if state.Phase == "done" {
-			record.Evidence = &state.Evidence
-		}
-		if state.Phase == "initializing" {
-			record.Kind = "start"
-			record.Binding = &binding
-			record.Token = state.Token
-		}
-		return appendUpload(saveCtx, c.Append, record)
+	if w.state.Phase == "initializing" {
+		record.Kind, record.Binding, record.Token = "start", &w.binding, w.state.Token
 	}
+	return appendUpload(ctx, w.continuation.Append, record)
+}
+
+func (w *multipartWrite) run(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64) (result core.Change, err error) {
+	result.Effect = core.Unchanged
+	d := w.driver
+	durable := w.continuation != nil
 	acknowledged := context.WithoutCancel(ctx)
-	if state.Phase == "done" {
-		return core.Change{Effect: core.Applied, Evidence: state.Evidence}, nil
+	count := 0
+	if length != nil {
+		count = partsFor(*length, d.opts.PartSize)
 	}
-	if state.Phase == "aborted" {
-		if c.Abort {
-			return result, nil
-		}
-		return result, core.Fail(core.InvalidRequest, errors.New("upload intent was aborted"))
-	}
-	if state.Phase == "committing" {
-		// NoSuchUpload or a missing/different object does not distinguish a lost
-		// completion from a subsequent replacement/deletion. Never replay blindly.
-		out, e := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key)})
-		if e == nil && out.Metadata["mountweave-upload"] == state.Token && out.ContentLength != nil && *out.ContentLength == length {
-			if observed := evidence(out.ETag, out.VersionId); observed.Validator.Valid() {
-				state.Phase, state.Evidence = "done", observed
-				return core.Change{Effect: core.Applied, Evidence: observed}, save(acknowledged)
+	if durable {
+		switch w.state.Phase {
+		case "done":
+			return core.Change{Effect: core.Applied, Evidence: w.state.Evidence}, nil
+		case "aborted":
+			if w.continuation.Abort {
+				return result, nil
 			}
+			return result, core.Fail(core.InvalidRequest, errors.New("upload intent was aborted"))
+		case "committing":
+			// Missing/different content cannot disprove a prior publication.
+			out, e := d.client.HeadObject(ctx, &sdk.HeadObjectInput{Bucket: aws.String(d.bucket), Key: aws.String(w.key)})
+			if e == nil && out.Metadata["mountweave-upload"] == w.state.Token && out.ContentLength != nil && *out.ContentLength == *length {
+				if observed := evidence(out.ETag, out.VersionId); observed.Validator.Valid() {
+					w.state.Phase, w.state.Evidence = "done", observed
+					return core.Change{Effect: core.Applied, Evidence: observed}, w.save(acknowledged)
+				}
+			}
+			return core.Change{Effect: core.Unknown}, errors.Join(resumeError("multipart publication is unresolved"), translate(e))
+		case "initializing":
+			return result, resumeError("multipart initiation is unresolved")
 		}
-		return core.Change{Effect: core.Unknown}, errors.Join(resumeError("multipart publication is unresolved"), translate(e))
-	}
-	if state.Phase == "initializing" {
-		return result, resumeError("multipart initiation is unresolved")
-	}
-	if state.Phase != "" && state.Phase != "uploading" && state.Phase != "aborting" {
-		return result, core.Fail(core.InvalidRequest, nil)
-	}
-	if state.Phase != "" && state.UploadID == "" {
-		return result, core.Fail(core.InvalidRequest, nil)
-	}
-	if state.Phase == "aborting" && !c.Abort {
-		return result, resumeError("upload retirement requires Abort")
-	}
-	if c.Abort || state.Phase == "aborting" {
-		if state.Phase == "" {
-			return result, nil
+		if w.state.Phase == "aborting" && !w.continuation.Abort {
+			return result, resumeError("upload retirement requires Abort")
 		}
-		if state.Phase != "aborting" {
-			state.Phase = "aborting"
-			if err = save(ctx); err != nil {
+		if w.continuation.Abort || w.state.Phase == "aborting" {
+			if w.state.Phase == "" {
+				return result, nil
+			}
+			if w.state.Phase != "aborting" {
+				w.state.Phase = "aborting"
+				if err = w.save(ctx); err != nil {
+					return
+				}
+			}
+			if err = d.cancelMultipart(ctx, w.key, w.state.UploadID, true); err != nil {
 				return
 			}
+			w.state.Phase = "aborted"
+			return result, w.save(acknowledged)
 		}
-		if err = ctx.Err(); err != nil {
-			return
+		if directory, e := d.directoryAt(ctx, p); e != nil {
+			return result, e
+		} else if directory {
+			return result, core.Fail(core.NotFile, nil)
 		}
-		_, abortErr := d.client.AbortMultipartUpload(ctx, &sdk.AbortMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), UploadId: aws.String(state.UploadID)}, noReplay)
-		_, listErr := d.client.ListParts(ctx, &sdk.ListPartsInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), UploadId: aws.String(state.UploadID), MaxParts: aws.Int32(1)})
-		if listErr == nil || core.CodeOf(translate(listErr)) != core.NotFound {
-			return result, errors.Join(resumeError("multipart retirement is unresolved"), translate(abortErr), translate(listErr))
-		}
-		state.Phase = "aborted"
-		return result, save(acknowledged)
-	}
-	// Recheck the ordinary namespace before creating/sending any new native data.
-	if directory, e := d.directoryAt(ctx, p); e != nil {
-		return result, e
-	} else if directory {
-		return result, core.Fail(core.NotFile, nil)
 	}
 	var lease *upload.Lease
-	if missingCount := int(count) - len(state.Parts); missingCount > 0 {
-		var acquireErr error
-		lease, acquireErr = d.buffer.Acquire(ctx, missingCount)
-		if acquireErr != nil {
-			return result, inputError(acquireErr)
+	if !durable || w.state.Confirmed < count {
+		lease, err = d.buffer.Acquire(ctx, d.opts.PartSize, count-w.state.Confirmed)
+		if err != nil {
+			return result, inputError(err)
 		}
 		defer lease.Release()
 	}
-	if state.Phase == "" {
-		state.Phase = "initializing"
-		state.Token = rand.Text()
-		if err = save(ctx); err != nil {
+	if w.state.Phase == "" {
+		w.state.Phase, w.state.Token = "initializing", rand.Text()
+		if err = w.save(ctx); err != nil {
 			return
 		}
 		if err = ctx.Err(); err != nil {
-			state.Phase = ""
-			err = errors.Join(err, save(acknowledged))
-			return
+			w.state.Phase = ""
+			return result, errors.Join(err, w.save(acknowledged))
 		}
-		out, e := d.client.CreateMultipartUpload(ctx, &sdk.CreateMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), Metadata: map[string]string{"mountweave-upload": state.Token}}, noReplay)
+		request := &sdk.CreateMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(w.key)}
+		if durable {
+			request.Metadata = map[string]string{"mountweave-upload": w.state.Token}
+		}
+		out, e := d.client.CreateMultipartUpload(ctx, request, noReplay)
 		if e != nil {
 			var status interface{ HTTPStatusCode() int }
-			if errors.As(e, &status) && status.HTTPStatusCode() >= 400 && status.HTTPStatusCode() < 500 && status.HTTPStatusCode() != 408 {
-				state.Phase = ""
-				return result, errors.Join(translate(e), save(acknowledged))
+			refused := errors.As(e, &status) && status.HTTPStatusCode() >= 400 && status.HTTPStatusCode() < 500 && status.HTTPStatusCode() != 408
+			if refused {
+				w.state.Phase = ""
+				return result, errors.Join(translate(e), w.save(acknowledged))
+			} else if !durable {
+				d.savePending(PendingUpload{ID: w.state.Token, Key: w.key, cause: translate(e)})
 			}
 			return result, translate(e)
 		}
 		if aws.ToString(out.UploadId) == "" {
-			return result, core.Fail(core.InvalidUpstreamResponse, nil)
+			err = core.Fail(core.InvalidUpstreamResponse, nil)
+			if !durable {
+				d.savePending(PendingUpload{ID: w.state.Token, Key: w.key, cause: err})
+			}
+			return
 		}
-		state.UploadID = *out.UploadId
-		state.Phase = "uploading"
-		if err = save(acknowledged); err != nil {
+		w.state.Phase, w.state.UploadID = "uploading", *out.UploadId
+		if err = w.save(acknowledged); err != nil {
 			return
 		}
 	}
-	missing := make([]int, 0, int(count)-len(state.Parts))
-	var remaining int64
-	for n := 1; n <= int(count); n++ {
-		if _, ok := state.Parts[n]; !ok {
-			missing = append(missing, n)
-			remaining += min(d.opts.PartSize, length-int64(n-1)*d.opts.PartSize)
+	intent := PendingUpload{ID: w.state.Token, Key: w.key, UploadID: w.state.UploadID}
+	complete := false
+	defer func() {
+		if durable || complete {
+			return
 		}
-	}
-	if len(missing) > 0 {
-		reader := &missingInput{source: source, ctx: ctx, parts: missing, size: length, partSize: d.opts.PartSize}
-		var checkpointMu sync.Mutex
-		_, _, err = lease.Run(ctx, reader, &remaining, 10000, func(partCtx context.Context, index int, data []byte) error {
-			n := missing[index-1]
-			var tag string
-			var last error
-			for attempt := 0; attempt < d.opts.PartAttempts; attempt++ {
-				if e := partCtx.Err(); e != nil {
-					return e
-				}
-				out, e := d.client.UploadPart(partCtx, &sdk.UploadPartInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), UploadId: aws.String(state.UploadID), PartNumber: aws.Int32(int32(n)), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}, noReplay)
-				if e == nil {
-					tag = aws.ToString(out.ETag)
-					break
-				}
-				last = translate(e)
-				code := core.CodeOf(last)
-				if code != core.UpstreamFailure && code != core.UpstreamTimeout && code != core.UpstreamThrottled {
-					return last
+		d.savePending(intent)
+		cleanup := context.WithoutCancel(ctx)
+		if d.opts.CleanupTimeout > 0 {
+			var cancel context.CancelFunc
+			cleanup, cancel = context.WithTimeout(cleanup, d.opts.CleanupTimeout)
+			defer cancel()
+		}
+		err = errors.Join(err, d.abort(cleanup, intent))
+	}()
+	if lease != nil {
+		var missing []int
+		var ranges *missingInput
+		runLength := length
+		if durable {
+			var remaining int64
+			for n := 1; n <= count; n++ {
+				if n > len(w.state.Parts) || w.state.Parts[n-1].ETag == nil {
+					missing = append(missing, n)
+					remaining += min(d.opts.PartSize, *length-int64(n-1)*d.opts.PartSize)
 				}
 			}
-			if tag == "" {
-				if last != nil {
-					return last
-				}
-				return core.Fail(core.InvalidUpstreamResponse, nil)
+			ranges = &missingInput{source: input.(core.Replayable), ctx: ctx, parts: missing, size: *length, partSize: d.opts.PartSize}
+			input, runLength = ranges, &remaining
+		}
+		var receipts sync.Mutex
+		total, sent, e := lease.Run(ctx, input, runLength, 10000, func(partCtx context.Context, index int, data []byte) error {
+			number := index
+			if durable {
+				number = missing[index-1]
 			}
-			checkpointMu.Lock()
-			defer checkpointMu.Unlock()
-			state.Parts[n] = tag
-			return appendUpload(context.WithoutCancel(partCtx), c.Append, uploadRecord{Version: 4, Kind: "part", Part: n, ETag: tag})
+			tag, e := d.sendPart(partCtx, w.key, w.state.UploadID, number, data)
+			if e != nil {
+				return e
+			}
+			receipts.Lock()
+			defer receipts.Unlock()
+			w.state.acknowledge(number, tag)
+			if durable {
+				return appendUpload(context.WithoutCancel(partCtx), w.continuation.Append, uploadRecord{Version: 5, Kind: "part", Part: number, ETag: *tag})
+			}
+			return nil
 		})
-		err = errors.Join(inputError(err), reader.Close())
-		if err != nil {
-			return
+		intent.Bytes = total
+		if ranges != nil {
+			e = errors.Join(e, ranges.Close())
+		}
+		if e != nil {
+			return result, inputError(e)
+		}
+		if !durable {
+			count = sent
 		}
 	}
-	if err = ctx.Err(); err != nil {
-		return
+	if w.state.Confirmed != count {
+		return result, core.Fail(core.InvalidUpstreamResponse, errors.New("multipart receipts are incomplete"))
 	}
-	receipts := make([]types.CompletedPart, int(count))
-	for n := 1; n <= int(count); n++ {
-		tag := state.Parts[n]
-		if tag == "" {
-			return result, core.Fail(core.InvalidUpstreamResponse, nil)
-		}
-		receipts[n-1] = types.CompletedPart{ETag: aws.String(tag), PartNumber: aws.Int32(int32(n))}
-	}
-	state.Phase = "committing"
-	if err = save(ctx); err != nil {
+	w.state.Phase = "committing"
+	if err = w.save(ctx); err != nil {
 		return
 	}
 	if err = ctx.Err(); err != nil {
-		state.Phase = "uploading"
-		err = errors.Join(err, save(acknowledged))
-		return
+		w.state.Phase = "uploading"
+		return result, errors.Join(err, w.save(acknowledged))
 	}
-	request := &sdk.CompleteMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(binding.Key), UploadId: aws.String(state.UploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: receipts}}
-	request.IfMatch, request.IfNoneMatch = match, none
+	request := &sdk.CompleteMultipartUploadInput{Bucket: aws.String(d.bucket), Key: aws.String(w.key), UploadId: aws.String(w.state.UploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: w.state.Parts}}
+	request.IfMatch, request.IfNoneMatch = w.match, w.none
 	ack, e := d.client.CompleteMultipartUpload(ctx, request, noReplay)
+	result, err = mutationResult(ctx, e, !w.when.Empty())
+	if core.CodeOf(err) == core.AlreadyExists && !w.when.IsAbsent() {
+		err = core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{}, err))
+	}
 	if e != nil {
-		var status interface{ HTTPStatusCode() int }
-		if errors.As(e, &status) && status.HTTPStatusCode() == 412 {
-			state.Phase = "uploading"
-			return result, errors.Join(core.Fail(core.PreconditionFailed, errors.Join(&core.ConditionFailure{Negative: options.When.IsAbsent()}, e)), save(acknowledged))
+		if durable {
+			var status interface{ HTTPStatusCode() int }
+			if errors.As(e, &status) && status.HTTPStatusCode() == 412 {
+				w.state.Phase = "uploading"
+				return result, errors.Join(err, w.save(acknowledged))
+			}
+			result.Effect = core.Unknown
 		}
-		return core.Change{Effect: core.Unknown}, translate(e)
+		return
 	}
-	state.Evidence = evidence(ack.ETag, ack.VersionId)
-	if !state.Evidence.Validator.Valid() {
-		return core.Change{Effect: core.Unknown}, core.Fail(core.InvalidUpstreamResponse, nil)
+	complete = true
+	w.state.Evidence = evidence(ack.ETag, ack.VersionId)
+	result.Evidence = w.state.Evidence
+	if ack.ETag == nil || *ack.ETag == "" || durable && !w.state.Evidence.Validator.Valid() {
+		return core.Change{Effect: core.Unknown}, errors.Join(err, core.Fail(core.InvalidUpstreamResponse, nil))
 	}
-	state.Phase = "done"
-	return core.Change{Effect: core.Applied, Evidence: state.Evidence}, save(acknowledged)
+	w.state.Phase = "done"
+	if w.when.IsAbsent() {
+		result.Before = core.TargetMissing
+	}
+	return result, errors.Join(err, w.save(acknowledged))
 }
 
 // missingInput concatenates only missing native ranges for the existing bounded

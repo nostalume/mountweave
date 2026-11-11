@@ -41,6 +41,10 @@ type DirectoryMaker interface {
 	Mkdir(context.Context, NativeAddress) (Change, error)
 }
 
+// Remover removes one native entry. Tree ancestors must not follow links, and
+// a final link is removed itself. Type and condition constraints must hold at
+// the native effect point; a preceding Stat cannot establish them. Native calls
+// finish before return, and failed cleanup remains owned by the Driver.
 type Remover interface {
 	Remove(context.Context, NativeAddress, ...RemoveOptions) (Change, error)
 }
@@ -124,24 +128,12 @@ func (c *Core) removeUse(u *use, options RemoveOptions, err error) (Change, erro
 	if err != nil {
 		return Change{Effect: Unchanged}, err
 	}
-	if options.Target != "" {
-		if u.namespace != TreeNamespace {
-			u.release()
-			return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)
-		}
-		parent, err := openRemovalDirectory(u, nil)
-		if err != nil {
-			return Change{Effect: Unchanged}, err
-		}
-		change, err := parent.removeChild(u, options)
-		return change, errors.Join(err, parent.close())
-	}
 	defer u.release()
 	remover, ok := u.mount.driver.(Remover)
 	if !ok {
 		return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)
 	}
-	if err = u.ctx.Err(); err != nil {
+	if err := u.ctx.Err(); err != nil {
 		return Change{Effect: Unchanged}, err
 	}
 	result, err := remover.Remove(u.ctx, u.native(), options)

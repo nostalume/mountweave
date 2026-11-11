@@ -7,9 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sync"
 
 	core "github.com/nostalume/mountweave"
+	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
@@ -69,7 +69,7 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	} else if exists {
 		return unchanged, core.Fail(core.AlreadyExists, nil)
 	}
-	lease, err := d.buffer.Acquire(ctx, max(1, int(count)))
+	lease, err := d.buffer.Acquire(ctx, d.opts.PartSize, max(1, int(count)))
 	if err != nil {
 		return unchanged, uploadError(err)
 	}
@@ -142,46 +142,28 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	return change, err
 }
 
-// partBody revokes late transport access before its payload buffer is reused.
-type partBody struct {
-	mu     sync.Mutex
-	reader *bytes.Reader
-}
-
-func (b *partBody) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.reader == nil {
-		return 0, io.ErrClosedPipe
-	}
-	return b.reader.Read(p)
-}
-func (b *partBody) Close() error {
-	b.mu.Lock()
-	b.reader = nil
-	b.mu.Unlock()
-	return nil
-}
-
 func (d *Driver) sendPart(ctx context.Context, target string, data []byte) error {
 	u, err := url.Parse(target)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	// A fresh isolated request never forwards provider bearer credentials.
-	body := &partBody{reader: bytes.NewReader(data)}
+	body := upload.Borrow(data)
 	defer body.Close()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), body)
 	if err != nil {
-		return core.Fail(core.InvalidUpstreamResponse, err)
+		return core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	req.ContentLength = int64(len(data))
 	if len(data) == 0 {
 		req.Body = http.NoBody
 	}
 	response, err := d.client.Do(req)
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
 	if err != nil {
-		return networkError(err)
+		return httpcontent.UpstreamIOError(err)
 	}
 	closeErr := d.closeBody(response.Body)
 	if response.StatusCode != http.StatusOK {

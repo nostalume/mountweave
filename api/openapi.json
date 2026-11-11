@@ -6500,10 +6500,10 @@
               }
             },
             "type": "object",
-            "description": "Positive planning budgets are required when explicit target removal encounters a directory."
+            "description": "Positive planning budgets are required for cross-mount directory moves and when explicit target removal encounters a directory."
           }
         },
-        "description": "Same-mount native relocation. Source and target conditions stay distinct. Explicit replace permits separately receipted target removal, followed by exclusive relocation protecting later peers. The target predicate is consumed at deletion, not reapplied to the deliberately missing target."
+        "description": "Native relocation within a mount. Across mounts, supported Driver pairs publish exclusively before removing the verified source; replacement is unavailable. For native relocation, explicit replace permits separately receipted target removal followed by exclusive relocation. The target predicate is consumed at deletion."
       },
       "RemoveInput": {
         "type": "object",
@@ -7251,7 +7251,7 @@
             }
           }
         ],
-        "description": "One typed file request, used unchanged for synchronous execution or queued delivery. Input syntax and all selected real bindings are admitted before execution. Execution retains Core stop, attempted-prefix, cancellation, link and partial-effect contracts. Copy defaults to new-file conflict; tree merge and per-file replacement are independent. Move is native same-mount relocation only. RemoveTree uses execution-time name intent. Structured mutations reject conditional/range headers; no automatic retries or rollback."
+        "description": "One typed file request, used unchanged for synchronous execution or queued delivery. Input syntax and all selected real bindings are admitted before execution. Execution retains Core stop, attempted-prefix, cancellation, link and partial-effect contracts. Copy defaults to new-file conflict; tree merge and per-file replacement are independent. Move uses native relocation within a mount and admits cross-mount moves supported by both Drivers. RemoveTree uses execution-time name intent. Structured mutations reject conditional/range headers; no automatic retries or rollback."
       },
       "TaskRequest": {
         "oneOf": [
@@ -7338,76 +7338,83 @@
             ]
           },
           "removed": {
-            "description": "MoveBatch target-removal receipt. Its ordered rows are tree phases, never nested batch operations.",
-            "additionalProperties": false,
-            "type": "object",
-            "properties": {
-              "items": {
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "index": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "relative_path": {
-                      "type": "string"
-                    },
-                    "effect": {
-                      "$ref": "#/components/schemas/Effect"
-                    },
-                    "error": {
-                      "type": "string"
-                    },
-                    "side": {
-                      "type": "string",
-                      "enum": [
-                        "source",
-                        "target"
-                      ]
-                    },
-                    "error_side": {
-                      "enum": [
-                        "source",
-                        "target"
-                      ],
-                      "type": "string",
-                      "description": "Failure endpoint when it differs from the effect owner, such as source input failure during target publication."
-                    },
-                    "phase": {
-                      "type": "string",
-                      "enum": [
-                        "read",
-                        "create",
-                        "write",
-                        "remove"
-                      ]
-                    }
-                  },
-                  "required": [
-                    "index"
-                  ]
-                },
-                "type": "array"
-              },
-              "before": {
-                "enum": [
-                  1,
-                  2
-                ],
-                "type": "integer",
-                "description": "Original target observation when known: 1 missing, 2 present. Omitted means unknown, not an optimistic-concurrency proof."
-              },
-              "effect": {
-                "$ref": "#/components/schemas/Effect"
-              }
-            }
+            "$ref": "#/components/schemas/TreeReceipt",
+            "description": "MoveBatch target-removal receipt."
+          },
+          "tree": {
+            "$ref": "#/components/schemas/TreeReceipt",
+            "description": "MoveBatch cross-mount directory receipt."
           }
         },
         "required": [
           "index"
         ]
+      },
+      "TreeReceipt": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "items": {
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "relative_path": {
+                  "type": "string"
+                },
+                "effect": {
+                  "$ref": "#/components/schemas/Effect"
+                },
+                "error": {
+                  "type": "string"
+                },
+                "side": {
+                  "type": "string",
+                  "enum": [
+                    "source",
+                    "target"
+                  ]
+                },
+                "error_side": {
+                  "enum": [
+                    "source",
+                    "target"
+                  ],
+                  "type": "string",
+                  "description": "Failure endpoint when it differs from the effect owner, such as source input failure during target publication."
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "read",
+                    "create",
+                    "write",
+                    "remove"
+                  ]
+                }
+              },
+              "required": [
+                "index"
+              ]
+            },
+            "type": "array"
+          },
+          "before": {
+            "enum": [
+              1,
+              2
+            ],
+            "type": "integer",
+            "description": "Original target observation when known: 1 missing, 2 present. Omitted means unknown, not an optimistic-concurrency proof."
+          },
+          "effect": {
+            "$ref": "#/components/schemas/Effect"
+          }
+        }
       },
       "FileResult": {
         "type": "object",
@@ -7445,7 +7452,7 @@
           }
         },
         "required": [],
-        "description": "Single or whole-tree effect, Move endpoint effects, and ordered attempted phase receipts. Whole-tree applied means selected work completed, not every item mutated. Move target_removed_effect and items retain its separate pre-delete phase even if relocation fails. Unstarted work is absent; confirmed effects survive errors."
+        "description": "Single or whole-tree effect, Move endpoint effects, and ordered attempted phase receipts. Whole-tree applied means selected work completed, not every item mutated. Move items can describe cross-mount tree phases or, with target_removed_effect, the separate native pre-delete phase. Unstarted work is absent; confirmed effects survive errors."
       },
       "Alias": {
         "type": "object",
@@ -7930,7 +7937,7 @@
           },
           "replace": {
             "type": "boolean",
-            "default": false
+            "description": "Legacy explicit publication selection: false publishes completely only if absent; true publishes completely with replacement. Omission does not select this legacy policy."
           },
           "target": {
             "type": "object",
@@ -7988,7 +7995,7 @@
             "$ref": "#/components/schemas/WritePolicy"
           }
         },
-        "description": "Version 1 transfer source input. Exactly one tree path or tagged address is required. Native keys use address; prefixes are not upload targets. Driver length/capability limits still apply at execution. Responses preserve path for tree targets and address for key targets. This is not a second file execution API. Policy or legacy replace is accepted, never both. A zero/create_new policy normalizes to complete Publish(IfAbsent); explicit publish predicates remain unchanged. The original condition is persisted and restored, without a refreshed expected tag.",
+        "description": "Version 2 transfer source input. Exactly one tree path or tagged address is required. Native keys use address; prefixes are not upload targets. Driver length/capability limits still apply at execution. Responses preserve path for tree targets and address for key targets. Policy or legacy replace is accepted, never both. Omission and explicit create_new retain ordinary exclusive creation, including possible incomplete effects. Explicit publish requests complete publication. Legacy replace false/true retains complete exclusive/replacing publication. The exact original policy is persisted and restored; retrying an existing ID must match it. Version 1 creation is rejected without changing stored intents or their Run/Abort behavior.",
         "not": {
           "required": [
             "replace",
@@ -8012,7 +8019,7 @@
           "version",
           "input"
         ],
-        "description": "Use the registered source format version (built-ins: 1). Transfer input follows TransferJobInput: input_id, target{definition_id,revision,path OR address}, optional policy or legacy replace. Pool input: kind=repair|drain|collect, member required only for drain. Same ID/request is idempotent; a different request conflicts. Creation persists intent and retention only, without starting native work. On error, query/retry the original ID; do not infer rollback."
+        "description": "Use the registered source format version (Transfer: 2; Pool: 1). Transfer input follows TransferJobInput: input_id, target{definition_id,revision,path OR address}, optional policy or legacy replace. Pool input: kind=repair|drain|collect, member required only for drain. Same ID/request is idempotent; a different request conflicts. Creation persists intent and retention only, without starting native work. On error, query/retry the original ID; do not infer rollback."
       },
       "JobCommandInput": {
         "type": "object",

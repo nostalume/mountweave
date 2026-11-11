@@ -33,14 +33,7 @@ func (d *Driver) mutate(ctx context.Context, route string, input, out any) (core
 	if cleanup != nil {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UpstreamFailure, cleanup)
 	}
-	rejected, err := d.call(ctx, route, input, out, false)
-	effect := core.Applied
-	if err != nil {
-		effect = core.Unknown
-		if rejected {
-			effect = core.Unchanged
-		}
-	}
+	effect, err := d.call(ctx, route, input, out, false)
 	return core.Change{Effect: effect}, errors.Join(err, ctx.Err())
 }
 
@@ -155,6 +148,10 @@ func (d *Driver) Relocate(ctx context.Context, sourceAddress, targetAddress core
 	if err != nil {
 		return unchanged, &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
 	}
+	// Refuse unsupported modes before conflicts: Core may replace a target.
+	if parent.ID != f.Parent && (f.Type != "file" || name != f.Name) {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
 	if _, exists, err := d.child(ctx, parent.ID, name); err != nil {
 		return unchanged, err
 	} else if exists {
@@ -167,11 +164,6 @@ func (d *Driver) Relocate(ctx context.Context, sourceAddress, targetAddress core
 			return core.Change{Effect: core.Unknown}, errors.Join(err, core.Fail(core.InvalidUpstreamResponse, nil))
 		}
 		return change, err
-	}
-	// Combining parent relocation and rename is not asserted atomic by the
-	// inspected Open contract. Keep it as two explicit caller operations.
-	if f.Type != "file" || name != f.Name {
-		return unchanged, core.Fail(core.UnsupportedOperation, nil)
 	}
 	var out struct {
 		Drive  string `json:"drive_id"`

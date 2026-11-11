@@ -12,16 +12,19 @@ import (
 	"unicode/utf8"
 )
 
-// Iterator owns a native enumeration. Next returns a batch and may return io.EOF
-// together with its final entries. Context applies to the current call only.
+// Iterator owns a native enumeration. Next has one caller; its positive size is
+// a hint, not a required batch length. An empty batch without io.EOF continues
+// the enumeration. Final entries may accompany io.EOF. Context applies only to
+// the current call, not to the lifetime of the iterator.
 type Iterator interface {
 	Next(context.Context, int) ([]Metadata, error)
 	Close() error
 }
 
 type ListRequest struct {
-	When   Condition
-	Query  Query
+	When  Condition
+	Query Query
+	// Limit bounds the public page, independently of native batch sizes.
 	Limit  int
 	Cursor string
 	// CursorTTL is required on the first request; zero inherits on continuation.
@@ -54,7 +57,6 @@ type session struct {
 	closeErr             error
 	lastInput, nextToken string
 	replay               Page
-	haveReplay           bool
 	expires              time.Time
 	timer                *time.Timer
 	invalid              atomic.Bool
@@ -83,7 +85,7 @@ func (c *Core) List(ctx context.Context, p Principal, r ListRequest) (Page, erro
 		c.mu.Lock()
 		s := c.tokens[r.Cursor]
 		c.mu.Unlock()
-		if s == nil || s.principal != p || s.query != r.Query || (r.Limit != 0 && r.Limit != s.limit) || (r.CursorTTL != 0 && r.CursorTTL != s.ttl) {
+		if !s.matches(p, r) {
 			return Page{}, Fail(CursorUnavailable, nil)
 		}
 		if err := c.authorize(ctx, p, ListAction, r.Query.address); err != nil {
@@ -217,7 +219,7 @@ func (s *session) next(ctx context.Context, token string, when Condition) (Page,
 		s.invalidate()
 		return Page{}, Fail(CursorUnavailable, nil)
 	}
-	replay := s.haveReplay && token == s.lastInput
+	replay := token != "" && token == s.lastInput
 	if !replay && token != s.nextToken {
 		return Page{}, Fail(CursorUnavailable, nil)
 	}
@@ -233,6 +235,11 @@ func (s *session) next(ctx context.Context, token string, when Condition) (Page,
 		return Page{}, err
 	}
 	return s.publish(token, page, more)
+}
+
+func (s *session) matches(p Principal, r ListRequest) bool {
+	return s != nil && s.principal == p && s.query == r.Query &&
+		(r.Limit == 0 || r.Limit == s.limit) && (r.CursorTTL == 0 || r.CursorTTL == s.ttl)
 }
 
 // validLocked is evaluated under the core lock at admission and publication.
@@ -296,6 +303,9 @@ func (s *session) advance(ctx context.Context) (Page, bool, error) {
 		}
 		page.Items = append(page.Items, entry)
 	}
+	if len(s.pending) == 0 {
+		s.pending = nil
+	}
 	more := len(s.pending) > 0 || !s.eof
 	if !more {
 		if err := s.closeIterator(); err != nil {
@@ -333,7 +343,6 @@ func (s *session) publish(token string, page Page, more bool) (Page, error) {
 	}
 	if token != "" {
 		c.tokens[token] = s
-		s.haveReplay = true
 		s.replay = clonePage(page)
 	}
 	c.mu.Unlock()
@@ -354,9 +363,13 @@ func (s *session) closeIterator() error {
 	if s.use != nil {
 		if s.closeErr == nil {
 			s.use.release()
+			s.use = nil
 		} else {
 			s.use.failed(s.closeErr, s.iter)
 		}
+	}
+	if s.closeErr == nil {
+		s.iter = nil
 	}
 	return s.closeErr
 }
@@ -452,15 +465,7 @@ func (c *Core) CheckCursor(ctx context.Context, p Principal, r ListRequest) erro
 	}
 	c.mu.Lock()
 	s := c.tokens[r.Cursor]
-	valid := s != nil && !c.closed
-	if valid {
-		valid = s.principal == p && s.query == r.Query && (r.Limit == 0 || r.Limit == s.limit) && (r.CursorTTL == 0 || r.CursorTTL == s.ttl) && !s.invalid.Load() && time.Now().Before(s.expires)
-		if s.mount != nil {
-			valid = valid && !s.mount.retiring && s.binding.active && s.revision == s.mount.revision
-		} else {
-			valid = valid && s.version == c.version
-		}
-	}
+	valid := s.matches(p, r) && s.validLocked()
 	c.mu.Unlock()
 	if !valid {
 		return Fail(CursorUnavailable, nil)

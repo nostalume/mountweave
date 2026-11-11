@@ -32,7 +32,7 @@ func jsonResponse(r *http.Request, value any) *http.Response {
 	data, _ := json.Marshal(value)
 	return response(r, 200, string(data))
 }
-func prepared(t *testing.T, rt transport, configure func(*driver.Options)) (*driver.Driver, *core.Core) {
+func nativeOptions(t *testing.T, rt transport) driver.Options {
 	t.Helper()
 	tokens, err := credential.New(credential.Record{Token: credential.Token{Access: "provider-secret", Refresh: "refresh", ExpiresAt: time.Now().Add(time.Hour)}}, func(context.Context, string) (credential.Token, error) {
 		t.Error("unexpected refresh")
@@ -47,22 +47,34 @@ func prepared(t *testing.T, rt transport, configure func(*driver.Options)) (*dri
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := driver.Options{Client: &http.Client{Transport: rt}, DriveID: "drive", RootID: "root", Credentials: tokens}
+	return driver.Options{Client: &http.Client{Transport: rt}, DriveID: "drive", RootID: "root", Credentials: tokens}
+}
+func prepared(t *testing.T, rt transport, configure func(*driver.Options)) (*driver.Driver, *core.Core) {
+	t.Helper()
+	options := nativeOptions(t, rt)
 	if configure != nil {
 		configure(&options)
 	}
-	d, err := driver.New(options)
+	d, err := driver.Open(context.Background(), options)
 	if err != nil {
-		_ = tokens.Close()
+		if d != nil {
+			err = errors.Join(err, d.Close())
+		} else {
+			err = errors.Join(err, options.Credentials.Close())
+		}
 		t.Fatal(err)
 	}
-	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
-		return nil
-	}})
-	if err != nil {
-		t.Fatal(err)
+	c := testCore(t)
+	if _, err := c.Install("/cloud", d); err != nil {
+		t.Fatal(errors.Join(err, d.Close()))
 	}
-	if _, err = c.Install("/cloud", d); err != nil {
+	return d, c
+}
+
+func testCore(t *testing.T) *core.Core {
+	t.Helper()
+	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error { return nil }})
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -72,8 +84,9 @@ func prepared(t *testing.T, rt transport, configure func(*driver.Options)) (*dri
 			t.Error(err)
 		}
 	})
-	return d, c
+	return c
 }
+
 func requestBody(t *testing.T, r *http.Request) map[string]any {
 	t.Helper()
 	var body map[string]any
@@ -124,7 +137,10 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 				t.Error("wrong parent")
 			}
 			if body["marker"] == "" {
-				return jsonResponse(r, map[string]any{"items": []any{file("file-id", "song")}, "next_marker": "page2"}), nil
+				return jsonResponse(r, map[string]any{"items": []any{file("file-id", "song")}, "next_marker": "empty"}), nil
+			}
+			if body["marker"] == "empty" {
+				return jsonResponse(r, map[string]any{"items": []any{}, "next_marker": "page2"}), nil
 			}
 			folder := file("folder-id", "folder")
 			folder["type"] = "folder"
@@ -142,7 +158,7 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	d, c := prepared(t, rt, nil)
 	ctx := context.Background()
 	entry, err := c.Stat(ctx, "reader", core.Path("/cloud/song"))
-	if err != nil || entry.Size == nil || *entry.Size != 99 || pages.Load() != 2 {
+	if err != nil || entry.Size == nil || *entry.Size != 99 || pages.Load() != 3 {
 		t.Fatalf("stat: %#v %v", entry, err)
 	}
 	first, err := c.List(ctx, "reader", core.ListRequest{Query: core.Children(core.Path("/cloud")), Limit: 1, CursorTTL: time.Minute})
@@ -150,14 +166,16 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 		t.Fatal(first, err)
 	}
 	req := core.ListRequest{Query: core.Children(core.Path("/cloud")), Cursor: *first.NextCursor}
+	empty, err := c.List(ctx, "reader", req)
+	if err != nil || len(empty.Items) != 0 || empty.NextCursor == nil {
+		t.Fatal("empty continuing page", empty, err)
+	}
+	req.Cursor = *empty.NextCursor
 	second, err := c.List(ctx, "reader", req)
 	if err != nil || len(second.Items) != 1 || second.Items[0].Kind != core.Directory || second.Items[0].Size != nil {
 		t.Fatal(second, err)
 	}
 	before := pages.Load()
-	if _, err = c.List(ctx, "reader", req); err != nil || pages.Load() != before {
-		t.Fatal("replay advanced native state", err)
-	}
 	opened, err := c.Open(ctx, "reader", core.Path("/cloud/song"), core.OpenOptions{Range: &core.Range{Start: 2, End: 5}})
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +184,7 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 	if err != nil || string(data) != "cdef" || opened.Range == nil || *opened.Entry.Size != 10 {
 		t.Fatalf("opened facts: %q %#v %v", data, opened, err)
 	}
-	if pages.Load()-before != 2 || links.Load() != 1 || downloads.Load() != 1 {
+	if pages.Load()-before != 3 || links.Load() != 1 || downloads.Load() != 1 {
 		t.Fatal("redundant path resolution or download")
 	}
 	scope, err := d.OpenDirectory(ctx, core.NativePath("/"))
@@ -174,16 +192,16 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer scope.Close()
-	for {
-		_, err = scope.Next(ctx, 1)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
+	for index, count := range []int{1, 0, 1} {
+		batch, nextErr := scope.Next(ctx, 1)
+		if len(batch) != count || (index < 2 && nextErr != nil) || (index == 2 && !errors.Is(nextErr, io.EOF)) {
+			t.Fatal("native page facts", index, batch, nextErr)
 		}
 	}
 	before = pages.Load()
+	if batch, err := scope.Next(ctx, 1); len(batch) != 0 || !errors.Is(err, io.EOF) || pages.Load() != before {
+		t.Fatal("native iterator advanced after EOF", batch, err)
+	}
 	for i := 0; i < 2; i++ {
 		opened, err := scope.OpenFile(ctx, "song")
 		if err != nil {
@@ -217,62 +235,197 @@ func TestIDReadWorkflowThroughCore(t *testing.T) {
 }
 
 func TestResolutionNeverInventsUniquenessOrAbsence(t *testing.T) {
-	for _, scenario := range []string{"duplicate", "incomplete", "budget", "missing", "repeated-marker", "wrong-drive", "invalid-name", "missing-items"} {
-		t.Run(scenario, func(t *testing.T) {
-			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
-				body := requestBody(t, r)
-				marker := body["marker"]
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		code core.Code
+	}{
+		{"duplicate", core.PathAmbiguous},
+		{"repeated-id", core.InvalidUpstreamResponse},
+		{"wrapped-eof", core.UpstreamFailure},
+		{"incomplete", core.UpstreamFailure},
+		{"budget", core.ResolutionBudgetExceeded},
+		{"missing", core.NotFound},
+		{"repeated-marker", core.InvalidUpstreamResponse},
+		{"cursor-cycle", core.InvalidUpstreamResponse},
+		{"wrong-drive", core.InvalidUpstreamResponse},
+		{"invalid-name", core.UnrepresentableName},
+		{"invalid-type", core.InvalidUpstreamResponse},
+		{"negative-size", core.InvalidUpstreamResponse},
+		{"missing-items", core.InvalidUpstreamResponse},
+		{"close-failure", core.InternalError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closeFailure := errors.New("native response close failed")
+			cycleCalls := 0
+			rt := transport(func(r *http.Request) (*http.Response, error) {
+				marker := requestBody(t, r)["marker"]
 				candidate := file("one", "song")
-				switch scenario {
+				switch tc.name {
+				case "cursor-cycle":
+					if marker == "" {
+						cycleCalls = 0
+					}
+					cycleCalls++
+					if cycleCalls > 4 {
+						return response(r, 503, "{}"), nil
+					}
+					next := "first"
+					if marker == "first" {
+						next = "second"
+					}
+					return jsonResponse(r, map[string]any{"items": []any{}, "next_marker": next}), nil
 				case "wrong-drive":
 					candidate["drive_id"] = "foreign"
 				case "invalid-name":
 					candidate["name"] = "bad/name"
+				case "invalid-type":
+					candidate["type"] = "redirect"
+				case "negative-size":
+					candidate["size"] = -1
 				case "missing":
 					candidate["name"] = "other"
 				case "missing-items":
 					return jsonResponse(r, map[string]any{"next_marker": ""}), nil
+				case "close-failure":
+					result := jsonResponse(r, map[string]any{"items": []any{candidate}})
+					result.Body = &trackedBody{Reader: result.Body, closeErr: closeFailure}
+					return result, nil
 				}
 				if marker == "" {
 					return jsonResponse(r, map[string]any{"items": []any{candidate}, "next_marker": "next"}), nil
 				}
-				switch scenario {
+				switch tc.name {
 				case "duplicate":
 					return jsonResponse(r, map[string]any{"items": []any{file("two", "song")}}), nil
+				case "repeated-id":
+					return jsonResponse(r, map[string]any{"items": []any{candidate}}), nil
+				case "wrapped-eof":
+					return nil, errors.Join(closeFailure, io.EOF)
 				case "incomplete":
 					return response(r, 503, "{}"), nil
 				case "repeated-marker":
 					return jsonResponse(r, map[string]any{"items": []any{}, "next_marker": "next"}), nil
 				}
 				return jsonResponse(r, map[string]any{"items": []any{}}), nil
-			}, func(o *driver.Options) {
-				if scenario == "budget" {
+			})
+			configure := func(o *driver.Options) {
+				if tc.name == "budget" {
 					o.MaxResolvePages = 1
 				}
-			})
-			_, err := c.Stat(context.Background(), "reader", core.Path("/cloud/song"))
-			want := map[string]core.Code{"duplicate": core.PathAmbiguous, "incomplete": core.UpstreamFailure, "budget": core.ResolutionBudgetExceeded, "missing": core.NotFound, "repeated-marker": core.InvalidUpstreamResponse, "wrong-drive": core.InvalidUpstreamResponse, "invalid-name": core.UnrepresentableName, "missing-items": core.InvalidUpstreamResponse}[scenario]
-			requireCode(t, err, want)
+			}
+			switch tc.name {
+			case "duplicate", "budget", "cursor-cycle", "close-failure":
+				opts := nativeOptions(t, rt)
+				opts.RootID, opts.RootPath = "", "/song"
+				configure(&opts)
+				d, err := driver.Open(ctx, opts)
+				if d == nil {
+					_ = opts.Credentials.Close()
+					t.Fatal("root failure lost its cleanup owner", err)
+				}
+				_, statErr := d.Stat(ctx, core.NativePath("/"))
+				closeErr := d.Close()
+				requireCode(t, err, tc.code)
+				if core.CodeOf(statErr) != core.MountUnavailable {
+					t.Fatal("failed construction admitted an operation", statErr)
+				}
+				if _, err := opts.Credentials.Access(ctx); !errors.Is(err, credential.ErrClosed) {
+					t.Fatal("failed construction left credentials active", err)
+				}
+				if tc.name == "close-failure" {
+					if !errors.Is(closeErr, closeFailure) {
+						t.Fatal("failed response cleanup was lost", closeErr)
+					}
+					return
+				}
+				if closeErr != nil {
+					t.Fatal(closeErr)
+				}
+			}
+			d, c := prepared(t, rt, configure)
+			_, err := c.Stat(ctx, "reader", core.Path("/cloud/song"))
+			requireCode(t, err, tc.code)
+			switch tc.name {
+			case "wrapped-eof":
+				checkCause := func(err error) {
+					t.Helper()
+					if errors.Is(err, io.EOF) || !errors.Is(err, closeFailure) || !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatal("failed page became normal EOF or lost cause", err)
+					}
+				}
+				checkCause(err)
+				req := core.ListRequest{Query: core.Children(core.Path("/cloud")), Limit: 1, CursorTTL: time.Minute}
+				page, err := c.List(ctx, "reader", req)
+				if err != nil || page.NextCursor == nil {
+					t.Fatal("first native page", page, err)
+				}
+				req.Cursor = *page.NextCursor
+				_, err = c.List(ctx, "reader", req)
+				requireCode(t, err, tc.code)
+				checkCause(err)
+			case "duplicate", "repeated-id", "missing", "cursor-cycle":
+				scope, err := d.OpenDirectory(ctx, core.NativePath("/"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer scope.Close()
+				for err == nil {
+					_, err = scope.Next(ctx, 100)
+				}
+				if errors.Is(err, io.EOF) {
+					_, err = scope.OpenFile(ctx, "song")
+				}
+				requireCode(t, err, tc.code)
+			}
 		})
 	}
 }
 
 type trackedBody struct {
 	io.Reader
-	closed atomic.Bool
+	closed   atomic.Bool
+	closeErr error
+	failOnce bool
 }
 
-func (b *trackedBody) Close() error { b.closed.Store(true); return nil }
+func (b *trackedBody) Close() error {
+	if b.closed.Swap(true) && b.failOnce {
+		return nil
+	}
+	return b.closeErr
+}
 func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
-	for _, scenario := range []string{"fallback", "unknown", "bad-range", "missing-range", "redirect", "expired", "short", "cancel", "unsafe-url"} {
+	failures := map[string]core.Code{
+		"bad-range": core.InvalidUpstreamResponse, "missing-range": core.InvalidUpstreamResponse,
+		"unsafe-url": core.InvalidUpstreamResponse, "encoded": core.InvalidUpstreamResponse,
+		"expired": core.UpstreamAccessDenied, "redirect": core.UpstreamFailure,
+	}
+	for _, scenario := range []string{"fallback", "unknown", "bad-range", "missing-range", "redirect", "expired", "frozen", "short", "cancel", "unsafe-url", "encoded", "unsatisfied", "invalid-total-close", "private-transport"} {
 		t.Run(scenario, func(t *testing.T) {
 			body := &trackedBody{Reader: strings.NewReader("abc")}
-			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
+			var cleanup error
+			if scenario == "invalid-total-close" {
+				cleanup = errors.New("download close failed")
+				body.closeErr = cleanup
+			}
+			rt := transport(func(r *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(r.URL.Path, "/list") {
-					return jsonResponse(r, map[string]any{"items": []any{file("id", "song")}}), nil
+					entry := file("id", "song")
+					switch scenario {
+					case "frozen":
+						entry["punish_flag"] = 2
+					case "fallback":
+						entry["punish_flag"] = 3
+					}
+					return jsonResponse(r, map[string]any{"items": []any{entry}}), nil
+				}
+				if scenario == "frozen" {
+					t.Errorf("frozen file requested %s", r.URL.Path)
+					return response(r, 500, ""), nil
 				}
 				if strings.HasSuffix(r.URL.Path, "/getDownloadUrl") {
-					target := "https://download.example.test/file"
+					target := "https://download.example.test/file?private=signature"
 					if scenario == "unsafe-url" {
 						target = "http://download.example.test/file"
 					}
@@ -284,6 +437,8 @@ func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
 				result := response(r, 200, "abc")
 				result.Body = body
 				switch scenario {
+				case "private-transport":
+					return nil, context.DeadlineExceeded
 				case "unknown":
 					result.ContentLength = -1
 				case "short":
@@ -298,29 +453,68 @@ func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
 				case "redirect":
 					result.StatusCode = 302
 					result.Header.Set("Location", "https://other.example.test/file")
+				case "encoded":
+					result.Header.Set("Content-Encoding", "gzip")
+				case "unsatisfied":
+					result.StatusCode = 416
+					result.Header.Set("Content-Range", "bytes */1")
+				case "invalid-total-close":
+					result.StatusCode = 416
+					result.Header.Set("Content-Range", "bytes */1x")
 				}
 				return result, nil
-			}, nil)
+			})
+			d, c := prepared(t, rt, nil)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			if scenario == "invalid-total-close" {
+				rejected, err := d.Open(ctx, core.NativePath("/song"), core.OpenOptions{Range: &core.Range{Start: 1, End: 2}})
+				requireCode(t, err, core.RangeNotSatisfiable)
+				var failure *core.Error
+				if !errors.As(err, &failure) || failure.Total != nil || rejected.Body != body || body.closed.Load() {
+					t.Fatal("refused body ownership or invalid total", rejected, err)
+				}
+				if err := rejected.Body.Close(); !errors.Is(err, cleanup) || !body.closed.Load() {
+					t.Fatal("returned body lost close failure", err)
+				}
+				return
+			}
 			opened, err := c.Open(ctx, "reader", core.Path("/cloud/song"), core.OpenOptions{Range: &core.Range{Start: 1, End: 2}})
+			if code := failures[scenario]; code != "" {
+				requireCode(t, err, code)
+				if body.closed.Load() != (scenario != "unsafe-url") {
+					t.Fatal("unexpected ownership of rejected download response")
+				}
+				return
+			}
 			switch scenario {
-			case "bad-range", "missing-range", "unsafe-url":
-				requireCode(t, err, core.InvalidUpstreamResponse)
-				if scenario != "unsafe-url" && !body.closed.Load() {
-					t.Fatal("rejected body leaked")
-				}
-				return
-			case "expired":
+			case "frozen":
 				requireCode(t, err, core.UpstreamAccessDenied)
-				if !body.closed.Load() {
-					t.Fatal("error body leaked")
+				scope, err := d.OpenDirectory(ctx, core.NativePath("/"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer scope.Close()
+				if batch, err := scope.Next(ctx, 1); len(batch) != 1 || !errors.Is(err, io.EOF) {
+					t.Fatal(batch, err)
+				}
+				_, err = scope.OpenFile(ctx, "song")
+				requireCode(t, err, core.UpstreamAccessDenied)
+				return
+			case "private-transport":
+				requireCode(t, err, core.UpstreamTimeout)
+				if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "private=signature") {
+					t.Fatal("private download transport failure was not isolated", err)
 				}
 				return
-			case "redirect":
-				requireCode(t, err, core.UpstreamFailure)
-				if !body.closed.Load() {
-					t.Fatal("redirect body leaked")
+			case "unsatisfied":
+				requireCode(t, err, core.RangeNotSatisfiable)
+				var failure *core.Error
+				if !errors.As(err, &failure) || !body.closed.Load() {
+					t.Fatal("range refusal lost response ownership", err)
+				}
+				if failure.Total == nil || *failure.Total != 1 {
+					t.Fatal("range refusal lost total", failure.Total)
 				}
 				return
 			}
@@ -333,18 +527,16 @@ func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
 			if scenario == "unknown" && (opened.Length != nil || opened.Entry.Size != nil) {
 				t.Fatal("invented length")
 			}
-			if scenario == "cancel" {
+			var readErr error
+			switch scenario {
+			case "short":
+				readErr = io.ErrUnexpectedEOF
+			case "cancel":
 				cancel()
+				readErr = context.Canceled
 			}
-			_, err = io.ReadAll(opened.Body)
-			if scenario == "short" && !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatal(err)
-			}
-			if scenario == "cancel" && !errors.Is(err, context.Canceled) {
-				t.Fatal(err)
-			}
-			if scenario != "short" && scenario != "cancel" && err != nil {
-				t.Fatal(err)
+			if _, err := io.ReadAll(opened.Body); !errors.Is(err, readErr) {
+				t.Fatalf("read returned %v, want %v", err, readErr)
 			}
 			if !body.closed.Load() {
 				t.Fatal("body not released")
@@ -353,24 +545,56 @@ func TestDownloadRangeFallbackAndFailureOwnership(t *testing.T) {
 	}
 }
 func TestCancellationReachesNativeRequest(t *testing.T) {
-	started := make(chan struct{})
-	_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
-		close(started)
-		<-r.Context().Done()
-		return nil, r.Context().Err()
-	}, nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { _, err := c.Stat(ctx, "reader", core.Path("/cloud/song")); done <- err }()
-	<-started
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatal(err)
+	for _, construction := range []bool{false, true} {
+		name := "read"
+		if construction {
+			name = "construct"
 		}
-	case <-time.After(time.Second):
-		t.Fatal("native request ignored cancellation")
+		t.Run(name, func(t *testing.T) {
+			started := make(chan struct{})
+			rt := transport(func(r *http.Request) (*http.Response, error) {
+				close(started)
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			if construction {
+				opts := nativeOptions(t, rt)
+				opts.RootID, opts.RootPath = "", "/docs"
+				canceled, stop := context.WithCancel(ctx)
+				stop()
+				if d, err := driver.Open(canceled, opts); d != nil || !errors.Is(err, context.Canceled) {
+					t.Fatal("canceled construction acquired resources", d, err)
+				}
+				if _, err := opts.Credentials.Access(ctx); err != nil {
+					t.Fatal("unacquired credentials were closed", err)
+				}
+				go func() {
+					d, err := driver.Open(ctx, opts)
+					if d != nil {
+						err = errors.Join(err, d.Close())
+					} else {
+						err = errors.Join(err, opts.Credentials.Close())
+					}
+					done <- err
+				}()
+			} else {
+				_, c := prepared(t, rt, nil)
+				go func() { _, err := c.Stat(ctx, "reader", core.Path("/cloud/song")); done <- err }()
+			}
+			<-started
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("native request ignored cancellation")
+			}
+		})
 	}
 }
 func TestOAuthRefreshAndOneReplay(t *testing.T) {

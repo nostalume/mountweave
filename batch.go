@@ -124,6 +124,10 @@ func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveReques
 	return execute(ctx, len(requests), limit, nil, func(i int) work[MoveItemResult] {
 		request := requests[i]
 		from, to := c.capture(ctx, request.Source), c.capture(ctx, request.Target)
+		if from == nil || to == nil || from.mount != to.mount {
+			// The batch already owns concurrency for cross-mount moves.
+			request.Options.Tree.Concurrency = min(request.Options.Tree.Concurrency, 1)
+		}
 		return work[MoveItemResult]{accesses: []access{{at: from, write: true}, {at: to, write: true}}, run: func() (MoveItemResult, error) {
 			var result MoveResult
 			var err error

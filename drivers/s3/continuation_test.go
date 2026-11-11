@@ -205,7 +205,14 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	ctx := context.Background()
 	server := newProtocol()
 	opts := driver.Options{PartSize: 5 << 20, MaxBufferedBytes: 10 << 20, PartConcurrency: 1, ResumeScope: "account/service-one"}
-	_, c := preparedDriver(t, server.roundTrip, []driver.Options{opts}, nil)
+	var denied atomic.Bool
+	authorize := func(context.Context, core.Principal, core.Action, core.Address) error {
+		if denied.Load() {
+			return core.Fail(core.PermissionDenied, nil)
+		}
+		return nil
+	}
+	_, c := preparedDriver(t, server.roundTrip, []driver.Options{opts}, authorize)
 	directory := t.TempDir()
 	inputOpts := input.Options{MaxBytes: 64 << 20, MaxInputs: 16, MaxAppendBytes: 5 << 20, MaxBlocks: 64}
 	inputs, err := input.Open(ctx, directory, inputOpts)
@@ -259,7 +266,7 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 		if _, err = inputs.Seal(ctx, source.ID, int64(len(data))); err != nil {
 			t.Fatal(err)
 		}
-		request := transfer.Request{InputID: source.ID, Target: transfer.Target{DefinitionID: "cloud", Revision: 1, Address: target}}
+		request := transfer.Request{InputID: source.ID, Target: transfer.Target{DefinitionID: "cloud", Revision: 1, Address: target}, Policy: core.Publish(core.IfAbsent())}
 		if len(policies) == 1 {
 			request.Policy = policies[0]
 		}
@@ -289,6 +296,25 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	}
 	payload := append(bytes.Repeat([]byte("a"), 5<<20), bytes.Repeat([]byte("b"), 5<<20)...)
 	payload = append(payload, []byte("final")...)
+	// Explicit ordinary creation remains ordinary after persistence and restart.
+	direct := create("direct-policy", core.Path("/cloud/direct-policy"), []byte("direct"), core.WritePolicy{})
+	restart()
+	direct, err = service.Run(ctx, "writer", direct.ID)
+	if err != nil || direct.Request.Policy.Complete() || direct.State != transfer.Completed || string(server.objects["vault/direct-policy"]) != "direct" {
+		t.Fatal("ordinary transfer policy changed on recovery", direct, err)
+	}
+	missingGeneration := direct
+	missingGeneration.Generation = ""
+	store.records[direct.ID] = missingGeneration
+	if _, err = service.Status(ctx, "writer", direct.ID); !errors.Is(err, transfer.ErrInvalid) {
+		t.Fatal("ordinary intent was interpreted as a legacy identity", err)
+	}
+	store.records[direct.ID] = direct
+	changedDirect := direct.Request
+	changedDirect.Policy = core.Publish(core.IfAbsent())
+	if _, err = service.Create(ctx, "writer", direct.ID, changedDirect); !errors.Is(err, transfer.ErrConflict) {
+		t.Fatal("retry changed ordinary policy", err)
+	}
 	lostCreation := true
 	store.after = func(r transfer.Record, _ []byte) bool {
 		if lostCreation && r.State == transfer.Preparing {
@@ -315,6 +341,10 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	policyJSON, _ := json.Marshal(legacy.Request.Policy)
 	requestJSON = bytes.Replace(requestJSON, append([]byte(`"Policy":`), policyJSON...), []byte(`"Replace":false`), 1)
 	oldRequest := bytes.Replace(requestJSON, targetJSON, oldTarget, 1)
+	var missingPolicy transfer.Request
+	if err = json.Unmarshal(bytes.Replace(oldRequest, []byte(`,"Replace":false`), nil, 1), &missingPolicy); err != nil || missingPolicy.Policy != core.Publish(core.IfAbsent()) {
+		t.Fatal("legacy omitted policy changed", missingPolicy, err)
+	}
 	recordJSON, _ := json.Marshal(intentEntry{Record: legacy})
 	oldRecord := bytes.Replace(recordJSON, targetJSON, oldTarget, 1)
 	oldRecord = bytes.Replace(oldRecord, append([]byte(`"Policy":`), policyJSON...), []byte(`"Replace":false`), 1)
@@ -361,7 +391,7 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	}
 	opts.PartConcurrency = 2
 	opts.ResumeScope = "account/service-other"
-	_, c = preparedDriver(t, server.roundTrip, []driver.Options{opts}, nil)
+	_, c = preparedDriver(t, server.roundTrip, []driver.Options{opts}, authorize)
 	restart()
 	server.failPartNumber = 0
 	if _, err = service.Run(ctx, "writer", intent.ID); core.CodeOf(err) != core.InvalidRequest {
@@ -374,7 +404,7 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts.ResumeScope = "account/service-one"
-	_, c = preparedDriver(t, server.roundTrip, []driver.Options{opts}, nil)
+	_, c = preparedDriver(t, server.roundTrip, []driver.Options{opts}, authorize)
 	service = serviceFor()
 	revision = 2
 	if _, err = service.Run(ctx, "writer", intent.ID); core.CodeOf(err) != core.MountUnavailable {
@@ -668,6 +698,11 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	// An externally replaced object cannot prove a lost commit. Neither Run nor
 	// Abort may repeat publication/delete by name or release its retained source.
 	intent = create("unresolved", core.Path("/cloud/unresolved"), []byte("original"))
+	denied.Store(true)
+	if initial, e := service.Run(ctx, "writer", intent.ID); core.CodeOf(e) != core.PermissionDenied || initial.Change.Effect != core.Unchanged || initial.CheckpointBytes != 0 {
+		t.Fatal("first admission refusal invented a prior effect", initial, e)
+	}
+	denied.Store(false)
 	server.lostComplete = true
 	r, err = service.Run(ctx, "writer", intent.ID)
 	if err == nil {
@@ -678,6 +713,29 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 	server.objects["vault/unresolved"] = []byte("external")
 	delete(server.metadata, "vault/unresolved")
 	restart()
+	denied.Store(true)
+	if rejected, e := service.Run(ctx, "writer", intent.ID); core.CodeOf(e) != core.PermissionDenied || rejected.Change.Effect != core.Unknown {
+		t.Fatal("admission refusal erased uncertain publication", rejected, e)
+	}
+	if saved, e := service.Status(ctx, "writer", intent.ID); e != nil || saved.Change.Effect != core.Unknown {
+		t.Fatal("admission refusal rewrote durable effect", saved, e)
+	}
+	// Other native writers can leave a known partial file in the same journal.
+	partial, e := service.Status(ctx, "writer", intent.ID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	partial.Change.Effect, partial.Revision = core.Incomplete, partial.Revision+1
+	if e = store.Commit(ctx, partial, partial.Revision-1, nil); e != nil {
+		t.Fatal(e)
+	}
+	if rejected, e := service.Run(ctx, "writer", intent.ID); core.CodeOf(e) != core.PermissionDenied || rejected.Change.Effect != core.Incomplete {
+		t.Fatal("admission refusal erased a known partial effect", rejected, e)
+	}
+	if saved, e := service.Status(ctx, "writer", intent.ID); e != nil || saved.Change.Effect != core.Incomplete {
+		t.Fatal("admission refusal rewrote a durable partial effect", saved, e)
+	}
+	denied.Store(false)
 	for _, run := range []func(context.Context, core.Principal, string, ...transfer.ExecutionOptions) (transfer.Record, error){service.Run, service.Abort} {
 		r, err = run(ctx, "writer", intent.ID)
 		if err == nil || r.Change.Effect != core.Unknown || r.State != transfer.Ready {
@@ -693,11 +751,17 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 
 	// Losing initiation cannot authorize another upload or erase retained input.
 	intent = create("initiation-loss", core.Path("/cloud/initiation"), []byte("initiation"))
+	// An unrun zero-value receipt is not evidence of a previous native effect.
+	unstarted := intent
+	unstarted.Change, unstarted.Revision = core.Change{}, intent.Revision+1
+	if err := store.Commit(ctx, unstarted, intent.Revision, nil); err != nil {
+		t.Fatal(err)
+	}
 	server.lostComplete = false
 	server.lostInitiate = true
 	r, err = service.Run(ctx, "writer", intent.ID)
-	if err == nil {
-		t.Fatal("lost initiation absent")
+	if err == nil || r.Change.Effect != core.Unchanged {
+		t.Fatal("lost private initiation invented a file effect", r, err)
 	}
 	phase, uploadID, _ = nativeState(t, store, r)
 	before = server.next
@@ -767,8 +831,18 @@ func TestDurableNativeTransferWorkflow(t *testing.T) {
 		return map[string]any{"kind": "uploads.run", "input": map[string]any{"id": intent.ID, "generation": generation}}
 	}
 	t.Logf("CONTRACT ApiInfo %s", call("GET", "/api/v1/info", nil, 200).Body.String())
-	createBody := map[string]any{"version": 1, "input": map[string]any{"input_id": intent.Request.InputID, "target": map[string]any{"definition_id": "cloud", "revision": 1, "address": core.Key("/cloud", "wire")}}}
+	createInput := map[string]any{"input_id": intent.Request.InputID, "target": map[string]any{"definition_id": "cloud", "revision": 1, "address": core.Key("/cloud", "wire")}, "policy": intent.Request.Policy}
+	createBody := map[string]any{"version": 2, "input": createInput}
+	call("PUT", "/api/v1/jobs/job?source=uploads&id=wire", map[string]any{"version": 1, "input": createInput}, 400)
 	w := call("PUT", "/api/v1/jobs/job?source=uploads&id=wire", createBody, 200)
+	legacyInput := map[string]any{"input_id": intent.Request.InputID, "target": createInput["target"], "replace": false}
+	call("PUT", "/api/v1/jobs/job?source=uploads&id=wire", map[string]any{"version": 2, "input": legacyInput}, 200)
+	ordinary := create("wire-direct", core.Path("/cloud/wire-direct"), []byte("ordinary"), core.WritePolicy{})
+	ordinaryInput := map[string]any{"input_id": ordinary.Request.InputID, "target": map[string]any{"definition_id": "cloud", "revision": 1, "path": "/cloud/wire-direct"}}
+	call("PUT", "/api/v1/jobs/job?source=uploads&id=wire-direct", map[string]any{"version": 2, "input": ordinaryInput}, 200)
+	if _, err := service.Abort(ctx, "writer", ordinary.ID); err != nil {
+		t.Fatal(err)
+	}
 	t.Logf("CONTRACT JobCreateRequest %s", mustJSON(t, createBody))
 	t.Logf("CONTRACT TransferJobInput %s", mustJSON(t, createBody["input"]))
 	if !bytes.Contains(w.Body.Bytes(), []byte(`"address":{"namespace":"keys"`)) {

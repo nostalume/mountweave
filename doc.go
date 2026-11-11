@@ -90,6 +90,13 @@
 // guarantee. Explicit complete publication is described below. Failed native cleanup
 // remains owned by the Driver and prevents successful retirement.
 //
+// WriteOptions.Continuation optionally supplies protected native recovery records
+// for an immutable Replayable input. It preserves the selected write policy:
+// ordinary creation may report Incomplete; explicit Publish retains complete
+// publication guarantees. Cancellation pauses the attempt, while Abort requests
+// native cleanup without undoing published content. Durable input retention and
+// intent persistence remain with the caller or optional transfer package.
+//
 // A possible mutation invalidates existing cursors for that mount before its
 // result returns, including EOF replay. Other mounts and opened content are not
 // invalidated by this coordination. Already-admitted reads may finish with an
@@ -198,9 +205,9 @@
 // OpenOptions holds Range and ReadSelection; Stat accepts an optional selection.
 // Source copy conditions apply to the actual open, target conditions to commit.
 // RemoveOptions and MoveOptions use these same predicates. RemoveOptions.Target
-// additionally constrains single-entry tree removal to a non-directory name or
-// an empty directory through the Driver's bound-parent removal capability.
-// Move retains its same-mount boundary; target evidence never flows to source.
+// constrains the native Remove effect to a non-directory name or empty directory.
+// Single removal needs only Remover; tree operations reuse ChildRemover on their
+// bound parents. Move keeps source and target evidence and receipts distinct.
 // Tree policies do not broadcast one file validator over all members.
 //
 // Native staging configuration, byte budgets and commit limits belong to the
@@ -255,20 +262,24 @@
 // phase; the final relocation stays exclusive and never removes a later peer.
 // Tree budgets must be positive if target removal encounters a directory.
 //
-// Currently both paths must select the same live mount with the optional Relocator
-// port. Its native no-replace receipt maps to both endpoints; a possible effect
-// invalidates that mount's cursors once. Unchanged means this call did not modify
-// the endpoint, not that another caller could not have changed it. Unknown is not
-// resolved by checking the current path. Cross-mount movement is refused before
-// creating a target: ordinary Open and Remove do not bind deletion to the object
-// and content state read by this call. Move never falls back to copying and then
-// deleting an unbound path.
+// Same-mount moves use Relocator and map the native receipt to both endpoints.
+// Same-mount directory moves transfer the directory entry without walking its
+// children. NoCopy requires this path. Mount and alias roots, equivalent resolved
+// endpoints and targets inside the source path are rejected.
 //
-// Directory moves relocate one entry together with its children, without subtree
-// enumeration or content copying. Source RemoveAction and target CreateAction
-// authorize that whole relocation; descendant grants are not checked individually.
-// Mount and alias roots, equivalent resolved endpoints and targets inside the
-// source path are rejected. Aliases retain their configured paths after a move.
+// A cross-mount move requires an absent target. MoveSource ties the opened file
+// version to a native conditional removal. The target publishes complete input
+// exclusively before Core reauthorizes and removes that exact source. A failed
+// or uncertain publication retains the source. An error can leave a confirmed
+// target, so use the two endpoint receipts to decide what remains.
+//
+// Cross-mount directories require positive Tree budgets and source directory
+// identities. MoveDirectoryWriter enforces target parent identities at creation
+// and publication. Core discovers bounded names, checks descendant grants, and
+// publishes a group of files before removing their source names. Source
+// directories are then removed from the bottom up, only if still the same
+// directory and empty. MoveResult.Tree retains the attempted phases. These
+// receipts describe this operation's effects amid independent mutations.
 //
 // Native relocation guarantees and platform support belong to each Driver.
 //
@@ -434,8 +445,8 @@
 // There is no worker pool per directory or global lock.
 //
 // The optional ChildRemover capability belongs to DirectoryScope. RemoveChild takes
-// one child name and File (non-directory unlink) or Directory (empty-directory
-// removal only). It needs no enumeration first. Calls can overlap each other, but
+// one child name and the same RemoveOptions, including type and native conditions.
+// It needs no enumeration first. Calls can overlap each other, but
 // not Next, OpenFile or Close. Local implements it with parent-relative unlinkat
 // on Linux and parent-relative DELETE handles with POSIX disposition on Windows.
 // A successful Windows delete-handle close confirms namespace removal; pending

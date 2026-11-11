@@ -38,12 +38,14 @@ type idProtocol struct {
 	calls        map[string]int
 	lostComplete bool
 	rejectPart   bool
+	failPart     bool
 	rejectedBody io.Reader
 	afterCreate  func()
 	asyncDelete  bool
 	deleteID     string
 	deletePolls  int
 	cancelQuery  func()
+	raceRelocate bool
 }
 
 func newIDProtocol() *idProtocol {
@@ -59,6 +61,11 @@ func (s *idProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 			return nil, errors.New("invalid upload identity")
 		}
 		s.mu.Lock()
+		if s.failPart {
+			s.failPart = false
+			s.mu.Unlock()
+			return nil, errors.New("upload connection failed")
+		}
 		if s.rejectPart {
 			s.rejectPart, s.rejectedBody = false, r.Body
 			s.mu.Unlock()
@@ -165,20 +172,35 @@ func (s *idProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 		return jsonResponse(r, e.metadata()), nil
 	case "/adrive/v1.0/openFile/getDownloadUrl":
 		return jsonResponse(r, map[string]any{"url": "https://download.example.test/" + text("file_id"), "method": "GET"}), nil
-	case "/adrive/v1.0/openFile/update":
+	case "/adrive/v1.0/openFile/update", "/adrive/v1.0/openFile/move":
 		e := s.entries[text("file_id")]
 		if text("check_name_mode") != "refuse" {
-			return nil, errors.New("rename lost exclusion")
+			return nil, errors.New("relocation lost exclusion")
 		}
-		e.name = text("name")
+		parent, name := e.parent, text("name")
+		moving := strings.HasSuffix(r.URL.Path, "/move")
+		if moving {
+			parent, name = text("to_parent_file_id"), e.name
+		}
+		if s.raceRelocate {
+			s.raceRelocate = false
+			s.next++
+			id := fmt.Sprintf("peer-%d", s.next)
+			s.entries[id] = &idEntry{id: id, parent: parent, name: name, kind: "file", size: 4, data: []byte("peer")}
+		}
+		for _, peer := range s.entries {
+			if peer.id != e.id && peer.parent == parent && peer.name == name {
+				if moving {
+					return jsonResponse(r, map[string]any{"drive_id": "drive", "file_id": e.id, "exist": true}), nil
+				}
+				return response(r, 409, `{ "code": "conflict" }`), nil
+			}
+		}
+		e.parent, e.name = parent, name
+		if moving {
+			return jsonResponse(r, map[string]any{"drive_id": "drive", "file_id": e.id, "exist": false}), nil
+		}
 		return jsonResponse(r, e.metadata()), nil
-	case "/adrive/v1.0/openFile/move":
-		e := s.entries[text("file_id")]
-		if text("check_name_mode") != "refuse" {
-			return nil, errors.New("move lost exclusion")
-		}
-		e.parent = text("to_parent_file_id")
-		return jsonResponse(r, map[string]any{"drive_id": "drive", "file_id": e.id, "exist": false}), nil
 	case "/adrive/v1.0/openFile/delete":
 		e := s.entries[text("file_id")]
 		if s.asyncDelete {
@@ -306,6 +328,27 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	if result, err := c.Move(ctx, "writer", core.Path("/cloud/other/new-name"), core.Path("/cloud/renamed/another-name")); core.CodeOf(err) != core.UnsupportedOperation || result.Source.Effect != core.Unchanged {
 		t.Fatal(result, err)
 	}
+	for _, target := range []string{"/cloud/other/raced", "/cloud/renamed/new-name"} {
+		server.raceRelocate = true
+		result, err := c.Move(ctx, "writer", core.Path("/cloud/other/new-name"), core.Path(target))
+		if err == nil || result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged || server.raceRelocate || string(readIDFile(t, c, target, nil)) != "peer" {
+			t.Fatal("commit conflict replaced a peer", result, err)
+		}
+	}
+	if _, err := c.Copy(ctx, "writer", core.Path("/local/copied"), core.Path("/cloud/renamed/another-name")); err != nil {
+		t.Fatal(err)
+	}
+	mutations := server.calls["/adrive/v1.0/openFile/delete"] + server.calls["/adrive/v1.0/openFile/update"] + server.calls["/adrive/v1.0/openFile/move"]
+	for _, source := range []string{"/cloud/other/new-name", "/cloud/other"} {
+		result, err := c.Move(ctx, "writer", core.Path(source), core.Path("/cloud/renamed/another-name"), core.MoveOptions{Existing: core.Replace})
+		if core.CodeOf(err) != core.UnsupportedOperation || result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged || result.Removed != nil ||
+			server.calls["/adrive/v1.0/openFile/delete"]+server.calls["/adrive/v1.0/openFile/update"]+server.calls["/adrive/v1.0/openFile/move"] != mutations {
+			t.Fatal("unsupported replacement reached mutation", result, err)
+		}
+	}
+	if string(readIDFile(t, c, "/cloud/other/new-name", nil)) != "abcdefg" || string(readIDFile(t, c, "/cloud/renamed/another-name", nil)) != "abcdefg" {
+		t.Fatal("unsupported replacement changed source or target")
+	}
 	if change, err := c.Remove(ctx, "writer", core.Path("/cloud/other")); core.CodeOf(err) != core.UnsupportedOperation || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
@@ -331,6 +374,10 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	}
 	if _, err := c.Remove(ctx, "writer", core.Path("/cloud/renamed/rejected")); err != nil {
 		t.Fatal(err)
+	}
+	server.failPart = true
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/renamed/connection-lost"), strings.NewReader("abcdefg"), &n); core.CodeOf(err) != core.UpstreamFailure || strings.Contains(err.Error(), "private=signature") || change.Effect != core.Incomplete {
+		t.Fatal("private upload transport failure was not isolated", change, err)
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -381,6 +428,38 @@ func TestIDMutationAndBoundedUploadWorkflow(t *testing.T) {
 	}
 	if _, err := c.Stat(ctx, "writer", core.Path("/cloud/cancel-tree")); err != nil {
 		t.Fatal("acceptance was mistaken for completion", err)
+	}
+	for _, tc := range []struct {
+		name string
+		want core.Effect
+	}{{"confirmed", core.Applied}, {"wrong-id", core.Unknown}} {
+		t.Run(tc.name+"-with-close-error", func(t *testing.T) {
+			server := newIDProtocol()
+			closeFault := errors.New("completion response close failed")
+			_, storage := prepared(t, func(r *http.Request) (*http.Response, error) {
+				reply, err := server.roundTrip(r)
+				if err == nil && strings.HasSuffix(r.URL.Path, "/complete") {
+					if tc.want == core.Unknown {
+						metadata := file("wrong-id", "receipt")
+						metadata["size"] = 3
+						reply = jsonResponse(r, metadata)
+					}
+					reply.Body = &trackedBody{Reader: reply.Body, closeErr: closeFault, failOnce: true}
+				}
+				return reply, err
+			}, func(o *driver.Options) { o.PartSize, o.MaxBufferedBytes = 3, 3 })
+			size := int64(3)
+			change, err := storage.Write(ctx, "writer", core.Path("/cloud/receipt"), strings.NewReader("abc"), &size)
+			if change.Effect != tc.want || !errors.Is(err, closeFault) || (tc.want == core.Unknown && core.CodeOf(err) != core.InvalidUpstreamResponse) {
+				t.Fatal("completion receipt or cleanup was lost", change, err)
+			}
+			if change, err := storage.Mkdir(ctx, "writer", core.Path("/cloud/blocked")); change.Effect != core.Unchanged || !errors.Is(err, closeFault) || server.calls["/adrive/v1.0/openFile/create"] != 1 {
+				t.Fatal("pending cleanup did not fence new mutations", change, err)
+			}
+			if err := storage.Close(ctx); err != nil {
+				t.Fatal("retirement did not retry the response close", err)
+			}
+		})
 	}
 }
 

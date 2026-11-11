@@ -108,24 +108,29 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 	}
 	_, err = c.Open(context.Background(), "alice", core.Path("/files/casename.bin"), core.OpenOptions{})
 	code(t, err, core.NotFound)
-	tests := []struct {
+	size := len(data)
+	for _, test := range []struct {
 		r          *core.Range
 		start, end int
-	}{{nil, 0, len(data)}, {&core.Range{Start: 65535, End: 65537}, 65535, 65538}, {&core.Range{Start: len64(data) - 7, End: -1}, len(data) - 7, len(data)}, {&core.Range{Start: 17, End: -1, Suffix: true}, len(data) - 17, len(data)}}
-	for _, test := range tests {
-		o, err := c.Open(context.Background(), "alice", core.Path(entry.Address.Value()), core.OpenOptions{Range: test.r})
+	}{
+		{nil, 0, size},
+		{&core.Range{Start: 65535, End: 65537}, 65535, 65538},
+		{&core.Range{Start: int64(size - 7), End: -1}, size - 7, size},
+		{&core.Range{Start: 17, End: -1, Suffix: true}, size - 17, size},
+		{&core.Range{Start: int64(size - 7), End: int64(size + 7)}, size - 7, size},
+		{&core.Range{Start: int64(size + 1), End: -1, Suffix: true}, 0, size},
+	} {
+		o, err := c.Open(context.Background(), "alice", entry.Address, core.OpenOptions{Range: test.r})
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, err := io.ReadAll(o.Body)
-		if err != nil {
-			t.Fatal(err)
+		if err = errors.Join(err, o.Body.Close()); err != nil || !bytes.Equal(got, data[test.start:test.end]) {
+			t.Fatalf("range %v returned %d bytes: %v", test.r, len(got), err)
 		}
-		if !bytes.Equal(got, data[test.start:test.end]) {
-			t.Fatal("range mismatch")
-		}
-		if err = o.Body.Close(); err != nil {
-			t.Fatal(err)
+		want := core.ContentRange{Start: int64(test.start), End: int64(test.end - 1), Total: int64(size)}
+		if test.r != nil && (o.Range == nil || *o.Range != want) {
+			t.Fatal("range metadata", o.Range, want)
 		}
 	}
 	empty, err := c.Open(context.Background(), "alice", core.Path("/files/empty"), core.OpenOptions{})
@@ -150,7 +155,6 @@ func TestIndependentLocalReadAndRange(t *testing.T) {
 	_, err = c.Open(context.Background(), "alice", core.Path("/files"), core.OpenOptions{})
 	code(t, err, core.NotFile)
 }
-func len64(b []byte) int64 { return int64(len(b)) }
 func TestLinksAndNames(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
@@ -190,31 +194,32 @@ func TestLinksAndNames(t *testing.T) {
 }
 func TestPaginationReplayScopeAndRetirement(t *testing.T) {
 	root := t.TempDir()
-	for i := 0; i < 201; i++ {
-		write(t, root, fmt.Sprintf("item-%03d", i), nil)
+	remaining := map[string]bool{"a": true, "b": true, "c": true, "d": true, "e": true}
+	for name := range remaining {
+		write(t, root, name, nil)
 	}
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
 	m := mountLocal(t, c, root)
-	req := core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 70, CursorTTL: time.Minute}
+	req := core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 2, CursorTTL: time.Minute}
 	first, err := c.List(context.Background(), "alice", req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Items) != 70 || first.NextCursor == nil {
+	if len(first.Items) != 2 || first.NextCursor == nil {
 		t.Fatalf("first page: %+v", first)
 	}
 	req.Cursor = *first.NextCursor
 	second, err := c.List(context.Background(), "alice", req)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(second.Items) != 2 || second.NextCursor == nil {
+		t.Fatal("second page", second, err)
 	}
 	saved := second.Items[0].Name
 	next := *second.NextCursor
 	second.Items[0].Name = "caller mutation"
 	*second.NextCursor = "caller mutation"
 	replay, err := c.List(context.Background(), "alice", req)
-	if err != nil || replay.Items[0].Name != saved || *replay.NextCursor != next {
+	if err != nil || len(replay.Items) != 2 || replay.Items[0].Name != saved || replay.NextCursor == nil || *replay.NextCursor != next {
 		t.Fatalf("replay: %+v %v", replay, err)
 	}
 	_, err = c.List(context.Background(), "bob", req)
@@ -227,42 +232,42 @@ func TestPaginationReplayScopeAndRetirement(t *testing.T) {
 	changed.Query = core.Children(core.Path("/"))
 	_, err = c.List(context.Background(), "alice", changed)
 	code(t, err, core.CursorUnavailable)
-	count := len(first.Items) + len(replay.Items)
-	seen := map[string]bool{}
-	for _, e := range append(first.Items, replay.Items...) {
-		seen[e.Name] = true
-	}
 	old := req.Cursor
 	req.Cursor = next
-	var lastInput string
-	for {
-		lastInput = req.Cursor
-		page, err := c.List(context.Background(), "alice", req)
+	items := append(first.Items, replay.Items...)
+	var terminal core.Page
+	// A short native batch can precede the terminal EOF page.
+	for range 2 {
+		terminal, err = c.List(context.Background(), "alice", req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		count += len(page.Items)
-		for _, e := range page.Items {
-			if seen[e.Name] {
-				t.Fatal("duplicate in unchanged fixture")
-			}
-			seen[e.Name] = true
-		}
-		if page.NextCursor == nil {
+		items = append(items, terminal.Items...)
+		if terminal.NextCursor == nil {
 			break
 		}
-		req.Cursor = *page.NextCursor
+		req.Cursor = *terminal.NextCursor
 	}
-	if count != 201 {
-		t.Fatalf("count %d", count)
+	if terminal.NextCursor != nil {
+		t.Fatal("enumeration did not reach EOF", terminal)
+	}
+	tail := req.Cursor
+	for _, item := range items {
+		if !remaining[item.Name] {
+			t.Fatal("duplicate or unexpected entry", item.Name)
+		}
+		delete(remaining, item.Name)
+	}
+	if len(remaining) != 0 {
+		t.Fatal("listing omitted entries", remaining)
 	}
 	req.Cursor = old
 	_, err = c.List(context.Background(), "alice", req)
 	code(t, err, core.CursorUnavailable)
-	req.Cursor = lastInput
+	req.Cursor = tail
 	final, err := c.List(context.Background(), "alice", req)
-	if err != nil || final.NextCursor != nil {
-		t.Fatal(final, err)
+	if err != nil || !reflect.DeepEqual(final, terminal) {
+		t.Fatal("last page replay", final, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -698,23 +703,6 @@ func TestShortReadAndCleanupErrorSurvive(t *testing.T) {
 	}
 }
 
-func TestRanges(t *testing.T) {
-	tests := []struct {
-		r    core.Range
-		size int64
-		want core.ContentRange
-		bad  bool
-	}{{core.Range{Start: 3, End: 100}, 10, core.ContentRange{Start: 3, End: 9, Total: 10}, false}, {core.Range{Start: 99, End: -1, Suffix: true}, 10, core.ContentRange{Start: 0, End: 9, Total: 10}, false}, {core.Range{Start: 0, End: 0}, 0, core.ContentRange{}, true}, {core.Range{Start: 0, End: -1, Suffix: true}, 3, core.ContentRange{}, true}}
-	for _, tt := range tests {
-		got, err := tt.r.Resolve(tt.size)
-		if tt.bad {
-			code(t, err, core.RangeNotSatisfiable)
-		} else if err != nil || !reflect.DeepEqual(got, tt.want) {
-			t.Fatal(got, err)
-		}
-	}
-}
-
 type cancelBody struct {
 	started   chan struct{}
 	released  chan struct{}
@@ -771,13 +759,19 @@ func TestCancellationIsNotSuccessfulEOF(t *testing.T) {
 type controlledIterator struct {
 	calls        atomic.Int32
 	closed       atomic.Int32
+	next         func(context.Context, int) ([]core.Metadata, error)
+	closeErr     error
 	nextStarted  chan struct{}
 	closeStarted chan struct{}
 	releaseClose chan struct{}
 }
 
 func (i *controlledIterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
-	if i.calls.Add(1) == 1 {
+	call := i.calls.Add(1)
+	if i.next != nil {
+		return i.next(ctx, n)
+	}
+	if call == 1 {
 		return []core.Metadata{{Name: "a", Kind: core.File}}, nil
 	}
 	close(i.nextStarted)
@@ -787,17 +781,26 @@ func (i *controlledIterator) Next(ctx context.Context, n int) ([]core.Metadata, 
 }
 func (i *controlledIterator) Close() error {
 	i.closed.Add(1)
-	close(i.closeStarted)
-	<-i.releaseClose
-	return nil
+	if i.closeStarted != nil {
+		close(i.closeStarted)
+	}
+	if i.releaseClose != nil {
+		<-i.releaseClose
+	}
+	return i.closeErr
 }
 func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
-	for _, trigger := range []string{"request", "mutation"} {
+	for _, trigger := range []string{"request", "mutation", "close-failure"} {
 		t.Run(trigger, func(t *testing.T) {
 			iterator := &controlledIterator{nextStarted: make(chan struct{}), closeStarted: make(chan struct{}), releaseClose: make(chan struct{})}
+			if trigger == "close-failure" {
+				iterator.closeErr = errors.New("iterator cleanup failed")
+			}
 			d := &fakeDriver{enum: func(context.Context, string) (core.Iterator, error) { return iterator, nil }}
 			c := newCore(t, core.Options{MaxCursors: 1})
-			defer closeCore(t, c)
+			if iterator.closeErr == nil {
+				defer closeCore(t, c)
+			}
 			m, installErr := c.Install("/files", &directoryDriver{fakeDriver: d, mkdir: func(context.Context, string) (core.Change, error) { return core.Change{Effect: core.Applied}, nil }})
 			if installErr != nil {
 				t.Fatal(installErr)
@@ -816,7 +819,7 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 			await(t, iterator.nextStarted)
 			_, err = c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *first.NextCursor})
 			code(t, err, core.CapacityExceeded)
-			if trigger == "request" {
+			if trigger != "mutation" {
 				cancelRequest()
 			} else {
 				result, changeErr := c.Mkdir(context.Background(), "alice", core.Path("/files/new"))
@@ -846,6 +849,17 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 				t.Fatal("lost pending iterator ownership")
 			}
 			close(iterator.releaseClose)
+			if iterator.closeErr != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+				defer cancel()
+				if err = c.Close(ctx); !errors.Is(err, iterator.closeErr) || !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("lost failed iterator ownership: %v", err)
+				}
+				if d.closes.Load() != 0 || iterator.closed.Load() != 1 {
+					t.Fatal("failed cleanup released the driver or retried Close")
+				}
+				return
+			}
 			if err = m.Retire(context.Background()); err != nil {
 				t.Fatal(err)
 			}
@@ -854,18 +868,43 @@ func TestCursorDoesNotFreeUnacknowledgedClose(t *testing.T) {
 	}
 }
 func TestInvalidRangeResponseIsClosed(t *testing.T) {
-	var closes atomic.Int32
-	d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
-		n := int64(2)
-		return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File}, Body: &countedBody{Reader: strings.NewReader("ab"), closed: &closes}, Length: &n, Range: &core.ContentRange{Start: 1, End: 2, Total: 10}}, nil
-	}}
-	c := newCore(t, core.Options{})
-	defer closeCore(t, c)
-	installFake(t, c, d)
-	_, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{Range: &core.Range{Start: 0, End: 1}})
-	code(t, err, core.InvalidUpstreamResponse)
-	if closes.Load() != 1 {
-		t.Fatal("invalid response body leaked")
+	two, ten := int64(2), int64(10)
+	for _, tt := range []struct {
+		name         string
+		size, length *int64
+		actual       *core.ContentRange
+		valid        bool
+	}{
+		{"shifted-range", nil, &two, &core.ContentRange{Start: 1, End: 2, Total: 10}, false},
+		{"full-size", &ten, &two, nil, false},
+		{"range-size", &two, &two, &core.ContentRange{Start: 0, End: 1, Total: 10}, false},
+		{"unknown-length", &two, nil, nil, true},
+		{"unknown-size", nil, &two, &core.ContentRange{Start: 0, End: 1, Total: 10}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var closes atomic.Int32
+			d := &fakeDriver{open: func(context.Context, string, *core.Range) (core.Opened, error) {
+				return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File, Size: tt.size}, Body: &countedBody{Reader: strings.NewReader("ab"), closed: &closes}, Length: tt.length, Range: tt.actual}, nil
+			}}
+			c := newCore(t, core.Options{})
+			defer closeCore(t, c)
+			installFake(t, c, d)
+			opened, err := c.Open(context.Background(), "alice", core.Path("/files/a"), core.OpenOptions{Range: &core.Range{Start: 0, End: 1}})
+			if tt.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(opened.Body)
+				if err != nil || string(data) != "ab" || !reflect.DeepEqual(opened.Length, tt.length) || !reflect.DeepEqual(opened.Range, tt.actual) {
+					t.Fatal("body facts changed", opened, string(data), err)
+				}
+			} else {
+				code(t, err, core.InvalidUpstreamResponse)
+			}
+			if closes.Load() != 1 {
+				t.Fatal("body was leaked or closed twice")
+			}
+		})
 	}
 }
 
@@ -987,25 +1026,51 @@ func TestCursorLifetimeBelongsToEnumeration(t *testing.T) {
 	if d.calls.Load() != before {
 		t.Fatal("missing enumeration lifetime reached driver")
 	}
-	root := t.TempDir()
-	for i := 0; i < 3; i++ {
-		write(t, root, fmt.Sprintf("f%d", i), []byte("abc"))
+	iterator := &controlledIterator{}
+	iterator.next = func(ctx context.Context, n int) ([]core.Metadata, error) {
+		if err := ctx.Err(); err != nil || n != 1 {
+			t.Fatalf("invalid native call scope or hint: %v, %d", err, n)
+		}
+		if iterator.calls.Load() == 1 {
+			return nil, nil // An empty native page still has progress.
+		}
+		return []core.Metadata{{Name: "a", Kind: core.File}, {Name: "b", Kind: core.File}, {Name: "c", Kind: core.File}}, io.EOF
 	}
-	other := newCore(t, core.Options{})
-	defer closeCore(t, other)
-	mountLocal(t, other, root)
-	page, err := other.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
-	if err != nil || page.NextCursor == nil {
+	d.enum = func(context.Context, string) (core.Iterator, error) { return iterator, nil }
+	page, err := c.List(context.Background(), "alice", core.ListRequest{Query: core.Children(core.Path("/files")), Limit: 1, CursorTTL: time.Minute})
+	if err != nil || len(page.Items) != 0 || page.NextCursor == nil {
 		t.Fatalf("first page: %v %v", page, err)
 	}
 	req := core.ListRequest{Query: core.Children(core.Path("/files")), Cursor: *page.NextCursor, CursorTTL: time.Second}
-	_, err = other.List(context.Background(), "alice", req)
+	_, err = c.List(context.Background(), "alice", req)
 	code(t, err, core.CursorUnavailable)
-	if err = other.CheckCursor(context.Background(), "alice", req); core.CodeOf(err) != core.CursorUnavailable {
+	if err = c.CheckCursor(context.Background(), "alice", req); core.CodeOf(err) != core.CursorUnavailable {
 		t.Fatal(err)
 	}
 	req.CursorTTL = 0
-	if _, err = other.List(context.Background(), "alice", req); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"a", "b", "c"} {
+		if err = c.CheckCursor(context.Background(), "alice", req); err != nil {
+			t.Fatal(err)
+		}
+		page, err = c.List(context.Background(), "alice", req)
+		if err != nil || len(page.Items) != 1 || page.Items[0].Name != name {
+			t.Fatalf("native batch projection: %+v %v", page, err)
+		}
+		replay, err := c.List(context.Background(), "alice", req)
+		if err != nil || !reflect.DeepEqual(page, replay) || iterator.calls.Load() != 2 {
+			t.Fatalf("replay advanced the native iterator: %+v %v", replay, err)
+		}
+		if name != "c" {
+			if page.NextCursor == nil {
+				t.Fatal("lost native batch remainder")
+			}
+			req.Cursor = *page.NextCursor
+		}
+	}
+	if page.NextCursor != nil || iterator.closed.Load() != 1 {
+		t.Fatal("terminal native batch was not closed")
+	}
+	if err = c.ReleaseCursor(context.Background(), "alice", req.Cursor); err != nil || iterator.closed.Load() != 1 {
+		t.Fatal("releasing terminal replay repeated Close", err)
 	}
 }

@@ -65,20 +65,24 @@ func (d *Driver) deleteEntry(ctx context.Context, id string) (core.Change, error
 			ID    string `json:"async_task_id"`
 			State string `json:"state"`
 		}
-		if err := d.post(ctx, "/adrive/v1.0/openFile/async_task/get", map[string]string{"async_task_id": out.Async}, &task); err != nil {
+		observed, err := d.call(ctx, "/adrive/v1.0/openFile/async_task/get", map[string]string{"async_task_id": out.Async}, &task, true)
+		if observed != core.Applied {
 			return uncertain(err)
 		}
 		if task.ID != out.Async {
-			return uncertain(core.Fail(core.InvalidUpstreamResponse, nil))
+			return uncertain(errors.Join(core.Fail(core.InvalidUpstreamResponse, nil), err))
 		}
 		switch task.State {
 		case "Succeed":
-			return core.Change{Effect: core.Applied}, ctx.Err()
+			return core.Change{Effect: core.Applied}, errors.Join(err, ctx.Err())
 		case "Failed":
-			return core.Change{Effect: core.Incomplete}, errors.Join(core.Fail(core.UpstreamFailure, fmt.Errorf("deletion task %s failed", out.Async)), ctx.Err())
+			return core.Change{Effect: core.Incomplete}, errors.Join(core.Fail(core.UpstreamFailure, fmt.Errorf("deletion task %s failed", out.Async)), err, ctx.Err())
 		case "Running":
+			if err != nil {
+				return uncertain(err)
+			}
 		default:
-			return uncertain(core.Fail(core.InvalidUpstreamResponse, nil))
+			return uncertain(errors.Join(core.Fail(core.InvalidUpstreamResponse, nil), err))
 		}
 		timer := time.NewTimer(interval)
 		select {

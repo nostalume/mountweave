@@ -33,10 +33,11 @@ type WriteContinuation struct {
 
 // ContinuableWriter is an optional Driver mode reached through the same Write
 // admission, authority, binding and resource lifetime. It must bind checkpoints
-// to the native destination, source version, length and publication mode, retain
+// to the native destination, source version, length and write policy, retain
 // uncertain effects, and join all source/native activity before returning. It
-// cannot close or retain source. Confirmed Abort may return Unchanged with nil;
-// all other results follow complete-publication semantics.
+// cannot close or retain source. Options.Continuation is always non-nil. Confirmed
+// Abort may return Unchanged with nil; other results follow the selected policy,
+// including possible Incomplete effects for ordinary creation.
 type ContinuableWriter interface {
-	ContinueWrite(context.Context, NativeAddress, Replayable, int64, PublicationOptions, WriteContinuation) (Change, error)
+	ContinueWrite(context.Context, NativeAddress, Replayable, int64, WriteOptions) (Change, error)
 }

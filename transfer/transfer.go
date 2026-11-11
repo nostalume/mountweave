@@ -68,13 +68,13 @@ func (t *Target) UnmarshalJSON(data []byte) error {
 type Request struct {
 	InputID string
 	Target  Target
-	// A zero policy normalizes to complete exclusive publication. Explicit
-	// Publish predicates are persisted unchanged and reused by every invocation.
+	// A zero policy retains ordinary exclusive creation, including possible
+	// incomplete effects. Explicit Publish predicates are persisted unchanged.
 	Policy core.WritePolicy
 }
 
 // UnmarshalJSON preserves original boolean intents while new records store the
-// exact immutable publication predicate. Neither retry nor resume refreshes it.
+// exact immutable write policy. Neither retry nor resume refreshes it.
 func (r *Request) UnmarshalJSON(data []byte) error {
 	var v struct {
 		InputID string
@@ -95,16 +95,6 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 		r.Policy = *v.Policy
 	} else if v.Replace != nil && *v.Replace {
 		r.Policy = core.Publish()
-	}
-	return r.normalize()
-}
-
-func (r *Request) normalize() error {
-	if r.Policy == (core.WritePolicy{}) {
-		r.Policy = core.Publish(core.IfAbsent())
-	}
-	if !r.Policy.Complete() {
-		return ErrInvalid
 	}
 	return r.Policy.Validate()
 }
@@ -243,12 +233,12 @@ func (s *Service) validate(r Record, id string) (Record, error) {
 	if r.ID != id || id == "" || r.Namespace != s.opts.Namespace || r.Revision == 0 || r.CheckpointBytes < 0 || r.CheckpointBytes > s.opts.MaxCheckpointBytes {
 		return Record{}, ErrInvalid
 	}
-	if err := r.Request.normalize(); err != nil {
+	if err := r.Request.Policy.Validate(); err != nil {
 		return Record{}, err
 	}
 	if r.Generation == "" {
 		when := r.Request.Policy.When()
-		if r.Request.Target.Address.Namespace() != core.TreeNamespace || !when.Empty() && !when.IsAbsent() {
+		if !r.Request.Policy.Complete() || r.Request.Target.Address.Namespace() != core.TreeNamespace || !when.Empty() && !when.IsAbsent() {
 			return Record{}, ErrInvalid
 		}
 		// Legacy identities derive only from persisted immutable fields. A new
@@ -364,7 +354,7 @@ func (s *Service) releaseRetention(ctx context.Context, r *Record) error {
 // even if source handoff fails. Retry the identical request or Abort that ID;
 // never abandon an uncertain Commit and create another attempt implicitly.
 func (s *Service) Create(ctx context.Context, p core.Principal, id string, request Request) (Record, error) {
-	if err := request.normalize(); err != nil {
+	if err := request.Policy.Validate(); err != nil {
 		return Record{}, err
 	}
 	leave, err := s.enter(ctx, id)
@@ -374,9 +364,6 @@ func (s *Service) Create(ctx context.Context, p core.Principal, id string, reque
 	defer leave()
 	r, err := s.load(ctx, id)
 	if errors.Is(err, ErrNotFound) {
-		if _, err := json.Marshal(request.Policy); err != nil {
-			return Record{}, err
-		}
 		if p == "" || request.InputID == "" || request.Target.DefinitionID == "" || request.Target.Revision == 0 || request.Target.Address.Validate() != nil || request.Target.Address.IsPrefix() {
 			return Record{}, ErrInvalid
 		}
@@ -534,8 +521,14 @@ func (s *Service) execute(ctx context.Context, p core.Principal, id string, abor
 		return s.opts.Core.Write(selected.Context(ctx), r.Owner, r.Request.Target.Address, body, &length, core.WriteOptions{Policy: r.Request.Policy, Continuation: &core.WriteContinuation{Checkpoint: checkpoint, Append: appendRecord, Abort: abort}})
 	}()
 	previousEffect := r.Change.Effect
+	confirmedAbort := abort && change.Effect == core.Unchanged && runErr == nil
+	// A rejected new attempt cannot disprove a prior partial or uncertain effect.
+	// Empty logs include never-run legacy records with a zero-value Change.
+	if (previousEffect == core.Unknown || previousEffect == core.Incomplete) && len(checkpoint) > 0 && change.Effect == core.Unchanged && !confirmedAbort {
+		change = r.Change
+	}
 	r.Change = change
-	if change.Effect == core.Applied || (abort && change.Effect == core.Unchanged && runErr == nil) {
+	if change.Effect == core.Applied || confirmedAbort {
 		next := r
 		next.State = Completed
 		if change.Effect != core.Applied {

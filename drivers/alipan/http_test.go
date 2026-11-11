@@ -68,7 +68,7 @@ func TestClosedHTTPRefreshAndRetirement(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 	client := closedClient(t, server)
 	if _, err := client.Get("https://outside.invalid/"); err == nil {
 		t.Fatal("external destination admitted")
@@ -94,12 +94,7 @@ func TestClosedHTTPRefreshAndRetirement(t *testing.T) {
 		_ = source.Close()
 		t.Fatal(err)
 	}
-	reader, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
-		return nil
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := testCore(t)
 	mount, err := reader.Install("/cloud", storage)
 	if err != nil {
 		_ = storage.Close()
@@ -108,11 +103,6 @@ func TestClosedHTTPRefreshAndRetirement(t *testing.T) {
 	// This watchdog is a test bound, not a deployment policy.
 	watchdog, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
-	defer func() {
-		if err := reader.Close(watchdog); err != nil {
-			t.Error(err)
-		}
-	}()
 	opened, err := reader.Open(watchdog, "reader", core.Path("/cloud/song"), core.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)

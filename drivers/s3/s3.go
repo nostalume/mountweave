@@ -29,18 +29,23 @@ type Driver struct {
 	bucket, prefix string
 	closed         atomic.Bool
 	opts           Options
+	listEncoding   types.EncodingType
 	buffer         *upload.Budget
 	mu             sync.Mutex
 	pending        map[string]PendingUpload
 }
 
-// Options enables bounded buffered/multipart writes when PartSize and
-// MaxBufferedBytes are set together. PartConcurrency and PartAttempts default
-// to one. CleanupTimeout zero adds no deadline beyond the borrowed client.
+// Options configures listings and bounded buffered/multipart writes.
+// Set PartSize and MaxBufferedBytes together. PartConcurrency and PartAttempts
+// default to one. CleanupTimeout zero adds no deadline beyond the borrowed client.
 type Options struct {
 	PartSize, MaxBufferedBytes    int64
 	PartConcurrency, PartAttempts int
 	CleanupTimeout                time.Duration
+	// PlainListKeys omits encoding-type for S3 endpoints that only list raw XML keys.
+	PlainListKeys bool
+	// ListV1 selects ListObjects with explicit, increasing NextMarker values.
+	ListV1 bool
 	// ResumeScope is a stable host identity for the native account/service. It
 	// contains no credentials and must change when that identity changes.
 	ResumeScope string
@@ -67,9 +72,15 @@ func New(client *sdk.Client, bucket, prefix string, options ...Options) (*Driver
 		opts.PartAttempts = 1
 	}
 	d := &Driver{client: client, bucket: bucket, prefix: prefix, opts: opts, pending: make(map[string]PendingUpload)}
+	if !opts.PlainListKeys {
+		d.listEncoding = types.EncodingTypeUrl
+	}
 	if opts.PartSize != 0 {
+		if err := upload.Validate(opts.PartSize, opts.MaxBufferedBytes, opts.PartConcurrency); err != nil {
+			return nil, core.Fail(core.InvalidRequest, err)
+		}
 		var err error
-		d.buffer, err = upload.New(opts.PartSize, opts.MaxBufferedBytes, opts.PartConcurrency)
+		d.buffer, err = upload.New(opts.MaxBufferedBytes, opts.PartConcurrency)
 		if err != nil {
 			return nil, core.Fail(core.InvalidRequest, err)
 		}
@@ -170,24 +181,80 @@ func (d *Driver) ancestors(ctx context.Context, p core.NativeAddress) error {
 	}
 	return nil
 }
-func (d *Driver) hasDirectory(ctx context.Context, key string) (bool, error) {
-	out, err := d.client.ListObjectsV2(ctx, &sdk.ListObjectsV2Input{
-		Bucket: aws.String(d.bucket), Prefix: aws.String(key + "/"), Delimiter: aws.String("/"), MaxKeys: aws.Int32(1),
+func decodeListedKey(encoding types.EncodingType, key string) (string, error) {
+	switch encoding {
+	case types.EncodingTypeUrl:
+		return url.PathUnescape(key)
+	case "":
+		// XML line-ending normalization can erase the original key bytes.
+		if strings.ContainsAny(key, "\r\n") {
+			return "", errors.New("raw XML listing cannot establish the exact key")
+		}
+		return key, nil
+	default:
+		return "", errors.New("unsupported key encoding")
+	}
+}
+
+// listObjects keeps native marker handling at the SDK boundary.
+func (d *Driver) listObjects(ctx context.Context, input *sdk.ListObjectsV2Input) (*sdk.ListObjectsV2Output, error) {
+	if !d.opts.ListV1 {
+		out, err := d.client.ListObjectsV2(ctx, input)
+		if err != nil {
+			return nil, translate(err)
+		}
+		return out, nil
+	}
+	marker := input.ContinuationToken
+	if marker == nil {
+		marker = input.StartAfter
+	}
+	out, err := d.client.ListObjects(ctx, &sdk.ListObjectsInput{
+		Bucket: input.Bucket, Prefix: input.Prefix, Delimiter: input.Delimiter, MaxKeys: input.MaxKeys,
+		Marker: marker, EncodingType: input.EncodingType,
 	})
 	if err != nil {
-		return false, translate(err)
+		return nil, translate(err)
+	}
+	if out.IsTruncated == nil || out.EncodingType != input.EncodingType {
+		return nil, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	var next string
+	if aws.ToBool(out.IsTruncated) {
+		nextKey := out.NextMarker
+		if nextKey == nil && aws.ToString(input.Delimiter) == "" && len(out.Contents) > 0 {
+			nextKey = out.Contents[len(out.Contents)-1].Key
+		}
+		next, err = decodeListedKey(out.EncodingType, aws.ToString(nextKey))
+		if err != nil || !utf8.ValidString(next) || next <= aws.ToString(marker) || !strings.HasPrefix(next, aws.ToString(input.Prefix)) {
+			return nil, core.Fail(core.InvalidUpstreamResponse, errors.Join(errors.New("invalid native listing marker"), err))
+		}
+	}
+	return &sdk.ListObjectsV2Output{IsTruncated: out.IsTruncated, Contents: out.Contents,
+		CommonPrefixes: out.CommonPrefixes, EncodingType: out.EncodingType, NextContinuationToken: optionalString(next)}, nil
+}
+
+func (d *Driver) hasDirectory(ctx context.Context, key string) (bool, error) {
+	prefix := key + "/"
+	out, err := d.listObjects(ctx, &sdk.ListObjectsV2Input{
+		Bucket: aws.String(d.bucket), Prefix: aws.String(prefix), Delimiter: aws.String("/"), MaxKeys: aws.Int32(1), EncodingType: d.listEncoding,
+	})
+	if err != nil {
+		return false, err
 	}
 	if out.IsTruncated == nil || (aws.ToBool(out.IsTruncated) && len(out.Contents)+len(out.CommonPrefixes) == 0) {
 		return false, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	for _, item := range out.Contents {
-		if !strings.HasPrefix(aws.ToString(item.Key), key+"/") {
-			return false, core.Fail(core.InvalidUpstreamResponse, nil)
+		listed, err := decodeListedKey(out.EncodingType, aws.ToString(item.Key))
+		if err != nil || !strings.HasPrefix(listed, prefix) {
+			return false, core.Fail(core.InvalidUpstreamResponse, err)
 		}
 	}
 	for _, item := range out.CommonPrefixes {
-		if !strings.HasPrefix(aws.ToString(item.Prefix), key+"/") || !strings.HasSuffix(aws.ToString(item.Prefix), "/") {
-			return false, core.Fail(core.InvalidUpstreamResponse, nil)
+		listed, err := decodeListedKey(out.EncodingType, aws.ToString(item.Prefix))
+		if err != nil || !strings.HasPrefix(listed, prefix) || !strings.HasSuffix(listed, "/") {
+			return false, core.Fail(core.InvalidUpstreamResponse, err)
 		}
 	}
 	return len(out.Contents) > 0 || len(out.CommonPrefixes) > 0, nil
@@ -291,6 +358,10 @@ func (d *Driver) Enumerate(ctx context.Context, query core.NativeQuery) (core.It
 	if query.Delimiter() != "" || query.StartAfter() != "" {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
+	return d.directoryIterator(ctx, p)
+}
+
+func (d *Driver) directoryIterator(ctx context.Context, p core.NativeAddress) (*iterator, error) {
 	meta, err := d.Stat(ctx, p)
 	if err != nil {
 		return nil, err
@@ -334,7 +405,7 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 	if n > 1000 {
 		n = 1000
 	}
-	input := &sdk.ListObjectsV2Input{Bucket: aws.String(i.driver.bucket), Prefix: aws.String(i.prefix), MaxKeys: aws.Int32(int32(n)), EncodingType: types.EncodingTypeUrl}
+	input := &sdk.ListObjectsV2Input{Bucket: aws.String(i.driver.bucket), Prefix: aws.String(i.prefix), MaxKeys: aws.Int32(int32(n)), EncodingType: i.driver.listEncoding}
 	if i.delimiter != "" {
 		input.Delimiter = aws.String(i.delimiter)
 	}
@@ -344,9 +415,9 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 	if i.marker != "" {
 		input.ContinuationToken = aws.String(i.marker)
 	}
-	out, err := i.driver.client.ListObjectsV2(ctx, input)
+	out, err := i.driver.listObjects(ctx, input)
 	if err != nil {
-		return nil, translate(err)
+		return nil, err
 	}
 	if out.IsTruncated == nil {
 		return nil, core.Fail(core.InvalidUpstreamResponse, nil)
@@ -356,17 +427,8 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid native continuation"))
 	}
 	items := make([]core.Metadata, 0, len(out.Contents)+len(out.CommonPrefixes))
-	decode := func(v string) (string, error) {
-		if out.EncodingType == types.EncodingTypeUrl {
-			return url.PathUnescape(v)
-		}
-		if out.EncodingType != "" {
-			return "", errors.New("unsupported key encoding")
-		}
-		return v, nil
-	}
 	for _, o := range out.Contents {
-		key, err := decode(aws.ToString(o.Key))
+		key, err := decodeListedKey(out.EncodingType, aws.ToString(o.Key))
 		if err != nil {
 			return nil, core.Fail(core.InvalidUpstreamResponse, err)
 		}
@@ -386,7 +448,7 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 		items = append(items, core.Metadata{Name: n, Kind: core.File, Size: o.Size, ModifiedAt: o.LastModified, Evidence: evidence(o.ETag, nil)})
 	}
 	for _, o := range out.CommonPrefixes {
-		key, err := decode(aws.ToString(o.Prefix))
+		key, err := decodeListedKey(out.EncodingType, aws.ToString(o.Prefix))
 		if err != nil || i.delimiter == "" || !strings.HasPrefix(key, i.prefix) || !strings.HasSuffix(key, i.delimiter) {
 			return nil, core.Fail(core.InvalidUpstreamResponse, err)
 		}
@@ -438,9 +500,6 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, options core.Op
 	wanted := options.Range
 	if err := d.admit(ctx, p); err != nil {
 		return core.Opened{}, err
-	}
-	if wanted != nil && !wanted.Valid() {
-		return core.Opened{}, core.Fail(core.InvalidRange, nil)
 	}
 	if p.Namespace() == core.TreeNamespace && p.Value() == "/" {
 		return core.Opened{}, core.Fail(core.NotFile, nil)
@@ -516,6 +575,15 @@ func (d *Driver) get(ctx context.Context, key, leaf string, wanted *core.Range, 
 		total := r.Total
 		opened.Metadata.Size = &total
 	}
+	if match != nil || none != nil {
+		if failure := selection.When.Check(opened.Metadata.Evidence, true); failure != nil {
+			tag := opened.Metadata.Evidence.Validator
+			if core.CodeOf(failure) == core.PreconditionFailed || tag.Tag != "" && !tag.Valid() {
+				failure = core.Fail(core.InvalidUpstreamResponse, failure)
+			}
+			return opened, failure
+		}
+	}
 	return opened, nil
 }
 func translate(err error) error {
@@ -558,7 +626,8 @@ func translate(err error) error {
 		case 416:
 			failure := &core.Error{Code: core.RangeNotSatisfiable, Cause: err}
 			var total int64
-			if _, scanErr := fmt.Sscanf(response.Response.Header.Get("Content-Range"), "bytes */%d", &total); scanErr == nil && total >= 0 {
+			text := response.Response.Header.Get("Content-Range")
+			if _, scanErr := fmt.Sscanf(text, "bytes */%d", &total); scanErr == nil && total >= 0 && text == fmt.Sprintf("bytes */%d", total) {
 				failure.Total = &total
 			}
 			return failure

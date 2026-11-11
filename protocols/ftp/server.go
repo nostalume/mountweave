@@ -461,7 +461,7 @@ func (x *session) command(cmd, arg string) (bool, error) {
 		if err != nil {
 			return false, x.failure(cmd, "request", err)
 		}
-		r, err := x.files.Move(x.ctx, x.actor, a, b)
+		r, err := x.files.Move(x.ctx, x.actor, a, b, core.MoveOptions{NoCopy: true})
 		return false, x.mutationReply(protocols.Failure{Operation: cmd, Phase: "rename", Err: err, Change: r.Target, HasChange: true, Source: &r.Source},
 			250, "Moved")
 	default:

@@ -64,6 +64,9 @@ func (o OpenOptions) Validate() error {
 	return o.Selection.When.Validate()
 }
 
+// Opened transfers any returned Body or File even when Open also returns an
+// error. For streams, Metadata.Size is the total object size; Length and Range
+// describe the returned body. Unknown sizes remain nil.
 type Opened struct {
 	Change   Change // LiveEdit opening effects survive errors and cleanup.
 	Metadata Metadata
@@ -262,9 +265,6 @@ func validateOpened(o Opened, rel NativeAddress, options OpenOptions) error {
 	if o.Metadata.Kind == Directory {
 		return Fail(NotFile, nil)
 	}
-	if _, err := project(Path("/"), o.Metadata); err != nil {
-		return err
-	}
 	if err := checkNativeName(o.Metadata, rel); err != nil {
 		return err
 	}
@@ -288,6 +288,7 @@ func validateOpened(o Opened, rel NativeAddress, options OpenOptions) error {
 	if o.Length != nil && *o.Length < 0 {
 		return Fail(InvalidUpstreamResponse, nil)
 	}
+	total := o.Length
 	if o.Range != nil {
 		if wanted == nil || o.Length == nil {
 			return Fail(InvalidUpstreamResponse, nil)
@@ -296,6 +297,10 @@ func validateOpened(o Opened, rel NativeAddress, options OpenOptions) error {
 		if err != nil || expected != *o.Range || *o.Length != o.Range.End-o.Range.Start+1 {
 			return Fail(InvalidUpstreamResponse, err)
 		}
+		total = &o.Range.Total
+	}
+	if total != nil && o.Metadata.Size != nil && *total != *o.Metadata.Size {
+		return Fail(InvalidUpstreamResponse, errors.New("object size disagrees with the returned body"))
 	}
 	return nil
 }

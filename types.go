@@ -72,9 +72,10 @@ func CodeOf(err error) Code {
 // Driver is rooted when constructed. Tree addresses start at /; key addresses
 // preserve literal keys. Metadata.Name is a child name for tree listings and a
 // complete root-relative key for key listings/reads. PrefixGroup is listing-only.
-// Provider IDs and physical paths remain inside it. Tree operations must use
-// exact stored names without traversing native redirects. The operation may
-// explicitly observe or unlink a final link without following it.
+// Provider IDs and physical paths remain inside it. Tree operations use exact
+// names in the service's exported namespace, without client-invented aliases or
+// redirects. Ordinary access does not prove how the service implements a name.
+// Explicit leaf observation and NoFollow retain their stronger native promises.
 // Open transfers every returned Body/File to the caller, including on error.
 // BoundRead/LiveEdit return File only. They must not retain the opening call's context;
 // subsequent calls and Close own the resource lifetime. LiveEdit must report

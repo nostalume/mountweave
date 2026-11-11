@@ -37,6 +37,7 @@ type objectProtocol struct {
 	held                              sync.Once
 	retryFirst                        bool
 	retryData                         []byte
+	emptyPartETag                     bool
 	second                            chan struct{}
 	rejectNext                        bool
 	rejectedBody                      io.Reader
@@ -204,7 +205,11 @@ func (s *objectProtocol) roundTrip(r *http.Request) (*http.Response, error) {
 				s.second = nil
 			}
 			out := response(r, 200, "")
-			out.Header.Set("ETag", fmt.Sprintf("\"p%d\"", n))
+			if n == 1 && s.emptyPartETag {
+				s.emptyPartETag = false
+			} else {
+				out.Header.Set("ETag", fmt.Sprintf("\"p%d\"", n))
+			}
 			return out, nil
 		case "POST":
 			if failure := conditionFailure(false); failure != nil {
@@ -358,6 +363,18 @@ func TestMultipartFileWorkflowAndRecoveryOwnership(t *testing.T) {
 	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), bytes.NewReader(payload), nil); core.CodeOf(err) != core.AlreadyExists || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
 	}
+	server.mu.Lock()
+	server.retryFirst, server.emptyPartETag = true, true
+	server.mu.Unlock()
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/bad-receipt"), bytes.NewReader(payload), nil); core.CodeOf(err) != core.InvalidUpstreamResponse || change.Effect != core.Unchanged {
+		t.Fatal("successful retry without a receipt reused the previous error", change, err)
+	}
+	server.mu.Lock()
+	badUpload := fmt.Sprint("u", server.next)
+	if server.calls["PUT 1 "+badUpload] != 2 || server.calls["POST  "+badUpload] != 0 {
+		t.Fatal("invalid part receipt was retried or published", server.calls)
+	}
+	server.mu.Unlock()
 	fault := errors.New("input failed after a complete part")
 	if change, err := c.Write(ctx, "writer", core.Path("/cloud/folder/file"), failedEOF{bytes.NewReader(payload), fault}, nil, core.WriteOptions{Policy: core.Publish()}); !errors.Is(err, fault) || change.Effect != core.Unchanged {
 		t.Fatal(change, err)
@@ -617,8 +634,8 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 	server := newProtocol()
 	server.hold, server.started = make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(server.hold) })
-	t.Cleanup(release)
-	d, c := preparedDriver(t, server.roundTrip, []driver.Options{{PartSize: 5 << 20, MaxBufferedBytes: 10 << 20, PartConcurrency: 2, CleanupTimeout: time.Second}}, nil)
+	defer release()
+	d, c := preparedDriver(t, server.roundTrip, []driver.Options{{PartSize: 5 << 20, MaxBufferedBytes: (10 << 20) + 1, PartConcurrency: 2, CleanupTimeout: time.Second}}, nil)
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan error, 1)
@@ -640,10 +657,14 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 		t.Fatal("native request still owns buffer", err)
 	default:
 	}
-	untouched := strings.NewReader("x")
-	n := int64(1)
-	if change, err := c.Write(ctx, "writer", core.Path("/cloud/other"), untouched, &n); core.CodeOf(err) != core.CapacityExceeded || change.Effect != core.Unchanged || untouched.Len() != 1 {
+	untouched := strings.NewReader("xy")
+	n := int64(2)
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/other"), untouched, &n); core.CodeOf(err) != core.CapacityExceeded || change.Effect != core.Unchanged || untouched.Len() != 2 {
 		t.Fatal(change, err)
+	}
+	one := int64(1)
+	if change, err := c.Write(ctx, "writer", core.Path("/cloud/small"), strings.NewReader("x"), &one); err != nil || change.Effect != core.Applied {
+		t.Fatal("single PUT did not fit the remaining byte budget", change, err)
 	}
 	release()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -652,7 +673,7 @@ func TestMultipartCancellationAndSharedBufferAdmission(t *testing.T) {
 	if len(d.PendingUploads()) != 0 {
 		t.Fatal("acknowledged cleanup retained a private upload")
 	}
-	if _, err := c.Write(ctx, "writer", core.Path("/cloud/other"), strings.NewReader("x"), &n); err != nil {
+	if _, err := c.Write(ctx, "writer", core.Path("/cloud/other"), untouched, &n); err != nil {
 		t.Fatal(err)
 	}
 }

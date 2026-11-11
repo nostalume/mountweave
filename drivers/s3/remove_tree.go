@@ -3,7 +3,6 @@ package s3
 import (
 	"context"
 	"errors"
-	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -39,9 +38,9 @@ func (d *Driver) RemoveSubtree(ctx context.Context, p core.NativeAddress, limits
 	marker, token := false, ""
 	entries, planBytes := 1, 1
 	for {
-		out, err := d.client.ListObjectsV2(ctx, &sdk.ListObjectsV2Input{Bucket: aws.String(d.bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(1000), EncodingType: types.EncodingTypeUrl, ContinuationToken: optionalString(token)})
+		out, err := d.listObjects(ctx, &sdk.ListObjectsV2Input{Bucket: aws.String(d.bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(1000), EncodingType: d.listEncoding, ContinuationToken: optionalString(token)})
 		if err != nil {
-			return change, translate(err)
+			return change, err
 		}
 		next := aws.ToString(out.NextContinuationToken)
 		if out.IsTruncated == nil || len(out.CommonPrefixes) != 0 || (aws.ToBool(out.IsTruncated) && (next == "" || next == token)) {
@@ -51,12 +50,7 @@ func (d *Driver) RemoveSubtree(ctx context.Context, p core.NativeAddress, limits
 			entries++
 		}
 		for _, item := range out.Contents {
-			key := aws.ToString(item.Key)
-			if out.EncodingType == types.EncodingTypeUrl {
-				key, err = url.PathUnescape(key)
-			} else if out.EncodingType != "" {
-				err = errors.New("unsupported key encoding")
-			}
+			key, err := decodeListedKey(out.EncodingType, aws.ToString(item.Key))
 			if err != nil || !strings.HasPrefix(key, prefix) || seen[key] {
 				return change, core.Fail(core.InvalidUpstreamResponse, err)
 			}

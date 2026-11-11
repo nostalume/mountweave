@@ -39,6 +39,11 @@
 // implicitly. Run can finish this handoff after a restart. Input Release cannot
 // delete an established durable hold; a race before Hold can instead fail source
 // admission without publishing any target. The preparation is still discoverable.
+// Request.Policy follows Core.Write: zero creates exclusively and may leave
+// incomplete content, while explicit Publish requires complete publication.
+// The exact policy is persisted, never strengthened on retry. Existing stored
+// records without Policy or with legacy Replace keep their original complete
+// publication meaning; resubmitting an ID requires the same stored policy.
 //
 // Run and Abort load protected intent and acquire a process-local per-ID owner.
 // Duplicate execution returns ErrBusy. They retain no worker, Mount/use, native

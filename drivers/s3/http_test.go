@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	core "github.com/nostalume/mountweave"
-	driver "github.com/nostalume/mountweave/drivers/s3"
 )
 
 func closedClient(t *testing.T, server *httptest.Server) *http.Client {
@@ -88,7 +87,7 @@ func TestClosedHTTPBodyCancellation(t *testing.T) {
 				<-r.Context().Done()
 				close(canceled)
 			}))
-			defer server.Close()
+			t.Cleanup(server.Close)
 			client := closedClient(t, server)
 			received := make(chan struct{})
 			wire := client.Transport
@@ -102,32 +101,13 @@ func TestClosedHTTPBodyCancellation(t *testing.T) {
 			if _, err := client.Get("https://outside.invalid/"); err == nil {
 				t.Fatal("external destination admitted")
 			}
-			native := sdk.New(sdk.Options{Region: "us-east-1", BaseEndpoint: aws.String(server.URL), UsePathStyle: true, RetryMaxAttempts: 1, HTTPClient: client, Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret"}, nil
-			})})
-			storage, err := driver.New(native, "bucket", "vault/")
-			if err != nil {
-				t.Fatal(err)
-			}
-			reader, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error {
-				return nil
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			mount, err := reader.Install("/cloud", storage)
-			if err != nil {
-				_ = storage.Close()
-				t.Fatal(err)
-			}
-			// Watchdogs terminate broken tests; they are not product latency requirements.
+			_, reader := prepared(t, nil, func(o *sdk.Options) {
+				o.BaseEndpoint = aws.String(server.URL)
+				o.HTTPClient = client
+			})
+			binding, _ := reader.Binding("/cloud")
 			watchdog, stop := context.WithTimeout(context.Background(), 5*time.Second)
 			defer stop()
-			defer func() {
-				if err := reader.Close(watchdog); err != nil {
-					t.Error(err)
-				}
-			}()
 			active, cancel := context.WithCancel(watchdog)
 			defer cancel()
 			opened, err := reader.Open(active, "reader", core.Key("/cloud", "a"), core.OpenOptions{Mode: mode})
@@ -179,7 +159,7 @@ func TestClosedHTTPBodyCancellation(t *testing.T) {
 			case <-watchdog.Done():
 				t.Fatal("server did not observe cancellation")
 			}
-			if err = mount.Retire(watchdog); err != nil {
+			if err = binding.Mount.Retire(watchdog); err != nil {
 				t.Fatal(err)
 			}
 		})

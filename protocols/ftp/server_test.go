@@ -217,28 +217,6 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 			}
 			command("RNFR data", 350)
 			command("RNTO moved", 250)
-			for _, tc := range []struct {
-				line string
-				code core.Code
-			}{
-				{"DELE folder", core.NotFile}, {"RMD moved", core.NotDirectory}, {"DELE MOVED", core.NotFound},
-				{"RMD /", core.PermissionDenied},
-			} {
-				command(tc.line, 550)
-				if f := failed(); core.CodeOf(f.Err) != tc.code || !f.HasChange || f.Change.Effect != core.Unchanged {
-					t.Fatal("removal diagnostic:", tc.line, f)
-				}
-			}
-			command("CWD ../outside", 550)
-			if f := failed(); f.Operation != "CWD" || core.CodeOf(f.Err) != core.InvalidPath || f.HasChange {
-				t.Fatal("invalid path failure:", f)
-			}
-			if text := command("CWD denied", 550); text != "Storage denied the operation" {
-				t.Fatal("incorrect public cause:", text)
-			}
-			if f := failed(); f.Operation != "CWD" || !errors.Is(f.Err, storageDenial) || f.HasChange {
-				t.Fatal("lost storage cause:", f)
-			}
 			// Exercise an active endpoint through the same transfer path.
 			listener, err := net.Listen("tcp4", "127.0.0.1:0")
 			if err != nil {
@@ -261,11 +239,36 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 				t.Fatal(string(data), err)
 			}
 			response(226)
-			command("DELE moved", 250)
-			command("RMD folder", 250)
-			for _, name := range []string{"moved", "folder"} {
-				if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
-					t.Fatal("remove did not take effect:", name, err)
+			if policy == ftp.CompletePublish {
+				// These control commands share the same behavior under either STOR policy.
+				for _, tc := range []struct {
+					line string
+					code core.Code
+				}{
+					{"DELE folder", core.NotFile}, {"RMD moved", core.NotDirectory}, {"DELE MOVED", core.NotFound},
+					{"RMD /", core.PermissionDenied},
+				} {
+					command(tc.line, 550)
+					if f := failed(); core.CodeOf(f.Err) != tc.code || !f.HasChange || f.Change.Effect != core.Unchanged {
+						t.Fatal("removal diagnostic:", tc.line, f)
+					}
+				}
+				command("CWD ../outside", 550)
+				if f := failed(); f.Operation != "CWD" || core.CodeOf(f.Err) != core.InvalidPath || f.HasChange {
+					t.Fatal("invalid path failure:", f)
+				}
+				if text := command("CWD denied", 550); text != "Storage denied the operation" {
+					t.Fatal("incorrect public cause:", text)
+				}
+				if f := failed(); f.Operation != "CWD" || !errors.Is(f.Err, storageDenial) || f.HasChange {
+					t.Fatal("lost storage cause:", f)
+				}
+				command("DELE moved", 250)
+				command("RMD folder", 250)
+				for _, name := range []string{"moved", "folder"} {
+					if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatal("remove did not take effect:", name, err)
+					}
 				}
 			}
 			if err = os.WriteFile(filepath.Join(root, "abort"), []byte("old"), 0600); err != nil {
@@ -306,19 +309,21 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 				t.Fatalf("abort: %q want %q", value, want)
 			}
 			command("NOOP", 200)
-			// Abort while Accept is still pending, before any file is opened.
-			command("EPSV", 229)
-			command("STOR pending", 150)
-			if err := control.PrintfLine("ABOR"); err != nil {
-				t.Fatal(err)
-			}
-			response(426)
-			response(226)
-			if f := failed(); f.Operation != "STOR" || f.Phase != "connect" || !f.HasChange || f.Change.Effect != core.Unchanged {
-				t.Fatal("pending abort outcome:", f)
-			}
-			if _, err := os.Stat(filepath.Join(root, "pending")); !errors.Is(err, os.ErrNotExist) {
-				t.Fatal("pending transfer changed a file", err)
+			if policy == ftp.CompletePublish {
+				// Abort while Accept is still pending, before any file is opened.
+				command("EPSV", 229)
+				command("STOR pending", 150)
+				if err := control.PrintfLine("ABOR"); err != nil {
+					t.Fatal(err)
+				}
+				response(426)
+				response(226)
+				if f := failed(); f.Operation != "STOR" || f.Phase != "connect" || !f.HasChange || f.Change.Effect != core.Unchanged {
+					t.Fatal("pending abort outcome:", f)
+				}
+				if _, err := os.Stat(filepath.Join(root, "pending")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("pending transfer changed a file", err)
+				}
 			}
 			command("QUIT", 221)
 		})

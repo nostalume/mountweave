@@ -6,8 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,26 +18,62 @@ import (
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/alipan/credential"
+	"github.com/nostalume/mountweave/drivers/internal/childscan"
+	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 const Endpoint = "https://openapi.alipan.com"
 
-// Options describes an already authorized drive root, not a saved configuration.
-// Credentials transfer to the driver only when New succeeds. Client is borrowed.
+// Options selects a drive and either a prepared RootID or a drive-relative
+// RootPath. New and Open validate settings before using runtime resources.
+// Client is borrowed. See New and Open for ownership.
 type Options struct {
-	Client                    *http.Client
-	Endpoint, DriveID, RootID string
-	Credentials               *credential.Source
+	Client      *http.Client       `json:"-"`
+	Credentials *credential.Source `json:"-"`
+	Endpoint    string             `json:"endpoint,omitempty"`
+	DriveID     string             `json:"drive_id"`
+	RootID      string             `json:"root_id,omitempty"`
+	RootPath    string             `json:"root_path,omitempty"`
 	// Zero leaves these optional host policies unset.
-	MaxResolvePages  int
-	MaxResponseBytes int64
+	MaxResolvePages  int   `json:"max_resolve_pages,omitempty"`
+	MaxResponseBytes int64 `json:"max_response_bytes,omitempty"`
 	// Both values are required to enable known-length new-file uploads.
-	PartSize, MaxBufferedBytes int64
-	PartConcurrency            int
+	PartSize         int64 `json:"part_size,omitempty"`
+	MaxBufferedBytes int64 `json:"max_buffered_bytes,omitempty"`
+	PartConcurrency  int   `json:"part_concurrency,omitempty"`
 	// Zero selects a one-second interval between running deletion-task queries.
-	DeletionPollInterval time.Duration
+	DeletionPollInterval time.Duration `json:"deletion_poll_interval,omitempty"`
 }
+
+// Validate checks static settings without opening a connection or acquiring a
+// credential owner. New and Open separately require Client and Credentials.
+func (o Options) Validate() error {
+	if o.DriveID == "" || (o.RootID == "") == (o.RootPath == "") {
+		return core.Fail(core.InvalidRequest, errors.New("a drive and exactly one root ID or root path are required"))
+	}
+	if o.RootPath != "" {
+		if err := core.ValidatePath(o.RootPath); err != nil {
+			return err
+		}
+	}
+	if o.Endpoint != "" {
+		if err := validEndpoint(o.Endpoint); err != nil {
+			return core.Fail(core.InvalidRequest, err)
+		}
+	}
+	if o.MaxResolvePages < 0 || o.MaxResponseBytes < 0 || o.PartConcurrency < 0 || o.DeletionPollInterval < 0 ||
+		o.PartSize < 0 || o.MaxBufferedBytes < 0 || (o.PartSize == 0) != (o.MaxBufferedBytes == 0) || o.PartSize > 5<<30 {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	if o.PartSize != 0 {
+		if err := upload.Validate(o.PartSize, o.MaxBufferedBytes, o.PartConcurrency); err != nil {
+			return core.Fail(core.InvalidRequest, err)
+		}
+	}
+	return nil
+}
+
 type Driver struct {
 	opts         Options
 	client       *http.Client
@@ -48,27 +84,68 @@ type Driver struct {
 	buffer       *upload.Budget
 }
 
+// New constructs a prepared root without network I/O. Only success transfers
+// Credentials. Use Open to resolve a RootPath with a cancellable context.
 func New(opts Options) (*Driver, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+	if opts.RootPath != "" {
+		return nil, core.Fail(core.InvalidRequest, errors.New("root path resolution requires Open with a context"))
+	}
+	return newDriver(opts)
+}
+
+func newDriver(opts Options) (*Driver, error) {
 	if opts.Endpoint == "" {
 		opts.Endpoint = Endpoint
 	}
-	if opts.Client == nil || opts.Credentials == nil || opts.DriveID == "" || opts.RootID == "" || opts.MaxResolvePages < 0 || opts.MaxResponseBytes < 0 {
-		return nil, errors.New("a client, credential owner, prepared drive root, and nonnegative policies are required")
-	}
-	if err := validEndpoint(opts.Endpoint); err != nil {
-		return nil, err
-	}
-	if opts.PartSize < 0 || opts.MaxBufferedBytes < 0 || opts.PartConcurrency < 0 || opts.DeletionPollInterval < 0 || (opts.PartSize == 0) != (opts.MaxBufferedBytes == 0) || opts.PartSize > 5<<30 {
-		return nil, core.Fail(core.InvalidRequest, nil)
+	if opts.Client == nil || opts.Credentials == nil {
+		return nil, errors.New("a client and credential owner are required")
 	}
 	d := &Driver{opts: opts, client: isolatedClient(opts.Client)}
 	if opts.PartSize != 0 {
 		var err error
-		d.buffer, err = upload.New(opts.PartSize, opts.MaxBufferedBytes, opts.PartConcurrency)
+		d.buffer, err = upload.New(opts.MaxBufferedBytes, opts.PartConcurrency)
 		if err != nil {
 			return nil, core.Fail(core.InvalidRequest, err)
 		}
 	}
+	return d, nil
+}
+
+// Open constructs a root, resolving RootPath once from the selected drive's
+// native root. Every returned Driver owns Credentials, including on error;
+// callers must close a non-nil failed result. A nil result leaves Credentials
+// with the caller.
+// Failed results refuse operations but retain any resources needing cleanup.
+func Open(ctx context.Context, opts Options) (*Driver, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+	rootPath := opts.RootPath
+	if rootPath != "" {
+		opts.RootID, opts.RootPath = "root", ""
+	}
+	d, err := newDriver(opts)
+	if err != nil || rootPath == "" {
+		return d, err
+	}
+	root, err := d.resolve(ctx, rootPath)
+	if err == nil && root.Type != "folder" {
+		err = core.Fail(core.NotDirectory, nil)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		d.closed.Store(true)
+		return d, err
+	}
+	d.opts.RootID = root.ID
 	return d, nil
 }
 func isolatedClient(client *http.Client) *http.Client {
@@ -89,6 +166,14 @@ func (d *Driver) Close() error {
 	err := d.opts.Credentials.Close()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	failed := d.failedBodies
+	d.failedBodies, d.closeErr = nil, nil
+	for _, body := range failed {
+		if retryErr := body.Close(); retryErr != nil {
+			d.failedBodies = append(d.failedBodies, body)
+			d.closeErr = errors.Join(d.closeErr, retryErr)
+		}
+	}
 	return errors.Join(err, d.closeErr)
 }
 func (d *Driver) closeBody(body io.Closer) error {
@@ -115,33 +200,26 @@ func (d *Driver) admit(ctx context.Context, p string) error {
 }
 
 type nativeFile struct {
-	ID       string     `json:"file_id"`
-	Drive    string     `json:"drive_id"`
-	Parent   string     `json:"parent_file_id"`
-	Name     string     `json:"name"`
-	Type     string     `json:"type"`
-	Size     *int64     `json:"size"`
-	Modified *time.Time `json:"updated_at"`
+	ID         string     `json:"file_id"`
+	Drive      string     `json:"drive_id"`
+	Parent     string     `json:"parent_file_id"`
+	Name       string     `json:"name"`
+	Type       string     `json:"type"`
+	Size       *int64     `json:"size"`
+	Modified   *time.Time `json:"updated_at"`
+	PunishFlag int        `json:"punish_flag"`
 }
 
-func (f nativeFile) metadata() (core.Metadata, error) {
-	if !core.ValidName(f.Name) {
-		return core.Metadata{}, core.Fail(core.UnrepresentableName, nil)
-	}
+// metadata projects an entry whose native fields were validated by page.
+func (f nativeFile) metadata() core.Metadata {
 	meta := core.Metadata{Name: f.Name, ModifiedAt: f.Modified}
-	switch f.Type {
-	case "folder":
+	if f.Type == "folder" {
 		meta.Kind = core.Directory
-	case "file":
+	} else {
 		meta.Kind = core.File
 		meta.Size = f.Size
-		if f.Size != nil && *f.Size < 0 {
-			return core.Metadata{}, core.Fail(core.InvalidUpstreamResponse, nil)
-		}
-	default:
-		return core.Metadata{}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
-	return meta, nil
+	return meta
 }
 
 type nativePage struct {
@@ -153,7 +231,7 @@ func (d *Driver) page(ctx context.Context, parent, marker string, n int) ([]nati
 	var out nativePage
 	err := d.post(ctx, "/adrive/v1.0/openFile/list", map[string]any{"drive_id": d.opts.DriveID, "parent_file_id": parent, "marker": marker, "limit": n}, &out)
 	if err != nil {
-		return nil, "", err
+		return nil, "", pageFailure(err)
 	}
 	if out.Items == nil || (out.Next != "" && out.Next == marker) {
 		return nil, "", core.Fail(core.InvalidUpstreamResponse, nil)
@@ -162,11 +240,42 @@ func (d *Driver) page(ctx context.Context, parent, marker string, n int) ([]nati
 		if f.ID == "" || f.Drive != d.opts.DriveID || f.Parent != parent {
 			return nil, "", core.Fail(core.InvalidUpstreamResponse, nil)
 		}
-		if _, err := f.metadata(); err != nil {
-			return nil, "", err
+		if !core.ValidName(f.Name) {
+			return nil, "", core.Fail(core.UnrepresentableName, nil)
+		}
+		if (f.Type != "folder" && f.Type != "file") || (f.Type == "file" && f.Size != nil && *f.Size < 0) {
+			return nil, "", core.Fail(core.InvalidUpstreamResponse, nil)
 		}
 	}
 	return *out.Items, out.Next, nil
+}
+
+// A failed native page cannot advertise enumeration EOF. Keep its classification,
+// diagnostic and independent causes while replacing only failed EOF leaves.
+func pageFailure(err error) error {
+	if !errors.Is(err, io.EOF) {
+		return err
+	}
+	causes := []error{errors.New(err.Error())}
+	var collect func(error)
+	collect = func(cause error) {
+		if !errors.Is(cause, io.EOF) {
+			causes = append(causes, cause)
+			return
+		}
+		switch failure := cause.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range failure.Unwrap() {
+				collect(child)
+			}
+		case interface{ Unwrap() error }:
+			collect(failure.Unwrap())
+		default:
+			causes = append(causes, io.ErrUnexpectedEOF)
+		}
+	}
+	collect(err)
+	return core.Fail(core.CodeOf(err), errors.Join(causes...))
 }
 
 // resolve scans every native page for each segment before claiming uniqueness.
@@ -194,29 +303,14 @@ func (d *Driver) resolve(ctx context.Context, p string) (nativeFile, error) {
 	}
 	return current, nil
 }
-func (d *Driver) child(ctx context.Context, parent, name string) (found nativeFile, exists bool, err error) {
-	marker := ""
-	for pages := 0; ; pages++ {
-		if d.opts.MaxResolvePages > 0 && pages >= d.opts.MaxResolvePages {
-			return found, exists, core.Fail(core.ResolutionBudgetExceeded, nil)
+func (d *Driver) child(ctx context.Context, parent, name string) (nativeFile, bool, error) {
+	scan := iterator{driver: d, parent: parent}
+	return childscan.Unique(ctx, name, func(ctx context.Context) ([]nativeFile, error) {
+		if d.opts.MaxResolvePages > 0 && scan.pages >= uint64(d.opts.MaxResolvePages) {
+			return nil, core.Fail(core.ResolutionBudgetExceeded, nil)
 		}
-		batch, next, e := d.page(ctx, parent, marker, 100)
-		if e != nil {
-			return found, exists, e
-		}
-		for _, f := range batch {
-			if f.Name == name {
-				if exists {
-					return found, exists, core.Fail(core.PathAmbiguous, nil)
-				}
-				found, exists = f, true
-			}
-		}
-		if next == "" {
-			return
-		}
-		marker = next
-	}
+		return scan.next(ctx, 100)
+	}, func(f nativeFile) (string, string) { return f.ID, f.Name })
 }
 func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selections ...core.ReadSelection) (meta core.Metadata, err error) {
 	if len(selections) > 1 {
@@ -246,7 +340,7 @@ func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selectio
 	if p == "/" {
 		return core.Metadata{Kind: core.Directory}, nil
 	}
-	return f.metadata()
+	return f.metadata(), nil
 }
 func (d *Driver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core.Iterator, error) {
 	if pAddress.Address().Namespace() != core.TreeNamespace || pAddress.Delimiter() != "" || pAddress.StartAfter() != "" {
@@ -267,12 +361,26 @@ func (d *Driver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core
 type iterator struct {
 	driver         *Driver
 	parent, marker string
+	checkpoint     string
+	pages          uint64
 	done, closed   bool
 	files          map[string]nativeFile
 }
 
 func (i *iterator) Close() error { i.closed = true; i.files = nil; return nil }
 func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
+	batch, err := i.next(ctx, n)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	items := make([]core.Metadata, 0, len(batch))
+	for _, f := range batch {
+		items = append(items, f.metadata())
+	}
+	return items, err
+}
+
+func (i *iterator) next(ctx context.Context, n int) ([]nativeFile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -288,33 +396,34 @@ func (i *iterator) Next(ctx context.Context, n int) ([]core.Metadata, error) {
 	if n < 1 {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
-	if n > 100 {
-		n = 100
-	}
-	batch, next, err := i.driver.page(ctx, i.parent, i.marker, n)
+	batch, next, err := i.driver.page(ctx, i.parent, i.marker, min(n, 100))
 	if err != nil {
 		return nil, err
 	}
-	items := make([]core.Metadata, 0, len(batch))
-	for _, f := range batch {
-		if i.files != nil {
-			if _, exists := i.files[f.Name]; exists {
+	if next != "" && next == i.checkpoint {
+		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("native continuation cycle"))
+	}
+	if i.files != nil {
+		for _, f := range batch {
+			if previous, exists := i.files[f.Name]; exists {
+				if previous.ID == f.ID {
+					return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("native child identity repeated"))
+				}
 				return nil, core.Fail(core.PathAmbiguous, nil)
 			}
 			i.files[f.Name] = f
 		}
-		meta, err := f.metadata()
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, meta)
 	}
-	i.marker = next
-	i.done = next == ""
+	i.marker, i.done = next, next == ""
 	if i.done {
-		return items, io.EOF
+		return batch, io.EOF
 	}
-	return items, nil
+	// Power-of-two checkpoints detect a repeating cycle without saving every cursor.
+	i.pages++
+	if bits.OnesCount64(i.pages) == 1 {
+		i.checkpoint = next
+	}
+	return batch, nil
 }
 
 type nativeError struct {
@@ -372,64 +481,65 @@ func (d *Driver) post(ctx context.Context, route string, input, out any) error {
 	return err
 }
 
-// call distinguishes reads, which may replay an auth rejection, from mutations.
+// call returns the native command's acceptance independently of response cleanup.
 // A rejected mutation refreshes credentials for the next call without replaying.
-func (d *Driver) call(ctx context.Context, route string, input, out any, replay bool) (rejected bool, err error) {
+func (d *Driver) call(ctx context.Context, route string, input, out any, replay bool) (core.Effect, error) {
 	payload, err := json.Marshal(input)
 	if err != nil {
-		return true, err
+		return core.Unchanged, err
 	}
 	access, err := d.opts.Credentials.Access(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return true, err
+			return core.Unchanged, err
 		}
-		return true, core.Fail(core.UpstreamAccessDenied, err)
+		return core.Unchanged, core.Fail(core.UpstreamAccessDenied, err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(d.opts.Endpoint, "/")+route, bytes.NewReader(payload))
 		if err != nil {
-			return true, err
+			return core.Unchanged, err
 		}
 		req.Header.Set("Authorization", "Bearer "+access)
 		req.Header.Set("Content-Type", "application/json")
+		if err := ctx.Err(); err != nil {
+			return core.Unchanged, err
+		}
 		response, err := d.client.Do(req)
 		if err != nil {
-			return false, networkError(err)
+			return core.Unknown, networkError(err)
 		}
+		effect := core.Unknown
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			err = decode(response.Body, d.opts.MaxResponseBytes, out)
-			return false, errors.Join(err, d.closeBody(response.Body))
+			if err == nil {
+				effect = core.Applied
+			}
+			return effect, errors.Join(err, d.closeBody(response.Body))
 		}
 		var failure nativeError
 		decodeErr := decode(response.Body, d.opts.MaxResponseBytes, &failure)
 		closeErr := d.closeBody(response.Body)
-		rejected = response.StatusCode == 400 || response.StatusCode == 401 || response.StatusCode == 403 || response.StatusCode == 404 || response.StatusCode == 409 || response.StatusCode == 429
+		switch response.StatusCode {
+		case 400, 401, 403, 404, 409, 429:
+			effect = core.Unchanged
+		}
 		if closeErr != nil {
-			return rejected, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), closeErr)
+			return effect, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), closeErr)
 		}
 		if attempt == 0 && (failure.Code == "AccessTokenExpired" || failure.Code == "AccessTokenInvalid") {
 			access, err = d.opts.Credentials.Reject(ctx, access)
 			if err != nil {
-				return true, core.Fail(core.UpstreamAccessDenied, err)
+				return core.Unchanged, core.Fail(core.UpstreamAccessDenied, err)
 			}
 			if !replay {
-				return true, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), ctx.Err())
+				return core.Unchanged, errors.Join(statusError(response.StatusCode, failure.Code, decodeErr), ctx.Err())
 			}
 			continue
 		}
-		return rejected, statusError(response.StatusCode, failure.Code, decodeErr)
+		return effect, statusError(response.StatusCode, failure.Code, decodeErr)
 	}
-	return true, core.Fail(core.UpstreamAccessDenied, nil)
-}
-func rangeHeader(r *core.Range) string {
-	if r.Suffix {
-		return fmt.Sprintf("bytes=-%d", r.Start)
-	}
-	if r.End < 0 {
-		return fmt.Sprintf("bytes=%d-", r.Start)
-	}
-	return fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
+	return core.Unchanged, core.Fail(core.UpstreamAccessDenied, nil)
 }
 func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options core.OpenOptions) (core.Opened, error) {
 	if err := options.Validate(); err != nil {
@@ -438,7 +548,6 @@ func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options 
 	if options.Mode != core.StreamRead {
 		return core.Opened{Change: core.Change{Effect: core.Unchanged}}, core.Fail(core.UnsupportedOperation, nil)
 	}
-	wanted := options.Range
 	if options.Selection.Version != "" {
 		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -447,9 +556,6 @@ func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options 
 	}
 	p := pAddress.Value()
 
-	if wanted != nil && !wanted.Valid() {
-		return core.Opened{}, core.Fail(core.InvalidRange, nil)
-	}
 	f, err := d.resolve(ctx, p)
 	if err != nil {
 		return core.Opened{}, err
@@ -461,7 +567,7 @@ func (d *Driver) Open(ctx context.Context, pAddress core.NativeAddress, options 
 	if err := options.Selection.Check(core.Evidence{}); err != nil {
 		return core.Opened{}, err
 	}
-	return d.openFile(ctx, f, wanted)
+	return d.openFile(ctx, f, options.Range)
 }
 
 func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range) (core.Opened, error) {
@@ -470,6 +576,10 @@ func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range)
 	}
 	if f.Type != "file" {
 		return core.Opened{}, core.Fail(core.NotFile, nil)
+	}
+	// A frozen file's grant can point to a notice instead of the original bytes.
+	if f.PunishFlag == 2 {
+		return core.Opened{}, core.Fail(core.UpstreamAccessDenied, errors.New("Aliyun Drive file is frozen"))
 	}
 	var link struct {
 		URL    string `json:"url"`
@@ -485,56 +595,23 @@ func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range)
 	// This is a fresh request: provider bearer credentials never reach a download origin.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, err)
+		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 	if wanted != nil {
-		req.Header.Set("Range", rangeHeader(wanted))
+		req.Header.Set("Range", httpcontent.Header(wanted))
 	}
 	response, err := d.client.Do(req)
+	if errors.Is(err, context.Canceled) {
+		return core.Opened{}, context.Canceled
+	}
 	if err != nil {
-		return core.Opened{}, networkError(err)
+		return core.Opened{}, httpcontent.UpstreamIOError(err)
 	}
-	opened := core.Opened{Metadata: core.Metadata{Name: f.Name, Kind: core.File}, Body: response.Body}
-	if response.StatusCode != 200 && response.StatusCode != 206 {
-		failure := statusError(response.StatusCode, "", nil)
-		if response.StatusCode == 416 {
-			failure = &core.Error{Code: core.RangeNotSatisfiable}
-			var total int64
-			text := response.Header.Get("Content-Range")
-			if _, err := fmt.Sscanf(text, "bytes */%d", &total); err == nil && total >= 0 && text == fmt.Sprintf("bytes */%d", total) {
-				failure.(*core.Error).Total = &total
-			}
-		}
-		return opened, failure
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		return core.Opened{Metadata: core.Metadata{Name: f.Name, Kind: core.File}, Body: response.Body}, statusError(response.StatusCode, "", nil)
 	}
-	if response.Header.Get("Content-Encoding") != "" && response.Header.Get("Content-Encoding") != "identity" {
-		return opened, core.Fail(core.InvalidUpstreamResponse, nil)
-	}
-	if response.ContentLength >= 0 {
-		length := response.ContentLength
-		opened.Length = &length
-		opened.Metadata.Size = &length
-	}
-	if modified, err := http.ParseTime(response.Header.Get("Last-Modified")); err == nil {
-		opened.Metadata.ModifiedAt = &modified
-	}
-	text := response.Header.Get("Content-Range")
-	if response.StatusCode == 206 {
-		var actual core.ContentRange
-		_, err := fmt.Sscanf(text, "bytes %d-%d/%d", &actual.Start, &actual.End, &actual.Total)
-		if err != nil || wanted == nil || text != fmt.Sprintf("bytes %d-%d/%d", actual.Start, actual.End, actual.Total) {
-			return opened, core.Fail(core.InvalidUpstreamResponse, err)
-		}
-		expected, err := wanted.Resolve(actual.Total)
-		if err != nil || expected != actual || opened.Length == nil || *opened.Length != actual.End-actual.Start+1 {
-			return opened, core.Fail(core.InvalidUpstreamResponse, err)
-		}
-		opened.Range = &actual
-		total := actual.Total
-		opened.Metadata.Size = &total
-	} else if text != "" {
-		return opened, core.Fail(core.InvalidUpstreamResponse, nil)
-	}
-	return opened, nil
+	opened, err := httpcontent.Open(response, wanted)
+	opened.Metadata.Name = f.Name
+	return opened, err
 }

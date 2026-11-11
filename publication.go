@@ -84,7 +84,7 @@ const (
 	TargetPresent
 )
 
-// PublicationOptions is shared by ordinary and continuable native publication.
+// PublicationOptions constrains native complete publication.
 // ObserveTarget requests a presence observation for response classification.
 // It does not strengthen When; ordinary publication need not perform that I/O.
 type PublicationOptions struct {

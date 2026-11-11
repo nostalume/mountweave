@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +29,22 @@ func response(r *http.Request, status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: r}
 }
 func listing(r *http.Request, items, marker string, truncated bool) *http.Response {
-	return response(r, 200, fmt.Sprintf("<ListBucketResult><IsTruncated>%t</IsTruncated><EncodingType>url</EncodingType>%s<NextContinuationToken>%s</NextContinuationToken></ListBucketResult>", truncated, items, marker))
+	return listResponse(r, items, marker, truncated, "<EncodingType>url</EncodingType>")
+}
+
+func listResponse(r *http.Request, items, marker string, truncated bool, encoding string) *http.Response {
+	q := r.URL.Query()
+	next, namespace := "NextContinuationToken", ""
+	if q.Get("list-type") == "" {
+		next = "NextMarker"
+		if q.Get("encoding-type") == "url" {
+			marker = url.PathEscape(marker)
+		}
+	}
+	if strings.HasSuffix(r.URL.Host, ".ufileos.com") {
+		namespace = ` xmlns="http://s3.UFileaws.com/doc/2006-03-01/"`
+	}
+	return response(r, 200, fmt.Sprintf("<ListBucketResult%s><IsTruncated>%t</IsTruncated>%s%s<%s>%s</%s></ListBucketResult>", namespace, truncated, encoding, items, next, marker, next))
 }
 func prepared(t *testing.T, rt transport, options ...func(*sdk.Options)) (*driver.Driver, *core.Core) {
 	return preparedDriver(t, rt, nil, nil, options...)
@@ -69,35 +85,110 @@ func requireCode(t *testing.T, err error, want core.Code) {
 }
 
 func TestSDKProtocolThroughCore(t *testing.T) {
-	directory := t.TempDir()
+	for _, profile := range []struct {
+		name, endpoint, region string
+		plain, listV1          bool
+	}{
+		{"encoded", "https://s3.example.test", "us-east-1", false, false},
+		{"plain", "https://s3.cn-east-1.qiniucs.com", "cn-east-1", true, false},
+		{"oss", "https://s3.oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou", true, false},
+		{"r2", "https://account.r2.cloudflarestorage.com", "auto", false, false},
+		{"cos", "https://cos.ap-guangzhou.myqcloud.com", "ap-guangzhou", false, true},
+		{"us3", "https://s3-cn-bj.ufileos.com", "cn-bj", true, false},
+	} {
+		t.Run(profile.name, func(t *testing.T) {
+			testSDKProtocolThroughCore(t, profile.endpoint, profile.region, profile.plain, profile.listV1, profile.name == "encoded")
+		})
+	}
+}
+
+func testSDKProtocolThroughCore(t *testing.T, endpoint, region string, plain, listV1, exerciseReads bool) {
+	var directory string
+	if exerciseReads {
+		directory = t.TempDir()
+	}
+	afterParam, listType, firstMarker, secondMarker := "continuation-token", "2", "empty", "opaque"
+	if listV1 {
+		afterParam, listType, firstMarker, secondMarker = "marker", "", "vault/", "vault/a +%"
+	}
+	if region == "cn-bj" {
+		firstMarker, secondMarker = "next+/=", "after+%/="
+	}
+	wireLine := "vault/line-break/a\r\nb"
+	if listV1 {
+		wireLine = "vault/line-break/a%0D%0Ab%252F"
+	}
+	wireFile, wireDir, encoding := "vault/a%20%2B%25", "vault/folder%20%2B%25/", "url"
+	list := listing
+	if plain {
+		wireFile, wireDir, encoding = "vault/a +%", "vault/folder +%/", ""
+		list = func(r *http.Request, items, marker string, truncated bool) *http.Response {
+			return listResponse(r, items, marker, truncated, "")
+		}
+	}
 	var mu sync.Mutex
 	calls := map[string]int{}
 	rootPages := 0
+	rootLimit := ""
 	rt := transport(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
 			t.Error("missing SDK signature")
 		}
-		if r.URL.Host != "s3.example.test" {
+		if !strings.Contains(r.Header.Get("Authorization"), "/"+region+"/s3/aws4_request") {
+			t.Error("missing configured signing region")
+		}
+		if r.URL.Host != "bucket."+strings.TrimPrefix(endpoint, "https://") {
 			t.Errorf("host %q", r.URL.Host)
 		}
 		key := r.Method + " " + r.URL.EscapedPath() + "?" + r.URL.Query().Get("prefix")
 		mu.Lock()
 		calls[key]++
 		mu.Unlock()
-		if r.URL.Query().Get("list-type") == "2" {
-			if r.URL.Query().Get("prefix") != "vault/" {
-				if r.URL.Query().Get("prefix") == "vault/folder/" {
-					return listing(r, "<Contents><Key>vault/folder/</Key><Size>0</Size></Contents>", "", false), nil
+		query := r.URL.Query()
+		if query.Has("prefix") {
+			if query.Get("list-type") != listType || query.Get("encoding-type") != encoding ||
+				plain && query.Has("encoding-type") || listV1 && (query.Has("start-after") || query.Has("continuation-token")) {
+				t.Fatalf("native listing query: %v", query)
+			}
+			switch query.Get("prefix") {
+			case "vault/marker/":
+				if !listV1 || query.Get("marker") != "vault/marker/a +%" {
+					t.Fatalf("initial marker: %v", query)
 				}
-				return listing(r, "", "", false), nil
+				return list(r, "", "vault/marker/a +%", true), nil
+			case "vault/folder +%/":
+				return list(r, "<Contents><Key>"+wireDir+"</Key><Size>0</Size></Contents>", "", false), nil
+			case "vault/line-break/":
+				item := "<Contents><Key>" + wireLine + "</Key></Contents>"
+				if !listV1 {
+					return list(r, item, "", false), nil
+				}
+				switch query.Get("marker") {
+				case "":
+					return response(r, 200, "<ListBucketResult><IsTruncated>true</IsTruncated><EncodingType>url</EncodingType>"+item+"</ListBucketResult>"), nil
+				case "vault/line-break/a\r\nb%2F":
+					return list(r, "", "", false), nil
+				default:
+					t.Fatalf("fallback marker: %v", query)
+				}
+			case "vault/":
+			default:
+				return list(r, "", "", false), nil
 			}
 			rootPages++
-			if r.URL.Query().Get("continuation-token") == "" {
-				return listing(r, "<Contents><Key>vault/a%20%2B%25</Key><Size>10</Size></Contents>", "opaque", true), nil
+			rootLimit = r.URL.Query().Get("max-keys")
+			switch query.Get(afterParam) {
+			case "":
+				return list(r, "", firstMarker, true), nil
+			case firstMarker:
+				return list(r, "<Contents><Key>"+wireFile+"</Key><Size>10</Size></Contents>", secondMarker, true), nil
+			case secondMarker:
+				return list(r, "<CommonPrefixes><Prefix>"+wireDir+"</Prefix></CommonPrefixes>", "", false), nil
+			default:
+				t.Fatal("unexpected continuation", r.URL.Query())
 			}
-			return listing(r, "<CommonPrefixes><Prefix>vault/folder/</Prefix></CommonPrefixes>", "", false), nil
 		}
-		if r.URL.Path != "/bucket/vault/a +%" {
+		if r.URL.Path != "/vault/a +%" {
 			return response(r, 404, ""), nil
 		}
 		switch r.Method {
@@ -122,20 +213,52 @@ func TestSDKProtocolThroughCore(t *testing.T) {
 		}
 		return nil, errors.New("unexpected operation")
 	})
-	d, c := prepared(t, rt)
+	d, c := preparedDriver(t, rt, []driver.Options{{PlainListKeys: plain, ListV1: listV1}}, nil, func(o *sdk.Options) {
+		o.UsePathStyle = false
+		o.BaseEndpoint, o.Region = aws.String(endpoint), region
+	})
 	ctx := context.Background()
+	if listV1 {
+		query := core.Keys("/cloud", "marker/", "").After("marker/a +%")
+		_, err := c.List(ctx, "reader", core.ListRequest{Query: query, Limit: 1, CursorTTL: time.Minute})
+		requireCode(t, err, core.InvalidUpstreamResponse)
+		req := core.ListRequest{Query: core.Keys("/cloud", "line-break/", ""), Limit: 1, CursorTTL: time.Minute}
+		page, err := c.List(ctx, "reader", req)
+		if err != nil || len(page.Items) != 1 || page.Items[0].Address.Value() != "line-break/a\r\nb%2F" || page.NextCursor == nil {
+			t.Fatalf("encoded listing lost the exact key or cursor: %v %v", page, err)
+		}
+		req.Cursor = *page.NextCursor
+		page, err = c.List(ctx, "reader", req)
+		if err != nil || len(page.Items) != 0 || page.NextCursor != nil {
+			t.Fatalf("list after the last key: %v %v", page, err)
+		}
+	}
+	if plain {
+		_, err := c.Stat(ctx, "reader", core.Path("/cloud/line-break"))
+		requireCode(t, err, core.InvalidUpstreamResponse)
+		_, err = c.List(ctx, "reader", core.ListRequest{Query: core.Keys("/cloud", "line-break/", ""), Limit: 1, CursorTTL: time.Minute})
+		requireCode(t, err, core.InvalidUpstreamResponse)
+	}
 	entry, err := c.Stat(ctx, "reader", core.Path("/cloud/a +%"))
 	if err != nil || entry.Size == nil || *entry.Size != 10 {
 		t.Fatalf("stat: %v %v", entry, err)
 	}
 	first, err := c.List(ctx, "reader", core.ListRequest{Query: core.Children(core.Path("/cloud")), Limit: 1, CursorTTL: time.Minute})
-	if err != nil || len(first.Items) != 1 || first.Items[0].Name != "a +%" || first.NextCursor == nil {
+	if err != nil || len(first.Items) != 0 || first.NextCursor == nil || rootLimit != "1" {
 		t.Fatalf("first: %v %v", first, err)
 	}
 	req := core.ListRequest{Query: core.Children(core.Path("/cloud")), Cursor: *first.NextCursor}
 	second, err := c.List(ctx, "reader", req)
-	if err != nil || len(second.Items) != 1 || second.Items[0].Kind != core.Directory || second.NextCursor != nil {
+	if err != nil || len(second.Items) != 1 || second.Items[0].Name != "a +%" || second.NextCursor == nil || rootLimit != "1" {
 		t.Fatalf("second: %v %v", second, err)
+	}
+	req.Cursor = *second.NextCursor
+	last, err := c.List(ctx, "reader", req)
+	if err != nil || len(last.Items) != 1 || last.Items[0].Kind != core.Directory || last.Items[0].Name != "folder +%" || last.NextCursor != nil || rootLimit != "1" {
+		t.Fatalf("last: %v %v", last, err)
+	}
+	if dir, err := c.Stat(ctx, "reader", last.Items[0].Address); err != nil || dir.Kind != core.Directory {
+		t.Fatalf("directory from listing cannot be resolved: %v %v", dir, err)
 	}
 	before := rootPages
 	replay, err := c.List(ctx, "reader", req)
@@ -144,6 +267,9 @@ func TestSDKProtocolThroughCore(t *testing.T) {
 	}
 	if rootPages != before {
 		t.Fatal("replay advanced the native page")
+	}
+	if !exerciseReads {
+		return
 	}
 	opened, err := c.Open(ctx, "reader", core.Path("/cloud/a +%"), core.OpenOptions{Range: &core.Range{Start: 2, End: 5}})
 	if err != nil {
@@ -157,16 +283,30 @@ func TestSDKProtocolThroughCore(t *testing.T) {
 		t.Fatalf("content: %q %#v", data, opened)
 	}
 	// Stat used HEAD; Open goes directly to GET after its directory probe.
-	if calls["HEAD /bucket/vault/a%20+%25?"]+calls["HEAD /bucket/vault/a%20%2B%25?"] != 1 {
+	if calls["HEAD /vault/a%20+%25?"]+calls["HEAD /vault/a%20%2B%25?"] != 1 {
 		t.Fatalf("unexpected repeated HEAD: %v", calls)
 	}
-	scope, err := d.OpenDirectory(ctx, core.NativePath("/"))
+	opening, cancelOpening := context.WithCancel(ctx)
+	scope, err := d.OpenDirectory(opening, core.NativePath("/"))
+	cancelOpening()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer scope.Close()
+	if _, err := scope.OpenFile(ctx, "a +%"); core.CodeOf(err) != core.InvalidRequest {
+		t.Fatal("child opened before enumeration completed", err)
+	}
+	before = rootPages
+	canceled, cancelNext := context.WithCancel(ctx)
+	cancelNext()
+	if _, err := scope.Next(canceled, 2000); !errors.Is(err, context.Canceled) || rootPages != before {
+		t.Fatal("canceled call advanced native enumeration", rootPages, before, err)
+	}
 	for {
-		_, err = scope.Next(ctx, 1)
+		_, err = scope.Next(ctx, 2000)
+		if rootLimit != "1000" {
+			t.Fatal("native page size not capped", rootLimit)
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -208,9 +348,9 @@ func TestSDKProtocolThroughCore(t *testing.T) {
 }
 
 func TestAmbiguousNamesAndIncompleteProbes(t *testing.T) {
-	for _, scenario := range []string{"ambiguous", "incomplete", "missing", "bad-marker", "denied"} {
+	for _, scenario := range []string{"ambiguous", "incomplete", "missing", "bad-marker", "denied", "missing-truncation", "repeated-continuation"} {
 		t.Run(scenario, func(t *testing.T) {
-			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
+			d, c := prepared(t, func(r *http.Request) (*http.Response, error) {
 				if r.URL.Query().Get("list-type") == "2" {
 					switch scenario {
 					case "incomplete":
@@ -219,6 +359,10 @@ func TestAmbiguousNamesAndIncompleteProbes(t *testing.T) {
 						return listing(r, "<CommonPrefixes><Prefix>vault/a/</Prefix></CommonPrefixes>", "", false), nil
 					case "bad-marker":
 						return listing(r, "", "", true), nil
+					case "missing-truncation":
+						return response(r, 200, "<ListBucketResult></ListBucketResult>"), nil
+					case "repeated-continuation":
+						return listing(r, "", "same", true), nil
 					}
 					return listing(r, "", "", false), nil
 				}
@@ -232,6 +376,21 @@ func TestAmbiguousNamesAndIncompleteProbes(t *testing.T) {
 				}
 				return response(r, 404, ""), nil
 			})
+			if scenario == "missing-truncation" || scenario == "repeated-continuation" {
+				iter, err := d.Enumerate(context.Background(), core.NativeKeys("", ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer iter.Close()
+				if scenario == "repeated-continuation" {
+					if items, err := iter.Next(context.Background(), 1); err != nil || len(items) != 0 {
+						t.Fatal(items, err)
+					}
+				}
+				_, err = iter.Next(context.Background(), 1)
+				requireCode(t, err, core.InvalidUpstreamResponse)
+				return
+			}
 			_, err := c.Stat(context.Background(), "reader", core.Path("/cloud/a"))
 			want := map[string]core.Code{"ambiguous": core.PathAmbiguous, "incomplete": core.UpstreamFailure, "missing": core.NotFound, "bad-marker": core.InvalidUpstreamResponse, "denied": core.UpstreamAccessDenied}[scenario]
 			requireCode(t, err, want)
@@ -245,6 +404,7 @@ func TestAmbiguousNamesAndIncompleteProbes(t *testing.T) {
 
 func TestNativeKeyFlow(t *testing.T) {
 	ctx := context.Background()
+	root := t.TempDir()
 	server := newProtocol()
 	keys := []string{"a", "a/b", "a/", "a//b", "/", "/a", "a +%", "a/../b", `a\b`, "a\x00b", "folder/x"}
 	for _, key := range keys {
@@ -314,11 +474,6 @@ func TestNativeKeyFlow(t *testing.T) {
 		}
 		return nil
 	})
-	defer func() {
-		if err := c.Close(ctx); err != nil {
-			t.Error(err)
-		}
-	}()
 	for _, key := range keys {
 		address := core.Key("/cloud", key)
 		e, err := c.Stat(ctx, "reader", address)
@@ -486,7 +641,6 @@ func TestNativeKeyFlow(t *testing.T) {
 	}
 	_, err = c.Stat(alias.Context(ctx), "reader", core.Key("/alias", "x"))
 	requireCode(t, err, core.MountUnavailable)
-	root := t.TempDir()
 	localDriver, err := local.New(root)
 	if err != nil {
 		t.Fatal(err)
@@ -537,81 +691,110 @@ type trackedBody struct {
 
 func (b *trackedBody) Close() error { b.closed = true; return nil }
 func TestContentFactsFailuresAndCleanup(t *testing.T) {
-	for _, scenario := range []string{"fallback", "unknown-length", "short", "bad-range", "missing-range", "unsatisfied", "cancel"} {
-		t.Run(scenario, func(t *testing.T) {
-			body := &trackedBody{Reader: strings.NewReader("abc")}
+	const expected = `"expected"`
+	match := core.IfMatch(core.Validator{Domain: "s3-etag", Tag: expected})
+	none := core.IfNotMatch(core.Validator{Domain: "s3-etag", Tag: "W/" + expected})
+	for _, test := range []struct {
+		name              string
+		status            int
+		length            int64
+		contentRange, tag string
+		when              core.Condition
+		code              core.Code
+		readErr           error
+		total             int64
+	}{
+		{name: "unknown-length", status: 200, length: -1},
+		{name: "short", status: 200, length: 8, readErr: io.ErrUnexpectedEOF},
+		{name: "bad-range", status: 206, contentRange: "bytes 0-2/10", code: core.InvalidUpstreamResponse},
+		{name: "missing-range", status: 206, code: core.InvalidUpstreamResponse},
+		{name: "unsatisfied", status: 416, contentRange: "bytes */3", code: core.RangeNotSatisfiable, total: 3},
+		{name: "unsatisfied-trailing", status: 416, contentRange: "bytes */3 junk", code: core.RangeNotSatisfiable},
+		{name: "unsatisfied-negative", status: 416, contentRange: "bytes */-1", code: core.RangeNotSatisfiable},
+		{name: "wrong-match", status: 200, tag: `"other"`, when: match, code: core.InvalidUpstreamResponse},
+		{name: "wrong-none", status: 200, tag: expected, when: none, code: core.InvalidUpstreamResponse},
+		{name: "missing-tag", status: 200, when: match, code: core.UnsupportedOperation},
+		{name: "malformed-tag", status: 200, tag: "bare", when: match, code: core.InvalidUpstreamResponse},
+		{name: "present", status: 200, when: core.IfPresent()},
+		{name: "native-match", status: 412, tag: `"other"`, when: match, code: core.PreconditionFailed},
+		{name: "native-none", status: 304, tag: expected, when: none, code: core.PreconditionFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := "abc"
+			switch test.status {
+			case http.StatusNotModified:
+				payload = ""
+			case http.StatusPreconditionFailed:
+				payload = "<Error><Code>PreconditionFailed</Code></Error>"
+			case http.StatusRequestedRangeNotSatisfiable:
+				payload = "<Error><Code>InvalidRange</Code></Error>"
+			}
+			body := &trackedBody{Reader: strings.NewReader(payload)}
 			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
 				if r.URL.Query().Get("list-type") == "2" {
 					return listing(r, "", "", false), nil
 				}
-				result := response(r, 200, "abc")
+				noneHeader := ""
+				if test.when == none {
+					noneHeader = expected
+				}
+				if r.Header.Get("If-Match") != test.when.Match() || r.Header.Get("If-None-Match") != noneHeader {
+					t.Fatalf("unexpected native read condition: %v", r.Header)
+				}
+				result := response(r, test.status, payload)
 				result.Body = body
-				result.Header.Set("Content-Length", "3")
-				switch scenario {
-				case "unknown-length":
-					result.ContentLength = -1
-					result.Header.Del("Content-Length")
-				case "short":
-					result.ContentLength = 8
-					result.Header.Set("Content-Length", "8")
-				case "bad-range":
-					result.StatusCode = 206
-					result.Header.Set("Content-Range", "bytes 0-2/10")
-				case "missing-range":
-					result.StatusCode = 206
-				case "unsatisfied":
-					result.StatusCode = 416
-					result.Header.Set("Content-Range", "bytes */3")
-					result.Body = io.NopCloser(strings.NewReader("<Error><Code>InvalidRange</Code></Error>"))
+				if test.length != 0 {
+					result.ContentLength = test.length
+				}
+				if result.ContentLength >= 0 {
+					result.Header.Set("Content-Length", fmt.Sprint(result.ContentLength))
+				}
+				if test.contentRange != "" {
+					result.Header.Set("Content-Range", test.contentRange)
+				}
+				if test.tag != "" {
+					result.Header.Set("ETag", test.tag)
 				}
 				return result, nil
 			})
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			address := core.Path("/cloud/a")
-			if scenario == "cancel" {
-				address = core.Key("/cloud", "a")
-			}
-			opened, err := c.Open(ctx, "reader", address, core.OpenOptions{Range: &core.Range{Start: 1, End: 2}})
-			switch scenario {
-			case "bad-range", "missing-range":
-				requireCode(t, err, core.InvalidUpstreamResponse)
+			opened, err := c.Open(context.Background(), "reader", core.Path("/cloud/a"), core.OpenOptions{
+				Range: &core.Range{Start: 1, End: 2}, Selection: core.ReadSelection{When: test.when},
+			})
+			defer func() {
 				if !body.closed {
-					t.Fatal("rejected body leaked")
+					t.Error("response body leaked")
+				}
+			}()
+			if test.code != "" {
+				requireCode(t, err, test.code)
+				if opened.Body != nil {
+					t.Fatal("failed read exposed a response body")
+				}
+				switch test.code {
+				case core.PreconditionFailed:
+					var failure *core.ConditionFailure
+					if !errors.As(err, &failure) || failure.Negative != (test.status == http.StatusNotModified) {
+						t.Fatal("native precondition failure lost its status", err)
+					}
+				case core.RangeNotSatisfiable:
+					var failure *core.Error
+					if !errors.As(err, &failure) || failure.Cause == nil ||
+						test.total == 0 && failure.Total != nil ||
+						test.total != 0 && (failure.Total == nil || *failure.Total != test.total) {
+						t.Fatal("range total", err)
+					}
 				}
 				return
-			case "unsatisfied":
-				requireCode(t, err, core.RangeNotSatisfiable)
-				var failure *core.Error
-				if !errors.As(err, &failure) || failure.Total == nil || *failure.Total != 3 {
-					t.Fatalf("range total %v", err)
-				}
-				return
 			}
-			if err != nil {
-				t.Fatal(err)
+			if err != nil || opened.Range != nil {
+				t.Fatal("full response rejected or projected as partial", opened, err)
 			}
-			if opened.Range != nil {
-				t.Fatal("fabricated partial response")
-			}
-			if scenario == "unknown-length" && (opened.Length != nil || opened.Entry.Size != nil) {
+			if test.length < 0 && (opened.Length != nil || opened.Entry.Size != nil) {
 				t.Fatal("invented length")
 			}
-			if scenario == "cancel" {
-				cancel()
-			}
-			_, err = io.ReadAll(opened.Body)
-			if scenario == "short" && !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatalf("short read: %v", err)
-			}
-			if scenario == "cancel" && !errors.Is(err, context.Canceled) {
-				t.Fatalf("cancellation: %v", err)
-			}
-			if scenario != "short" && scenario != "cancel" && err != nil {
-				t.Fatal(err)
-			}
-			if !body.closed {
-				t.Fatal("completed body leaked")
+			data, err := io.ReadAll(opened.Body)
+			if string(data) != payload || !errors.Is(err, test.readErr) {
+				t.Fatal(string(data), err)
 			}
 		})
 	}
@@ -620,11 +803,14 @@ func TestContentFactsFailuresAndCleanup(t *testing.T) {
 // TestConditionalCreateThroughCore reuses the protocol fixture and exercises
 // only the new write boundary, without a provider service or account.
 func TestConditionalCreateThroughCore(t *testing.T) {
-	for _, mode := range []string{"normal", "empty", "ack-cancel", "conflict", "lost", "short", "long", "long-ack", "unknown", "directory", "missing-parent"} {
+	for _, mode := range []string{"normal", "empty", "ack-cancel", "conflict", "lost", "short", "long", "long-ack", "tail-error", "tail-cancel", "unknown", "directory", "missing-parent"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			sourceDir := t.TempDir()
+			var sourceDir string
+			if mode == "normal" {
+				sourceDir = t.TempDir()
+			}
 			data, length := "abc", int64(3)
 			var n *int64 = &length
 			if mode == "empty" {
@@ -641,7 +827,24 @@ func TestConditionalCreateThroughCore(t *testing.T) {
 			}
 			input := strings.NewReader(data)
 			puts := 0
-			fault := errors.New("response lost")
+			fault := errors.New("injected I/O failure")
+			var source io.Reader = input
+			if strings.HasPrefix(mode, "tail-") {
+				tails := 0
+				source = &heldUpload{tail: func(p []byte) (int, error) {
+					tails++
+					switch mode {
+					case "tail-error":
+						return copy(p, "x"), fault
+					case "tail-cancel":
+						if tails == 1 {
+							cancel()
+							return 0, nil
+						}
+					}
+					return 0, fault
+				}}
+			}
 			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
 				switch r.Method {
 				case "HEAD":
@@ -703,7 +906,7 @@ func TestConditionalCreateThroughCore(t *testing.T) {
 				}
 				change, err = c.Copy(ctx, "writer", core.Path("/local/a"), core.Path(target))
 			} else {
-				change, err = c.Create(ctx, "writer", core.Path(target), input, n)
+				change, err = c.Create(ctx, "writer", core.Path(target), source, n)
 			}
 			switch mode {
 			case "normal", "empty":
@@ -730,6 +933,11 @@ func TestConditionalCreateThroughCore(t *testing.T) {
 				if change.Effect != core.Incomplete || core.CodeOf(err) != core.InvalidRequest {
 					t.Fatal(change, err)
 				}
+			case "tail-error", "tail-cancel":
+				cause := map[string]error{"tail-error": fault, "tail-cancel": context.Canceled}[mode]
+				if change.Effect != core.Unknown || !errors.Is(err, cause) || mode != "tail-error" && errors.Is(err, fault) {
+					t.Fatal(change, err)
+				}
 			default:
 				if change.Effect != core.Unknown || err == nil {
 					t.Fatal(change, err)
@@ -749,17 +957,65 @@ func TestConditionalCreateThroughCore(t *testing.T) {
 	}
 }
 
+func TestExactKeyRemovalReceipts(t *testing.T) {
+	for _, mode := range []string{"lost", "ack-cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fault := errors.New("delete response lost")
+			var calls []string
+			_, c := prepared(t, func(r *http.Request) (*http.Response, error) {
+				calls = append(calls, r.Method+" "+r.URL.Path)
+				switch r.Method {
+				case "HEAD":
+					if r.URL.Path == "/bucket/vault/missing" {
+						return response(r, 404, ""), nil
+					}
+					return response(r, 200, ""), nil
+				case "DELETE":
+					if r.Header.Get("If-Match") != "*" {
+						t.Fatal("delete condition lost", r.Header)
+					}
+					if mode == "lost" {
+						return nil, fault
+					}
+					cancel()
+					return response(r, 204, ""), nil
+				}
+				return nil, errors.New("unexpected protocol call")
+			}, func(o *sdk.Options) { o.RetryMaxAttempts = 3 })
+			if change, err := c.Remove(ctx, "writer", core.Key("/cloud", "missing")); change.Effect != core.Unchanged || change.Before != core.TargetMissing || core.CodeOf(err) != core.NotFound {
+				t.Fatal(change, err)
+			}
+			change, err := c.Remove(ctx, "writer", core.Key("/cloud", "a//b"), core.RemoveOptions{When: core.IfPresent()})
+			if mode == "lost" && (change.Effect != core.Unknown || !errors.Is(err, fault)) ||
+				mode == "ack-cancel" && (change.Effect != core.Applied || !errors.Is(err, context.Canceled)) {
+				t.Fatal(change, err)
+			}
+			if got := strings.Join(calls, ";"); got != "HEAD /bucket/vault/missing;HEAD /bucket/vault/a//b;DELETE /bucket/vault/a//b" {
+				t.Fatal("exact key changed, probed or retried", got)
+			}
+		})
+	}
+}
+
 type heldUpload struct {
 	started, release chan struct{}
 	reads            int
+	tail             func([]byte) (int, error)
 }
 
 func (r *heldUpload) Read(p []byte) (int, error) {
 	r.reads++
 	if r.reads == 1 {
-		close(r.started)
-		<-r.release
+		if r.started != nil {
+			close(r.started)
+			<-r.release
+		}
 		return copy(p, "abc"), nil
+	}
+	if r.tail != nil {
+		return r.tail(p)
 	}
 	return 0, io.EOF
 }

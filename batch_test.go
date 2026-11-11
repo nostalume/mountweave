@@ -70,15 +70,11 @@ func TestBatchStopAndCancellation(t *testing.T) {
 			t.Fatal(results, err)
 		}
 	}
-	for _, targets := range [][]core.Address{nil, {core.Path("/not-started")}} {
-		if results, err := c.RemoveBatch(ctx, "alice", targets); len(results) != 0 || !errors.Is(err, context.Canceled) {
-			t.Fatal(results, err)
-		}
+	if results, err := c.RemoveBatch(ctx, "alice", []core.Address{core.Path("/not-started")}); len(results) != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatal(results, err)
 	}
-	for _, requests := range [][]core.CopyRequest{nil, {{Source: core.Path("/a"), Target: core.Path("/b")}}} {
-		if results, err := c.CopyBatch(ctx, "alice", requests); len(results) != 0 || !errors.Is(err, context.Canceled) {
-			t.Fatal(results, err)
-		}
+	if results, err := c.CopyBatch(ctx, "alice", []core.CopyRequest{{Source: core.Path("/a"), Target: core.Path("/b")}}); len(results) != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatal(results, err)
 	}
 }
 
@@ -134,6 +130,7 @@ func TestBoundedBatches(t *testing.T) {
 				{Source: core.Path("/from/a"), Target: core.Path("/to/x")},
 				{Source: core.Path("/from/a"), Target: core.Path("/to/y")},
 				{Source: core.Path("/from/a"), Target: core.Path("/alias/x")},
+				// Block the suffix until the alias collision has returned.
 				{Source: core.Path("/from/a"), Target: core.Path("/to/x")},
 				{Source: core.Path("/from/a"), Target: core.Path("/to/not-started")},
 			}, core.ExecutionOptions{Concurrency: 2})

@@ -23,6 +23,7 @@ type MoveOptions struct {
 	Target   Condition    `json:"target"`
 	Existing TargetPolicy `json:"existing,omitempty"`
 	Tree     TreeOptions  `json:"tree,omitzero"`
+	NoCopy   bool         `json:"-"` // Require the existing relocation path.
 }
 
 func (o MoveOptions) validate() error {
@@ -46,6 +47,7 @@ type MoveResult struct {
 	// Removed records a separately confirmed target-removal phase. It never
 	// claims that the later source relocation or target creation succeeded.
 	Removed *TreeResult
+	Tree    *TreeResult // Attempted phases of a cross-mount directory move.
 }
 
 // Move renames or moves a file or directory. The zero policy never replaces.
@@ -53,9 +55,9 @@ type MoveResult struct {
 // Tree budgets are required if that phase encounters a directory. Directory
 // admission authorizes the whole native relocation, without descendant checks.
 // Both receipts must be Applied and error must be nil for completion without
-// errors. A failed later relocation does not undo Removed. Currently only
-// native relocation within one mount is supported; copying followed by removal
-// through an unbound source path is never used.
+// errors. A failed later relocation does not undo Removed. A cross-mount move
+// publishes exclusively before removing the exact source version. Directories
+// require positive Tree budgets. NoCopy retains the native relocation path.
 func (c *Core) Move(ctx context.Context, p Principal, source, target Address, policies ...MoveOptions) (result MoveResult, err error) {
 	result = MoveResult{Source: Change{Effect: Unchanged}, Target: Change{Effect: Unchanged}}
 	ctx, turn, err := enterOrder(ctx, nil)
@@ -136,6 +138,9 @@ func (c *Core) moveAt(ctx context.Context, p Principal, source, target *location
 // also the fast path when the target is absent. Unsupported options must be
 // refused before a Relocator reports an existing-target conflict.
 func (c *Core) moveUses(ctx context.Context, p Principal, from, to *use, options MoveOptions) (MoveResult, error) {
+	if from.mount != to.mount {
+		return c.moveAcross(p, from, to, options)
+	}
 	if options.Existing == Replace && from.mount == to.mount && from.namespace == TreeNamespace && to.namespace == TreeNamespace && Within(from.path, to.path) {
 		from.release()
 		to.release()

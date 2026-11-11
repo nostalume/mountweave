@@ -208,7 +208,7 @@ func (x *session) dispatch(p sshfx.Packet, failure *protocols.Failure) (reply ss
 			return nil, err, false
 		}
 		failure.Phase = "rename"
-		result, err := x.files.Move(x.ctx, x.actor, a, b)
+		result, err := x.files.Move(x.ctx, x.actor, a, b, core.MoveOptions{NoCopy: true})
 		failure.Change, failure.Source = result.Target, &result.Source
 		return okStatus, err, result.Source.Effect == core.Unknown || result.Target.Effect == core.Unknown
 	case *sshfx.RemovePacket:

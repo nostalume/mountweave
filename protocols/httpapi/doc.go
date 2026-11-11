@@ -54,7 +54,7 @@
 // execution; refusals there have no file effects. Both modes execute the same
 // prepared function through the ordinary Core API, preserving stop/prefix, links,
 // explicit replacement/merge and partial-effect contracts. A stale queued binding
-// fails instead of targeting a replacement. Move retains its same-mount restriction.
+// fails instead of targeting a replacement. Move preserves both endpoint receipts.
 // fs.remove_tree accepts scope: discovered (default) or subtree. Empty also selects
 // discovered. Subtree requires Core RemoveTreeAction, may affect new descendants
 // and may return only a root receipt for native execution. Planning budgets limit
@@ -71,10 +71,13 @@
 // merge_directories/replace flags are boundary mappings; conflicting explicit
 // policies are rejected. Directory traversal needs positive budgets; file leaves
 // can use zero. remove_tree accepts when for a file root, never for every child.
-// move options.existing=replace uses options.tree to bound target removal.
-// Tree FileResult carries effect/before and item side/phase/error_side. Move adds
-// target_removed_effect and its removal rows; MoveBatch retains nested removed
-// receipts per item. Sync and queued delivery use these same operation results.
+// move uses the native route within a mount. Across mounts it publishes
+// exclusively and removes only confirmed source versions on supported Drivers.
+// options.tree bounds cross-mount directory planning or explicit target removal.
+// Move reports source_effect and target_effect. For migration, items report
+// attempted tree phases. For native replacement, target_removed_effect and its
+// items record the separate removal. MoveBatch nests these as tree or removed
+// per item. Sync and queued delivery share these receipts.
 //
 // Optional Options.Inputs borrows an independent input.Store and requires
 // AuthorizeInput for create/list/read/append/seal/release/use. A permitted input
@@ -166,7 +169,7 @@
 // Optional JobSources exposes existing durable transfer/Pool intents, not another
 // queue or database. TransferJobs requires a bounded metadata Lister; Pool's
 // optional delivery package supplies its own authorized resource adapter.
-// PUT /api/v1/jobs/job?source=uploads&id=one with {version:1,input:...} durably
+// PUT /api/v1/jobs/job?source=uploads&id=one with {version:2,input:...} durably
 // creates an intent without starting native work. GET the same URL for status;
 // GET /api/v1/jobs?source=uploads&after=...&limit=... for a bounded metadata page.
 // The page limit counts scanned entries, including hidden ones; empty items can
@@ -182,9 +185,12 @@
 // Transfer target accepts exactly one path or tagged address. Existing v1 file
 // routes and tree target responses retain path; native key targets use address.
 // They share the same Core.Write; prefix selectors are not upload targets.
-// Transfer input accepts Policy or the legacy replace flag, never both. New
-// durable intents retain the exact publication condition across Run and restart;
-// checkpoints do not refresh it from current destination metadata.
+// Transfer source format version 2 accepts Policy or the legacy replace flag,
+// never both. Omitting both retains ordinary exclusive creation, matching
+// Core.Write; explicit Publish requests complete publication. Legacy replace
+// false/true keeps complete exclusive/replacing publication respectively.
+// Version 1 creation requests are refused. Existing durable intents retain their
+// exact policy across Run and restart; checkpoints do not refresh the condition.
 // Sync actions remain request-bound and outside queue ordering, with original
 // domain mutual exclusion. Pool run performs one bounded batch; task finished
 // does not imply pass done. Host backoff/resubmission owns further scheduling.

@@ -106,6 +106,7 @@ type FileItem struct {
 	Side         core.ResultSide     `json:"side,omitempty"`
 	Phase        core.OperationPhase `json:"phase,omitempty"`
 	Removed      *FileResult         `json:"removed,omitempty"`
+	Tree         *FileResult         `json:"tree,omitempty"`
 	ErrorSide    core.ResultSide     `json:"error_side,omitempty"`
 }
 
@@ -134,8 +135,10 @@ func moveResult(r core.MoveResult) FileResult {
 	if r.Removed != nil {
 		result = treeResult(*r.Removed)
 		result.TargetRemovedEffect = r.Removed.Change.Effect.String()
+		result.Effect = ""
+	} else if r.Tree != nil {
+		result = treeResult(*r.Tree)
 	}
-	result.Effect = ""
 	result.SourceEffect, result.TargetEffect, result.Before = r.Source.Effect.String(), r.Target.Effect.String(), r.Target.Before
 	return result
 }
@@ -272,6 +275,10 @@ func FileTaskKinds(c *core.Core) map[string]TaskKind {
 					if item.Removed != nil {
 						removed := treeResult(*item.Removed)
 						out.Items[n].Removed = &removed
+					}
+					if item.Tree != nil {
+						tree := treeResult(*item.Tree)
+						out.Items[n].Tree = &tree
 					}
 				}
 				return out, err

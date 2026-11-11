@@ -82,7 +82,7 @@ func (d *Driver) Remove(ctx context.Context, p core.NativeAddress, policies ...c
 	var meta core.Metadata
 	var err error
 	if p.Namespace() == core.KeyNamespace {
-		meta, err = d.Stat(ctx, p)
+		meta, err = d.head(ctx, d.key(p), name(p))
 	} else {
 		meta, err = d.statKey(ctx, d.key(p), name(p))
 	}

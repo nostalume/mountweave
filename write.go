@@ -102,20 +102,17 @@ func (c *Core) writeUse(u *use, input io.Reader, length *int64, write WriteOptio
 		}
 		continuation := *write.Continuation
 		continuation.Checkpoint = append([]byte(nil), continuation.Checkpoint...)
+		write.Continuation = &continuation
+		aborting := continuation.Abort
 		if err = u.ctx.Err(); err != nil {
 			return Change{Effect: Unchanged}, err
 		}
-		publication := PublicationOptions{When: write.Policy.When(), ObserveTarget: write.ObserveTarget}
-		if !write.Policy.Complete() {
-			publication.When = IfAbsent()
-		}
-		result, err := writer.ContinueWrite(u.ctx, rel, source, *length, publication, continuation)
-		if continuation.Abort && result.Effect == Unchanged && err == nil {
+		result, err := writer.ContinueWrite(u.ctx, rel, source, *length, write)
+		if aborting && result.Effect == Unchanged && err == nil {
 			return result, u.ctx.Err()
 		}
-		if result.Effect == Incomplete {
-			result.Effect = Unknown
-			err = Fail(InvalidUpstreamResponse, errors.Join(err, errors.New("continuation reported a partial target")))
+		if write.Policy.Complete() {
+			return c.finishPublication(u, result, err, write.Policy.When(), write.ObserveTarget)
 		}
 		return c.finishChange(u, result, err)
 	}
@@ -128,20 +125,7 @@ func (c *Core) writeUse(u *use, input io.Reader, length *int64, write WriteOptio
 			return Change{Effect: Unchanged}, err
 		}
 		result, err := publisher.Publish(u.ctx, rel, input, length, PublicationOptions{When: write.Policy.When(), ObserveTarget: write.ObserveTarget})
-		if result.Effect == Unchanged && write.Policy.When().IsAbsent() && CodeOf(err) == AlreadyExists {
-			err = Fail(PreconditionFailed, errors.Join(&ConditionFailure{Negative: true, Evidence: result.Evidence}, err))
-		}
-		if result.Effect == Applied && write.Policy.When().IsAbsent() {
-			result.Before = TargetMissing
-		}
-		if result.Effect == Applied && write.ObserveTarget && result.Before == TargetUnknown && err == nil {
-			err = Fail(InvalidUpstreamResponse, errors.New("publisher omitted requested target observation"))
-		}
-		if result.Effect == Incomplete {
-			result.Effect = Unknown
-			err = Fail(InvalidUpstreamResponse, errors.Join(errors.New("publisher reported a partial target"), err))
-		}
-		return c.finishChange(u, result, err)
+		return c.finishPublication(u, result, err, write.Policy.When(), write.ObserveTarget)
 	}
 	creator, ok := u.mount.driver.(FileCreator)
 	if !ok {
@@ -151,5 +135,22 @@ func (c *Core) writeUse(u *use, input io.Reader, length *int64, write WriteOptio
 		return Change{Effect: Unchanged}, err
 	}
 	result, err := creator.Create(u.ctx, rel, input, length)
+	return c.finishChange(u, result, err)
+}
+
+func (c *Core) finishPublication(u *use, result Change, err error, when Condition, observeTarget bool) (Change, error) {
+	if result.Effect == Unchanged && when.IsAbsent() && CodeOf(err) == AlreadyExists {
+		err = Fail(PreconditionFailed, errors.Join(&ConditionFailure{Negative: true, Evidence: result.Evidence}, err))
+	}
+	if result.Effect == Applied && when.IsAbsent() {
+		result.Before = TargetMissing
+	}
+	if result.Effect == Applied && observeTarget && result.Before == TargetUnknown && err == nil {
+		err = Fail(InvalidUpstreamResponse, errors.New("publisher omitted requested target observation"))
+	}
+	if result.Effect == Incomplete {
+		result.Effect = Unknown
+		err = Fail(InvalidUpstreamResponse, errors.Join(errors.New("publisher reported a partial target"), err))
+	}
 	return c.finishChange(u, result, err)
 }

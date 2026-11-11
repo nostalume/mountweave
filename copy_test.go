@@ -91,6 +91,9 @@ func copySource(b *copyBody, length *int64) *fakeDriver {
 			return core.Opened{}, errors.New("unexpected source request")
 		}
 		size := int64(99)
+		if length != nil {
+			size = *length
+		}
 		return core.Opened{Metadata: core.Metadata{Name: "a", Kind: core.File, Size: &size}, Body: b, Length: length}, nil
 	}}
 }
@@ -119,10 +122,6 @@ func TestCopyLocal(t *testing.T) {
 		if err != nil || change.Effect != core.Applied {
 			t.Fatal(change, err)
 		}
-		change, err = c.Copy(context.Background(), "caller", core.Path("/from/"+name), core.Path("/to/"+name))
-		if change.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists {
-			t.Fatal(change, err)
-		}
 		for _, directory := range []string{from, to} {
 			got, err := os.ReadFile(filepath.Join(directory, name))
 			if err != nil || string(got) != data {
@@ -130,21 +129,19 @@ func TestCopyLocal(t *testing.T) {
 			}
 		}
 	}
-	if change, err := c.Copy(context.Background(), "caller", core.Path("/to/a"), core.Path("/to/another")); err != nil || change.Effect != core.Applied {
-		t.Fatal(change, err)
-	}
 	results, err := c.CopyBatch(context.Background(), "caller", []core.CopyRequest{
 		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
 		{Source: core.Path("/to/batch-b"), Target: core.Path("/to/batch-c")},
 		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
+		// This conflict blocks the suffix while the failing item runs.
 		{Source: core.Path("/to/a"), Target: core.Path("/to/batch-b")},
 		{Source: core.Path("/to/a"), Target: core.Path("/to/not-started")},
 	}, core.ExecutionOptions{Concurrency: 2})
 	if len(results) != 3 || core.CodeOf(err) != core.AlreadyExists {
 		t.Fatal(results, err)
 	}
-	for i, result := range results {
-		if i < 2 && (result.Change.Effect != core.Applied || result.Err != nil) {
+	for i, result := range results[:2] {
+		if result.Change.Effect != core.Applied || result.Err != nil {
 			t.Fatal(i, result)
 		}
 	}

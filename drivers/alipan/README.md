@@ -1,13 +1,34 @@
 # Aliyun Drive Open adapter
 
-This independent Go module resolves a host-prepared drive and folder root through
+This independent Go module binds a selected drive and folder through
 Aliyun Drive Open, then implements github.com/nostalume/mountweave.Driver. It uses the standard
 library and the core module. It does not import the S3 SDK or OpenList.
 
-The API client, drive ID, root folder ID, and one credential.Source are supplied
-explicitly. The prepared root is assumed to be a directory. New transfers
-credential-source ownership only on success; a rejected constructor leaves it
-with the caller. A rejected core.Install leaves the driver with the caller.
+The drive is explicit. Select exactly one of RootID, an already prepared folder,
+or RootPath, an exact path starting at `/` within that drive. RootPath `/` explicitly
+selects the drive root. Open(ctx, options) resolves the path once and requires a
+directory. It scans complete native pages with the existing root/name checks,
+then pins the resulting folder ID. Renaming or replacing the original path does
+not rebind an active instance. Reconstructing the definition resolves the path
+again and may select a new folder. Root selection does not discover or choose a
+different drive. The native root convention is documented by the
+[official SDK](https://github.com/alibaba/aliyunpan-ios-sdk#3-%E5%8F%91%E9%80%81%E5%91%BD%E4%BB%A4).
+
+Options.Validate checks static settings, including root selection, endpoint,
+page/response policies, and complete upload-budget constraints. It performs no
+network I/O and requires neither Client nor Credentials. The same Options type
+can be decoded by control.TypedFactory and passed to Open after runtime resource
+injection. Its JSON fields are snake_case; Client and Credentials are excluded
+and rejected by the strict configuration decoder. This is native typed input,
+not a configuration-file format.
+
+New(options) retains prepared-RootID construction without network I/O and transfers
+credential-source ownership only on success. Open(ctx, options) adds cancellable
+RootPath construction. Any non-nil result from Open owns the supplied
+credential.Source, even when accompanied by an error. A failed result refuses
+operations and must be closed or returned to Control for cleanup. A nil result
+leaves credentials with the caller. This preserves failed response-close resources
+and ongoing refresh ownership. A rejected core.Install leaves the driver with the caller.
 After installation, retirement closes the driver and waits for its credential
 writer. Clients and transports are borrowed and are never closed by the driver.
 
@@ -23,24 +44,31 @@ can use this adapter as a source or a configured new-file destination.
 ## Name and content semantics
 
 Resolution lists every page at each path segment before reporting one matching
-ID or absence. Two matching names are ambiguous, including a later-page match.
-An incomplete scan returns its failure. There is no directory-wide ID cache,
+ID or absence. Different IDs with the same exact name are ambiguous, including a
+later-page match; repeating the same matching ID is an invalid native enumeration.
+An incomplete scan returns its failure. Failed native I/O EOF is not enumeration
+completion; its original classification and independent causes remain available.
+There is no directory-wide ID cache,
 get-by-path shortcut, strong validator, or directory snapshot.
 
 Enumeration preserves native continuation and order, retaining one batch.
 The native API page size is capped at its documented 100. MaxResolvePages and
 MaxResponseBytes are optional host policies; zero leaves them unset. Contexts
-and client deadlines also govern work. Immediate repeated markers are rejected;
-longer faulty cycles require cancellation, cursor expiry, or a host resolution
-budget. Benchmark numbers provide no defaults.
+and client deadlines also govern work. Lookup and enumeration use the same
+native cursor and detect cycles with one checkpoint and a page count. Benchmark
+numbers provide no defaults.
 
-Temporary download URLs remain private. Downloads use fresh HTTPS requests with
+Temporary download and upload URLs are omitted from request failures.
+Downloads use fresh HTTPS requests with
 no provider bearer header or cookie jar. API and download redirects are rejected.
 Only GET download targets are admitted. Upload URLs use isolated HTTPS PUT
 requests with the same bearer/cookie/redirect separation. Full responses remain full, unknown
 length remains unknown, and partial responses need matching actual ranges.
-Failures return any opened body for the core to close. A failed internal API
-body close remains owned by the driver and prevents successful retirement.
+Files listed as frozen remain visible. Open refuses them before requesting a
+download grant because Aliyun Drive can return a notice file in their place.
+Failures return any opened body for the core to close. The Driver retains failed
+internal response closes and retries them at retirement. A validated native
+mutation receipt determines the effect even when response cleanup also fails.
 
 ## Native mutations and uploads
 
@@ -49,12 +77,16 @@ The Driver implements these existing optional capabilities:
 
 | Capability | Supported modes |
 | --- | --- |
-| DirectoryMaker | New directory with native name-conflict refusal |
+| DirectoryMaker | New directory with native name-conflict checking |
 | FileCreator | Known-length new file, when upload options are configured |
 | Remover | Files only |
 | SubtreeRemover | Explicit RemoveTree subtree scope, native directory-ID deletion and completion query |
 | Relocator | Same-parent file/directory rename; same-name file move to another parent |
 | FilePublisher / scoped ChildRemover | Unsupported |
+
+Serial Mkdir rejects an observed name conflict and requests native `refuse`.
+Aliyun Drive documents optimistic checking, so simultaneous same-name directory
+creates can still yield distinct directory IDs. [Official FAQ](https://www.yuque.com/aliyundrive/zpfszx/zscu11)
 
 Set Options.PartSize and MaxBufferedBytes together to enable upload; the budget
 must hold one part. PartConcurrency defaults to one. Native upload planning uses
@@ -81,9 +113,11 @@ and durable credential ownership remain unchanged.
 
 Unknown-length upload and complete replacement are refused before reading input.
 The inspected Aliyun Drive Open creation contract does not establish PDS-style
-file_id replacement; related PDS APIs are not substituted. Combined rename and
-parent change, cross-parent directory movement and asynchronous move completion
-are not supplied. Remove(directory) and default RemoveTree Discovered scope remain
+file_id replacement; related PDS APIs are not substituted. Rename and move send
+the selected file ID. The API has no source-name or source-parent predicate,
+so hosts requiring exact effects must coordinate concurrent native renames and
+moves outside the Driver. Combined rename and parent change, cross-parent
+directory movement and asynchronous move completion are not supplied. Remove(directory) and default RemoveTree Discovered scope remain
 unsupported: a prior listing cannot establish an atomic empty-directory condition.
 Explicit DirectoryRemoveOptions{Scope: core.Subtree} instead authorizes deletion of
 the captured directory ID and descendants through Core's remove_tree action.
@@ -104,13 +138,19 @@ writer admission, complete record replacement, loading, and secret protection. O
 it does not acquire consent, find secrets, or save tokens. Example assembly:
 
 ~~~go
+ctx := context.Background()
 oauth := alipan.OAuth{Client: client, ClientID: appID, ClientSecret: appSecret}
 tokens, err := credential.New(initialCheckpoint, oauth.Refresh, saveDurably)
 if err != nil { return err }
-storage, err := alipan.New(alipan.Options{
-    Client: client, DriveID: driveID, RootID: rootID, Credentials: tokens,
-})
-if err != nil { return errors.Join(err, tokens.Close()) }
+settings := alipan.Options{DriveID: driveID, RootPath: "/Documents"}
+settings.Client, settings.Credentials = client, tokens
+storage, err := alipan.Open(ctx, settings)
+if err != nil {
+    if storage != nil {
+        return errors.Join(err, storage.Close())
+    }
+    return errors.Join(err, tokens.Close())
+}
 if _, err := reader.Install("/cloud", storage); err != nil {
     return errors.Join(err, storage.Close())
 }
@@ -163,6 +203,11 @@ go test -race ./...  # requires a supported C compiler
 
 Controlled transports test native JSON, ID resolution, range responses, bearer
 separation, token exchange, shared refresh, persistence failure and cancellation.
+The same resolution and cancellation fixtures cover root construction, including
+ambiguous/incomplete pages and retained cleanup on a failed response close. One
+managed workflow decodes native Options, verifies static rejection without
+retirement, pins a resolved root through path replacement, and reconstructs it
+on a new definition revision.
 Most save callbacks model outcomes. One disposable-file subprocess case kills
 the writer after a synthetic provider effect and after confirmation; it checks
 that pending recovery stops and confirmed recovery resumes. It does not test

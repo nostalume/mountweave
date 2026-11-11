@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	core "github.com/nostalume/mountweave"
 )
 
@@ -32,12 +33,13 @@ func appendUpload(ctx context.Context, appendRecord func(context.Context, []byte
 	return appendRecord(ctx, append(data, '\n'))
 }
 func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, error) {
-	state := uploadState{Parts: make(map[int]string)}
+	state := uploadState{}
 	invalid := func(err error) (uploadState, error) {
 		return state, core.Fail(core.InvalidRequest, errors.Join(errors.New("invalid native recovery log"), err))
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
+	startVersion := 0
 	for {
 		var r uploadRecord
 		err := decoder.Decode(&r)
@@ -50,42 +52,51 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 		if err != nil {
 			return invalid(err)
 		}
-		if r.Version != 2 && r.Version != 3 && r.Version != 4 {
+		if r.Version < 2 || r.Version > 5 {
 			return invalid(nil)
 		}
 		done := r.Kind == "phase" && r.Phase == "done"
 		if r.Evidence != nil {
-			if !done || r.Version != 4 || !r.Evidence.Validator.Valid() {
+			if !done || r.Version < 4 || !r.Evidence.Validator.Valid() {
 				return invalid(nil)
 			}
 			state.Evidence = *r.Evidence
-		} else if done && r.Version == 4 {
+		} else if done && (r.Version >= 4 || startVersion >= 4) {
 			return invalid(nil)
 		}
 		switch r.Kind {
 		case "start":
-			if r.Version == 2 && r.Binding != nil {
-				if !r.Binding.When.Empty() {
+			if r.Binding == nil {
+				return invalid(nil)
+			}
+			if r.Version < 5 {
+				if r.Binding.Policy != nil || r.Version == 2 && !r.Binding.When.Empty() || r.Version > 2 && r.Binding.Replace {
 					return invalid(nil)
 				}
-				if !r.Binding.Replace {
-					r.Binding.When = core.IfAbsent()
+				when := r.Binding.When
+				if r.Version == 2 && !r.Binding.Replace {
+					when = core.IfAbsent()
 				}
-				r.Binding.Replace = false
+				policy := core.Publish(when)
+				r.Binding.Policy = &policy
+				r.Binding.When, r.Binding.Replace = core.Condition{}, false
+			} else if r.Binding.Policy == nil || r.Binding.Policy.Validate() != nil || !r.Binding.When.Empty() || r.Binding.Replace {
+				return invalid(nil)
 			}
-			if r.Binding == nil || *r.Binding != binding || r.Token == "" || state.Phase != "" || len(state.Parts) != 0 || r.Phase != "initializing" || r.UploadID != "" || r.Part != 0 || r.ETag != "" {
+			if !sameBinding(*r.Binding, binding) || r.Token == "" || state.Phase != "" || len(state.Parts) != 0 || r.Phase != "initializing" || r.UploadID != "" || r.Part != 0 || r.ETag != "" {
 				return invalid(nil)
 			}
 			state.Token = r.Token
 			state.Phase = r.Phase
+			startVersion = r.Version
 		case "part":
 			if state.Phase != "uploading" || r.Part < 1 || r.Part > count || r.ETag == "" || r.Binding != nil || r.Phase != "" || r.Token != "" || r.UploadID != "" {
 				return invalid(nil)
 			}
-			if previous, ok := state.Parts[r.Part]; ok && previous != r.ETag {
+			if r.Part <= len(state.Parts) && state.Parts[r.Part-1].ETag != nil && *state.Parts[r.Part-1].ETag != r.ETag {
 				return invalid(nil)
 			}
-			state.Parts[r.Part] = r.ETag
+			state.acknowledge(r.Part, aws.String(r.ETag))
 		case "phase":
 			if r.Part != 0 || r.ETag != "" || r.Token != "" || r.Binding != nil || state.Token == "" || (state.UploadID != "" && r.UploadID != state.UploadID) {
 				return invalid(nil)
@@ -97,7 +108,7 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 			case "uploading":
 				valid = (state.Phase == "initializing" || state.Phase == "committing") && r.UploadID != ""
 			case "committing":
-				valid = state.Phase == "uploading" && len(state.Parts) == count
+				valid = state.Phase == "uploading" && state.Confirmed == count
 			case "done":
 				valid = state.Phase == "committing"
 			case "aborting":
@@ -114,4 +125,12 @@ func restoreUpload(data []byte, binding resumeBinding, count int) (uploadState, 
 			return invalid(nil)
 		}
 	}
+}
+
+func sameBinding(a, b resumeBinding) bool {
+	if a.Policy == nil || b.Policy == nil || *a.Policy != *b.Policy {
+		return false
+	}
+	a.Policy, b.Policy = nil, nil
+	return a == b
 }

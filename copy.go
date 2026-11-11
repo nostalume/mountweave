@@ -86,7 +86,13 @@ func (c *Core) copyAt(ctx context.Context, p Principal, from, to *location, opti
 	return c.copyContent(ctx, p, to, opened, write)
 }
 
-func (c *Core) copyContent(ctx context.Context, principal Principal, at *location, opened Content, write WriteOptions) (change Change, err error) {
+func (c *Core) copyContent(ctx context.Context, principal Principal, at *location, opened Content, write WriteOptions) (Change, error) {
+	return copyOpened(ctx, opened, func(input io.Reader, length *int64) (Change, error) {
+		return c.writeAt(ctx, principal, at, input, length, write)
+	})
+}
+
+func copyOpened(ctx context.Context, opened Content, publish func(io.Reader, *int64) (Change, error)) (change Change, err error) {
 	change.Effect = Unchanged
 	defer func() {
 		if cause := ctx.Err(); cause != nil && !errors.Is(err, cause) {
@@ -99,7 +105,7 @@ func (c *Core) copyContent(ctx context.Context, principal Principal, at *locatio
 		}
 	}()
 
-	change, err = c.writeAt(ctx, principal, at, opened.Body, opened.Length, write)
+	change, err = publish(opened.Body, opened.Length)
 	err = copyError(opened.Body, err)
 	return change, err
 }

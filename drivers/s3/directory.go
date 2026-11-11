@@ -12,18 +12,12 @@ func (d *Driver) OpenDirectory(ctx context.Context, p core.NativeAddress) (core.
 	if p.Namespace() != core.TreeNamespace {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}
-	meta, err := d.Stat(ctx, p)
+	iter, err := d.directoryIterator(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	if meta.Kind != core.Directory {
-		return nil, core.Fail(core.NotDirectory, nil)
-	}
-	prefix := d.prefix
-	if p.Value() != "/" {
-		prefix = d.key(p) + "/"
-	}
-	return &directoryScope{iterator: &iterator{driver: d, prefix: prefix, delimiter: "/", files: make(map[string]core.Metadata)}}, nil
+	iter.files = make(map[string]core.Metadata)
+	return &directoryScope{iterator: iter}, nil
 }
 
 func (s *directoryScope) OpenFile(ctx context.Context, name string) (core.Opened, error) {

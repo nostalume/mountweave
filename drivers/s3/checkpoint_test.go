@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	core "github.com/nostalume/mountweave"
 	"testing"
+
+	core "github.com/nostalume/mountweave"
 )
 
 func TestCheckpointGrowthAndRecoveryEdges(t *testing.T) {
@@ -22,11 +23,11 @@ func TestCheckpointGrowthAndRecoveryEdges(t *testing.T) {
 			}
 		}
 		emit(uploadRecord{Version: 2, Kind: "start", Binding: &binding, Token: "attempt", Phase: "initializing"})
-		if binding.Replace {
-			binding.Replace = false
-		} else {
-			binding.When = core.IfAbsent()
+		policy := core.Publish()
+		if !binding.Replace {
+			policy = core.Publish(core.IfAbsent())
 		}
+		binding.Replace, binding.Policy = false, &policy
 		emit(uploadRecord{Version: 2, Kind: "phase", Phase: "uploading", UploadID: "upload"})
 		for n := 1; n <= count; n++ {
 			emit(uploadRecord{Version: 2, Kind: "part", Part: n, ETag: "0123456789abcdef0123456789abcdef"})
@@ -49,19 +50,53 @@ func TestCheckpointGrowthAndRecoveryEdges(t *testing.T) {
 			t.Fatal("scope change accepted")
 		}
 		wrong = binding
-		wrong.When = core.IfPresent()
+		changed := core.Publish(core.IfPresent())
+		wrong.Policy = &changed
 		if _, err = restoreUpload(log.Bytes(), wrong, count); err == nil {
 			t.Fatal("predicate change accepted")
 		}
-		var policy core.WritePolicy
+		var decoded core.WritePolicy
 		for _, guard := range []string{`{"macth":"\"old\""}`, `{"match":""}`, `{"match":null}`, `null`} {
-			if err := json.Unmarshal([]byte(`{"mode":"publish","when":`+guard+`}`), &policy); err == nil {
+			if err := json.Unmarshal([]byte(`{"mode":"publish","when":`+guard+`}`), &decoded); err == nil {
 				t.Fatal("malformed durable guard became unconditional", guard)
 			}
+		}
+		proof := core.Evidence{Validator: core.Validator{Domain: "s3-etag", Tag: `"native"`}}
+		emit(uploadRecord{Version: 5, Kind: "phase", Phase: "done", UploadID: "upload", Evidence: &proof})
+		if state, err := restoreUpload(log.Bytes(), binding, count); err != nil || state.Phase != "done" || state.Evidence != proof {
+			t.Fatal("new phase lost the original publication binding", state, err)
 		}
 		emit(uploadRecord{Version: 2, Kind: "part", Part: 1, ETag: "different"})
 		if _, err = restoreUpload(log.Bytes(), binding, count); err == nil {
 			t.Fatal("receipt after commit barrier accepted")
+		}
+		if count == 10 {
+			log.Reset()
+			direct := binding
+			creation := core.WritePolicy{}
+			direct.Policy = &creation
+			emit(uploadRecord{Version: 5, Kind: "start", Binding: &direct, Token: "direct", Phase: "initializing"})
+			if _, err := restoreUpload(log.Bytes(), direct, count); err != nil {
+				t.Fatal("direct policy did not survive its checkpoint", err)
+			}
+			if _, err := restoreUpload(log.Bytes(), binding, count); err == nil {
+				t.Fatal("direct checkpoint accepted complete publication")
+			}
+			emit(uploadRecord{Version: 5, Kind: "phase", Phase: "uploading", UploadID: "upload"})
+			for n := 1; n <= count; n++ {
+				emit(uploadRecord{Version: 5, Kind: "part", Part: n, ETag: "native"})
+			}
+			emit(uploadRecord{Version: 5, Kind: "phase", Phase: "committing", UploadID: "upload"})
+			emit(uploadRecord{Version: 2, Kind: "phase", Phase: "done", UploadID: "upload"})
+			if _, err := restoreUpload(log.Bytes(), direct, count); err == nil {
+				t.Fatal("old record version bypassed a new publication receipt")
+			}
+			log.Reset()
+			direct.Policy = nil
+			emit(uploadRecord{Version: 5, Kind: "start", Binding: &direct, Token: "missing", Phase: "initializing"})
+			if _, err := restoreUpload(log.Bytes(), binding, count); err == nil {
+				t.Fatal("new checkpoint omitted its explicit policy")
+			}
 		}
 	}
 }

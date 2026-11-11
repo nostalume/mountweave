@@ -35,7 +35,20 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	root := t.TempDir()
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
-	mountLocal(t, c, root)
+	storage, err := local.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Single removal needs its mutation capability, not a directory read scope.
+	if _, err := c.Install("/files", struct {
+		core.Driver
+		core.DirectoryMaker
+		core.FileCreator
+		core.Remover
+	}{storage, storage, storage, storage}); err != nil {
+		_ = storage.Close()
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	changed, err := c.Mkdir(ctx, "alice", core.Path("/files/folder"))
 	if err != nil || changed.Effect != core.Applied {
@@ -92,12 +105,12 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	if err != nil || string(partial) != "prefix" {
 		t.Fatal(string(partial), err)
 	}
-	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder"))
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder"), core.RemoveOptions{Target: core.RemoveEmptyDirectory})
 	code(t, err, core.DirectoryNotEmpty)
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
-	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"))
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"), core.RemoveOptions{Target: core.RemoveNonDirectory})
 	if err != nil || changed.Effect != core.Applied {
 		t.Fatal(changed, err)
 	}
@@ -144,6 +157,79 @@ func TestChangeReceiptsSurviveErrorsAndCancellation(t *testing.T) {
 			result, err := c.Mkdir(ctx, "alice", core.Path("/files/new"))
 			if result.Effect != effect || !errors.Is(err, fault) || !errors.Is(err, context.Canceled) {
 				t.Fatal(result, err)
+			}
+		})
+	}
+}
+
+type continuationWriter struct {
+	core.Driver
+	change  core.Change
+	err     error
+	options core.WriteOptions
+}
+
+func (d *continuationWriter) ContinueWrite(_ context.Context, _ core.NativeAddress, _ core.Replayable, _ int64, options core.WriteOptions) (core.Change, error) {
+	d.options = options
+	options.Continuation.Checkpoint[0] = 'x'
+	return d.change, d.err
+}
+
+type continuationSource struct{ *strings.Reader }
+
+func (continuationSource) SourceVersion() string { return "source-v1" }
+func (r continuationSource) OpenRange(_ context.Context, offset, length int64) (io.ReadCloser, error) {
+	return io.NopCloser(io.NewSectionReader(r.Reader, offset, length)), nil
+}
+
+func TestContinuationPublicationReceipts(t *testing.T) {
+	fault := errors.New("native completion failed")
+	for _, tt := range []struct {
+		name           string
+		policy         core.WritePolicy
+		observe, abort bool
+		change         core.Change
+		err            error
+		effect         core.Effect
+		before         core.TargetPresence
+		code           core.Code
+	}{
+		{"conflict", core.Publish(core.IfAbsent()), false, false, core.Change{Effect: core.Unchanged}, core.Fail(core.AlreadyExists, fault), core.Unchanged, core.TargetUnknown, core.PreconditionFailed},
+		{"created", core.Publish(core.IfAbsent()), false, false, core.Change{Effect: core.Applied}, nil, core.Applied, core.TargetMissing, ""},
+		{"missing-observation", core.Publish(), true, false, core.Change{Effect: core.Applied}, nil, core.Applied, core.TargetUnknown, core.InvalidUpstreamResponse},
+		{"partial", core.Publish(), false, false, core.Change{Effect: core.Incomplete}, fault, core.Unknown, core.TargetUnknown, core.InvalidUpstreamResponse},
+		{"aborted", core.Publish(core.IfAbsent()), false, true, core.Change{Effect: core.Unchanged}, nil, core.Unchanged, core.TargetUnknown, ""},
+		{"direct-partial", core.WritePolicy{}, false, false, core.Change{Effect: core.Incomplete}, fault, core.Incomplete, core.TargetUnknown, core.InternalError},
+		{"direct-conflict", core.WritePolicy{}, false, false, core.Change{Effect: core.Unchanged}, core.Fail(core.AlreadyExists, fault), core.Unchanged, core.TargetUnknown, core.AlreadyExists},
+		{"direct-created", core.WritePolicy{}, false, false, core.Change{Effect: core.Applied}, nil, core.Applied, core.TargetUnknown, ""},
+		{"direct-aborted", core.WritePolicy{}, false, true, core.Change{Effect: core.Unchanged}, nil, core.Unchanged, core.TargetUnknown, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCore(t, core.Options{})
+			defer closeCore(t, c)
+			d := &continuationWriter{Driver: &fakeDriver{}, change: tt.change, err: tt.err}
+			installCopyMount(t, c, "/files", d)
+			source := continuationSource{strings.NewReader("x")}
+			checkpoint := []byte("log")
+			change, err := c.Write(context.Background(), "alice", core.Path("/files/new"), source, ptr(1), core.WriteOptions{
+				Policy: tt.policy, ObserveTarget: tt.observe,
+				Continuation: &core.WriteContinuation{Checkpoint: checkpoint, Abort: tt.abort, Append: func(context.Context, []byte) error { return nil }},
+			})
+			if string(checkpoint) != "log" || d.options.Policy != tt.policy || d.options.Continuation.Abort != tt.abort {
+				t.Fatal("continuation changed its source checkpoint or policy")
+			}
+			var gotCode core.Code
+			if err != nil {
+				gotCode = core.CodeOf(err)
+			}
+			if change.Effect != tt.effect || change.Before != tt.before || gotCode != tt.code || (tt.err != nil && !errors.Is(err, fault)) {
+				t.Fatal(change, err)
+			}
+			if tt.code == core.PreconditionFailed {
+				var failure *core.ConditionFailure
+				if !errors.As(err, &failure) || !failure.Negative {
+					t.Fatal("exclusive publication lost its failed condition", err)
+				}
 			}
 		})
 	}
