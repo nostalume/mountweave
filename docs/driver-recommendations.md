@@ -1,0 +1,50 @@
+# Choosing a driver
+
+Start with the job you need to do and the access you can obtain. Compare the
+account's storage with the transfer allowance and request limits for the
+interface you will use. Check the [driver capabilities](drivers.md) for the
+operations Mountweave supports.
+
+Provider terms were checked in November 2026. Confirm the limits for your
+account, app and region before buying capacity or planning a bulk transfer.
+The figures are provider terms. Throughput has yet to be benchmarked.
+
+## Chinese cloud drives
+
+| Your goal | Driver and setup | Capacity and traffic |
+| --- | --- | --- |
+| Manage personal files with an Open API grant | **123 Open**. Supply Open API credentials and select a root. Good for browsing, new files and single-file recycling. | The provider advertises up to 2 TB free. The ordinary Open API download documentation lists 1 GB/day for self-use and says VIP lifts that cap. The consumer channel lists a separate 10 GB/month extraction quota for ordinary accounts. [Plans](https://www.123pan.com/?pageType=1) · [Open API downloads](https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/fnf60phsushn8ip2) · [Consumer rules](https://www.123pan.com/Open/?notoken=1) |
+| Work with a library you can already access through an approved app | **Aliyun Drive Open**. Use your approved app and account authorization. Choose it for same-parent renames or moves that keep the file name. | The provider lists an 8 TB membership and separate third-party app entitlements. Its API guide allows 3, 6 or 2 concurrent download segments per user in a one-second window for ordinary, certified or risk-classified apps, respectively. [Membership](https://www.aliyundrive.com/) · [App entitlements](https://apps.apple.com/cn/app/id1494661473) · [Download limits](https://www.yuque.com/aliyundrive/zpfszx/gogo34oi2gy98w5d/markdown) |
+| Browse and read a large authorized library | **Guangya Pan Open**. Obtain an Open Platform app and matching user authorization. | The provider advertises 2 TB on registration and up to 500 TB for eligible members. The API allows 5 list requests and 2 original-download grants per second per IP. Check the app's byte allowance for bulk reads. [Capacity](https://www.guangyapan.com/) · [API limits](https://ossdata.guangyapan.com/doc/guangyapan_openapi_cn.md) |
+| Mount a small document collection with simple setup | **Nutstore via WebDAV**. Create an application password and select a collection. | Free storage grows as files are uploaded. Free accounts get 1 GB upload and 3 GB download per month. WebDAV allows 600 requests per 30 minutes on Free and 1,500 on paid accounts, with a 500 MB default upload limit. [Storage](https://help.jianguoyun.com/?p=2884) · [Transfer](https://help.jianguoyun.com/?p=29) · [WebDAV](https://help.jianguoyun.com/?p=2064) |
+| Mount files already in an authorized Baidu library | **Baidu Netdisk Open**. Obtain app approval and use a token scoped to the authorized directory. | Capacity follows the account. The pre-approval app limit is 10 requests per hour and 10 users. Approved limits are assigned per app. [Permissions and quotas](https://pan.baidu.com/union/doc/使用入门/权限与配额/) |
+| Read an existing 115 collection | **115 Open**. Register an app and authorize it with OAuth. The driver reads ordinary unencrypted files. | The provider lists 15 GB of initial free storage. Check the Open API traffic allowance for the app. [Storage](https://vip.115.com/?ac=buyspace&c=1) · [App registration](https://115.com/115115/T853224.html) |
+
+## International cloud drives
+
+| Your goal | Driver and setup | Capacity and traffic |
+| --- | --- | --- |
+| Browse personal or team files and add new files | **Dropbox**. Authorize a Dropbox OAuth app and choose an app folder, account root or granted team namespace. Enable the write scope and file creation in the driver for uploads. | Basic includes 2 GB and Plus includes 2 TB. Dropbox can throttle API calls and concurrent writes. Some team plans count data transport calls against a monthly allowance. [Storage](https://help.dropbox.com/storage-space/get-more-space) · [App access](https://www.dropbox.com/developers/reference/developer-guide) · [API throttling](https://developers.dropbox.com/en-us/error-handling-guide) · [Data transport limits](https://docs.dropboxapi.com/dropbox-api/docs/technical-reference/data-transport-limit) |
+| Read files from an existing Box library | **Box**. Authorize the app through OAuth and select the granted folder. The driver offers read-only access. | Individual includes 10 GB and Personal Pro includes 100 GB. Box sets a monthly fair-use transfer limit of 1 TB per individual user or purchased seat. General API throttling starts at about 1,000 calls per minute per user, with endpoint-specific limits. [Plans](https://www.box.com/pricing/individual) · [OAuth](https://developer.box.com/guides/authentication/oauth2) · [Fair use](https://www.box.com/legal/fairusepolicy) · [API limits](https://developer.box.com/guides/api-calls/permissions-and-errors/rate-limits) |
+| Read a Drive folder or export Google Workspace documents | **Google Drive**. Authorize an OAuth app, choose a folder or shared drive and configure export formats. The driver offers read-only access. | A personal account includes 15 GB across Drive, Gmail and Photos. The new API quotas list 1 TB/day of project egress and per-minute quotas weighted by method. Some existing projects retain earlier quotas. Google plans over-quota charges and has yet to publish full billing details. Document exports are limited to 10 MB. [Storage](https://support.google.com/docs/answer/9312312/how-your-google-storage-works) · [API quotas](https://developers.google.com/workspace/drive/api/guides/limits) · [Export limits](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/export) |
+| Mount OneDrive or a SharePoint document library | **OneDrive via Graph Drive**. Use delegated access for personal accounts or a tenant-approved app for organization drives. Select the drive and folder. Write access and a buffer budget enable exclusive creation on ordinary mounts. Durable resume requires retained input and a checkpoint. | Free Microsoft accounts include 5 GB of shared cloud storage. Microsoft 365 Personal includes 1 TB. Organization capacity follows the tenant's plan. Graph and SharePoint throttle heavy request traffic. [Storage FAQ](https://support.microsoft.com/en-us/onedrive/microsoft-storage-faqs) · [Plans](https://www.microsoft.com/en-us/microsoft-365/onedrive/onedrive-plans-and-pricing) · [Graph limits](https://learn.microsoft.com/en-us/graph/throttling-limits) · [Setup](../drivers/graphdrive/README.md) |
+
+## Standard protocol deployments
+
+| Your goal | Start with | What to check |
+| --- | --- | --- |
+| Mount a directory on the host | **Local** | Filesystem permissions, free space and any staging budget |
+| Mount a NAS or LAN share | **SMB** | Share credentials, server quotas and LAN bandwidth |
+| Use an existing SSH file server | **SFTP** | SSH host key, credentials, root and connection limits |
+| Mount an HTTPS collection | **WebDAV** | Collection URL, authentication, pagination and server write limits |
+| Connect an FTP device or server | **FTP/FTPS** | Credentials, supported transport and directory behavior |
+| Mount an object bucket by key | **S3** | SDK credentials, region, bucket and key scope. Check charges for storage, requests and egress, plus support for the write operations you need. [AWS pricing](https://aws.amazon.com/s3/pricing/) · [Service profiles](../drivers/s3/README.md#compatible-s3-services) |
+
+## Object storage
+
+| Your goal | Driver and setup | Capacity and traffic |
+| --- | --- | --- |
+| Read an object bucket in mainland China | **Alibaba Cloud OSS, Tencent Cloud COS or UCloud US3 via S3**. Use regional endpoints and vendor credentials. The documented profiles cover reads. | Compare storage, requests and public egress. COS offers eligible first-time accounts 50 GB for individuals or 1 TB for enterprises for 180 days. US3 lists mainland Standard storage at CNY 0.004 per GB-day and public egress at CNY 0.25 or 0.45 per GB by time band. [OSS billing](https://help.aliyun.com/zh/oss/understanding-billing/) · [COS allowance](https://cloud.tencent.com/document/product/436/6240) · [US3 billing](https://docs.ucloud.cn/ufile/bill/billing) · [Service profiles](../drivers/s3/README.md#compatible-s3-services) |
+| Read and write objects in an AWS deployment | **Amazon S3**. Supply an authorized AWS SDK client, region, bucket and prefix. Configure a write budget for uploads and check the permissions for the operations you need. | Storage, requests, retrieval and public egress have separate rates. The first 100 GB/month of Internet egress is shared across eligible AWS services and regions. China and GovCloud have separate rates. [Pricing](https://aws.amazon.com/s3/pricing/) · [Driver](../drivers/s3/README.md) |
+| Read and write objects in an Azure deployment | **Azure Blob Storage**. Supply an authorized container client. A write budget enables new or replacement block blobs. | Standard v2 accounts have a default 5 PiB capacity limit and a regional request limit of 20,000 or 40,000 per second. Check storage, operation and egress charges for the selected region and tier. [Account limits](https://learn.microsoft.com/en-us/azure/storage/common/storage-scalability-targets) · [Pricing](https://azure.microsoft.com/en-us/pricing/details/storage/blobs/) · [Driver](../drivers/azureblob/README.md) |
+| Read an object bucket with frequent Internet downloads | **Cloudflare R2 Standard via S3**. Create a bucket and bucket-scoped credentials. The documented profile covers reads. | The monthly Standard allowance includes 10 GB-month, 1 million Class A requests and 10 million Class B requests. R2 charges no direct Internet egress. Listings count as Class A requests. [Pricing](https://developers.cloudflare.com/r2/pricing/) · [Service profile](../drivers/s3/README.md#compatible-s3-services) |
