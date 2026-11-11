@@ -101,15 +101,15 @@ func (f *objectFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPut {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read failed", 400)
+			return
+		}
 		if (r.Header.Get("If-None-Match") == "*" && exists) ||
 			(r.Header.Get("If-Match") != "" && (!exists || r.Header.Get("If-Match") != tag(data))) {
 			w.WriteHeader(412)
 			io.WriteString(w, "<Error><Code>PreconditionFailed</Code></Error>")
-			return
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read failed", 400)
 			return
 		}
 		f.objects[key] = string(body)

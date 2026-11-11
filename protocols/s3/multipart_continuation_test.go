@@ -73,13 +73,13 @@ func TestSDKMultipartContinuation(t *testing.T) {
 				number, _ := strconv.Atoi(q.Get("partNumber"))
 				event := key + " part " + strconv.Itoa(number)
 				calls[event]++
-				if (key == "resume" && number == 2 && calls[event] == 1) || key == "abort" {
-					fail(503, "SlowDown")
-					return
-				}
 				data, err := io.ReadAll(r.Body)
 				if err != nil {
 					fail(400, "InvalidRequest")
+					return
+				}
+				if (key == "resume" && number == 2 && calls[event] == 1) || key == "abort" {
+					fail(503, "SlowDown")
 					return
 				}
 				s.parts[number] = string(data)
