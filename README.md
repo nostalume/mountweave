@@ -13,18 +13,13 @@ your application needs.
 From your application's module, install Core with Go 1.24 or newer.
 
 ```sh
-go get github.com/nostalume/mountweave@v0.1.0
+go get github.com/nostalume/mountweave@v0.2.0
 ```
 
-S3, AliPan and Pool have their own `v0.1.0` module tags. Check the tags before
-selecting an optional module. Use the API reference for the version you install.
-Mountweave is in v0 development. [Tags](https://github.com/nostalume/mountweave/tags) · [v0.1.0 API](https://pkg.go.dev/github.com/nostalume/mountweave@v0.1.0)
+Optional modules have independent versions and Go requirements.
+[Module tags](https://github.com/nostalume/mountweave/tags) · [Core API](https://pkg.go.dev/github.com/nostalume/mountweave@v0.2.0)
 
 ## Mount a local directory
-
-This example uses `drivers/local` from the current checkout. To try it from your
-application's module, use `go mod edit -replace 'github.com/nostalume/mountweave=/path/to/mountweave'`
-with the absolute path to your checkout.
 
 Create a Core with `core.New` and supply your authorization policy in
 `core.Options`. The helper mounts a directory at `/files`.

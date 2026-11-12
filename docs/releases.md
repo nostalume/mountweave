@@ -17,18 +17,18 @@ outside the checkout or under the ignored `work/` directory.
 
 ```sh
 git fetch origin --tags
-go run ./internal/release plan -all -bump minor > ../release-plan.json
+go run ./internal/release plan -bump patch > ../release-plan.json
 go run ./internal/release prepare ../release-plan.json
 ```
 
-This plans the first full batch from the current release tags. Core,
-AliPan, Pool, and the S3 driver advance to `v0.2.0`. The other 51
-modules start at `v0.1.0`. For later batches, `plan -bump patch` selects
-untagged modules and modules that changed since their last tag. You can
+The planner selects changed modules and starts untagged modules at `v0.1.0`.
+Use `-all` to include every module or `-bump minor` for a minor bump. You can
 also pass explicit targets such as `plan drivers/dropbox@v0.1.1`.
 
-Review and commit the resulting `go.mod` changes. Verify that commit with
-the same plan.
+Review the `go.mod` changes. When releasing Core, update the README installation
+command and API link to the planned root tag. Check the README's Go requirement
+and example against the candidate. Commit these changes together, then verify
+that commit with the same plan.
 
 ```sh
 go run ./internal/release verify ../release-plan.json > ../release-receipt.json
