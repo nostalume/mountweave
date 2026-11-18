@@ -13,11 +13,11 @@ your application needs.
 From your application's module, install Core with Go 1.24 or newer.
 
 ```sh
-go get github.com/nostalume/mountweave@v0.2.0
+go get github.com/nostalume/mountweave@v0.3.0
 ```
 
 Optional modules have independent versions and Go requirements.
-[Module tags](https://github.com/nostalume/mountweave/tags) · [Core API](https://pkg.go.dev/github.com/nostalume/mountweave@v0.2.0)
+[Module tags](https://github.com/nostalume/mountweave/tags) · [Core API](https://pkg.go.dev/github.com/nostalume/mountweave@v0.3.0)
 
 ## Mount a local directory
 

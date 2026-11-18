@@ -235,6 +235,17 @@ func TestDistributedPublicationRangeAndDegradedRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts.MetadataPath = filepath.Join(t.TempDir(), "restored.db")
+	// A valid Bolt database without a Pool layout is still missing metadata.
+	blank, err := bolt.Open(opts.MetadataPath, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blank.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExisting(opts); core.CodeOf(err) != core.NotFound {
+		t.Fatalf("uninitialized metadata: %v", err)
+	}
 	if err := os.WriteFile(opts.MetadataPath, backup.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}

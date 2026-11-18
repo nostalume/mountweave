@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path"
 
 	core "github.com/nostalume/mountweave"
@@ -92,8 +93,26 @@ func shardPath(id string, stripe int64, slot, attempt int) string {
 	return fmt.Sprintf("/%s-%x-%x-%x", id, stripe, slot, attempt)
 }
 
-func (d *Driver) initialize() error {
+func openExistingMetadata(path string, flags int, mode os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, flags&^os.O_CREATE, mode)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && info.Size() == 0 {
+		err = os.ErrNotExist
+	}
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
+}
+
+func (d *Driver) initialize(requireExisting bool) error {
 	return d.db.Update(func(tx *bolt.Tx) error {
+		if cfg := tx.Bucket(configKey); requireExisting && (cfg == nil || cfg.Get(headerKey) == nil) {
+			return os.ErrNotExist
+		}
 		for _, key := range [][]byte{configKey, filesKey, uploadsKey, membersKey, entriesKey, dirsKey, refsKey, garbageKey, jobsKey} {
 			if _, err := tx.CreateBucketIfNotExists(key); err != nil {
 				return err

@@ -33,6 +33,21 @@ func (d *Driver) mutate(ctx context.Context, route string, input, out any) (core
 	if cleanup != nil {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UpstreamFailure, cleanup)
 	}
+	if d.website != nil {
+		var op string
+		switch route {
+		case "/adrive/v1.0/openFile/create":
+			op = "create"
+		case "/adrive/v1.0/openFile/complete":
+			op = "complete"
+		default:
+			return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+		}
+		if err := d.website.request(ctx, op, input, out); err != nil {
+			return core.Change{Effect: core.Unknown}, err
+		}
+		return core.Change{Effect: core.Applied}, nil
+	}
 	effect, err := d.call(ctx, route, input, out, false)
 	return core.Change{Effect: effect}, errors.Join(err, ctx.Err())
 }
@@ -85,10 +100,12 @@ func (d *Driver) Mkdir(ctx context.Context, pAddress core.NativeAddress) (core.C
 	if err != nil {
 		return unchanged, err
 	}
-	if _, exists, err := d.child(ctx, parent.ID, name); err != nil {
-		return unchanged, err
-	} else if exists {
-		return unchanged, core.Fail(core.AlreadyExists, nil)
+	if d.website == nil {
+		if _, exists, err := d.child(ctx, parent.ID, name); err != nil {
+			return unchanged, err
+		} else if exists {
+			return unchanged, core.Fail(core.AlreadyExists, nil)
+		}
 	}
 	_, change, err := d.createEntry(ctx, parent.ID, name, "folder", nil, nil)
 	return change, err

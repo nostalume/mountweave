@@ -44,6 +44,9 @@ type transfer struct {
 }
 
 func (x *session) startTransfer(cmd, arg string) error {
+	if x.privateData && !x.private {
+		return x.reply(522, "Private data protection required")
+	}
 	if x.passive == nil && !x.active.IsValid() {
 		return x.reply(425, "Data endpoint required")
 	}
@@ -226,15 +229,33 @@ func (t *transfer) connect() (_ net.Conn, err error) {
 		return nil, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	if t.private {
-		secured := tls.Server(conn, t.x.options.TLSConfig)
+		if t.x.privateData {
+			conn = strictTLSEOF{conn}
+		}
+		secured := tls.Server(conn, t.x.dataTLS)
 		if err := secured.HandshakeContext(ctx); err != nil {
 			return nil, err
+		}
+		if t.x.privateData && !secured.ConnectionState().DidResume {
+			return nil, core.Fail(core.Unauthenticated, nil)
 		}
 		// The raw connection remains the cancellation owner; TLS holds no other
 		// native resource. A failed send cannot wait for a peer close_notify.
 		return secured, nil
 	}
 	return conn, nil
+}
+
+// A raw TCP EOF is a failed protected upload. TLS close_notify supplies the
+// authenticated EOF used by complete publication.
+type strictTLSEOF struct{ net.Conn }
+
+func (c strictTLSEOF) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err == io.EOF {
+		return n, fmt.Errorf("FTP data transport closed: %w", io.ErrUnexpectedEOF)
+	}
+	return n, err
 }
 
 func (t *transfer) execute() (err, cleanup error) {

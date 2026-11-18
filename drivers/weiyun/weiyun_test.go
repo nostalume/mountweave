@@ -218,8 +218,47 @@ func TestMountTokenBoundDirectory(t *testing.T) {
 			t.Fatal("unconfirmed selection reached a grant", state, err)
 		}
 	}
+	options := weiyun.Options{Token: "fixture-private", Client: api, ContentClient: content, RootPath: "/Docs"}
+	for state, code := range map[string]core.Code{
+		"ambiguous": core.PathAmbiguous, "wrong-parent": core.InvalidUpstreamResponse,
+	} {
+		mode = state
+		scoped, err := weiyun.Open(ctx, options)
+		if scoped != nil {
+			_ = scoped.Close()
+		}
+		if core.CodeOf(err) != code {
+			t.Fatal("unconfirmed selected root mounted", state, err)
+		}
+	}
+	mode = ""
+	scoped, err := weiyun.Open(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Install("/scoped", scoped); err != nil {
+		t.Fatal(err)
+	}
+	startPages := rootPages
+	contents, err := c.List(ctx, "u", core.ListRequest{Query: core.Children(core.Path("/scoped")), Limit: 50, CursorTTL: time.Minute})
+	if err != nil || len(contents.Items) != 1 || contents.Items[0].Name != name {
+		t.Fatal("selected root exposed the wrong directory", contents, err)
+	}
+	if _, err := c.Stat(ctx, "u", core.Path("/scoped/last.txt")); core.CodeOf(err) != core.NotFound || rootPages != startPages {
+		t.Fatal("selected root read its parent", err)
+	}
+	scopedBody, err := c.Open(ctx, "u", core.Path("/scoped/"+name), core.OpenOptions{Range: &core.Range{Start: 1, End: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopedData, err := io.ReadAll(scopedBody.Body)
+	if err = errors.Join(err, scopedBody.Body.Close()); err != nil || string(scopedData) != "bcd" || rootPages != startPages {
+		t.Fatal("selected root download used the wrong parent", err)
+	}
+
 	mode = "wrong-id"
-	if _, err := c.Open(ctx, "u", target, core.OpenOptions{}); core.CodeOf(err) != core.InvalidUpstreamResponse || bodyRequests != 0 {
+	beforeBody := bodyRequests
+	if _, err := c.Open(ctx, "u", target, core.OpenOptions{}); core.CodeOf(err) != core.InvalidUpstreamResponse || bodyRequests != beforeBody {
 		t.Fatal("unconfirmed grant reached the body", err)
 	}
 	mode = "denied"

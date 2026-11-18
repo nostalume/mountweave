@@ -25,8 +25,13 @@ import (
 )
 
 func TestTransferPoliciesAndAbort(t *testing.T) {
-	for _, policy := range []ftp.StorePolicy{ftp.CompletePublish, ftp.LiveEdit} {
-		t.Run(fmt.Sprint(policy), func(t *testing.T) {
+	for _, profile := range []struct {
+		name   string
+		policy ftp.StorePolicy
+		secure bool
+	}{{"plain", ftp.CompletePublish, false}, {"protected", ftp.CompletePublish, true}, {"live", ftp.LiveEdit, true}} {
+		t.Run(profile.name, func(t *testing.T) {
+			policy, secure := profile.policy, profile.secure
 			root := t.TempDir()
 			localDriver, err := local.New(root, local.Options{StagingDirectory: t.TempDir(), MaxStagingBytes: 4096})
 			if err != nil {
@@ -50,7 +55,7 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 			o := ftp.Options{Root: core.Path("/files"), CursorTTL: time.Minute, StorePolicy: policy, DataConnectTimeout: 3 * time.Second,
 				Limits: ftp.Limits{CommandBytes: 512, TransferBufferBytes: 32, PageEntries: 1, PageNameBytes: 4096},
 				Authenticate: func(_ context.Context, login ftp.Login) (core.Principal, error) {
-					if login.Username != "test" || login.Password != "synthetic" || (login.TLS != nil) != (policy == ftp.LiveEdit) {
+					if login.Username != "test" || login.Password != "synthetic" || (login.TLS != nil) != secure {
 						return "", errors.New("invalid login")
 					}
 					return "writer", nil
@@ -73,15 +78,21 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 			o.OnFailure = func(f protocols.Failure) { failures <- f }
 			// Reuse the standard loopback certificate fixture for explicit control
 			// and protected data TLS. No external service or real credential is used.
-			if policy == ftp.LiveEdit {
+			if secure {
 				certificate := httptest.NewTLSServer(nil)
 				t.Cleanup(certificate.Close)
 				o.TLSConfig = &tls.Config{Certificates: certificate.TLS.Certificates}
 			}
-			clientTLS := &tls.Config{InsecureSkipVerify: true} // Synthetic loopback certificate only.
+			clientTLS := &tls.Config{InsecureSkipVerify: true, ServerName: "fixture", ClientSessionCache: tls.NewLRUClientSessionCache(1)} // Synthetic loopback certificate only.
 			s, err := ftp.New(c, o)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if secure {
+				s, err = s.WithPrivateData()
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			peer, server := net.Pipe()
 			_ = peer.SetDeadline(time.Now().Add(15 * time.Second))
@@ -128,7 +139,9 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 			}
 			response(220)
 			command("FEAT", 211)
-			if policy == ftp.LiveEdit {
+			if secure {
+				command("USER test", 331)
+				command("PASS synthetic", 534)
 				command("AUTH TLS", 234)
 				secured := tls.Client(peer, clientTLS)
 				if err := secured.Handshake(); err != nil {
@@ -136,13 +149,17 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 				}
 				control = textproto.NewConn(secured)
 				command("PBSZ 0", 200)
-				command("PROT P", 200)
+				command("PROT C", 534)
 			}
 			command("USER test", 331)
 			command("PASS wrong", 530)
 			command("PASS synthetic", 230)
 			command("TYPE I", 200)
-			dataConn := func() net.Conn {
+			if secure {
+				command("RETR no-data", 522)
+				command("PROT P", 200)
+			}
+			dataSocket := func() net.Conn {
 				t.Helper()
 				message := command("EPSV", 229)
 				parts := strings.Split(message, "|")
@@ -158,10 +175,28 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 					t.Fatal(err)
 				}
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-				if policy == ftp.LiveEdit {
+				return conn
+			}
+			dataConn := func() net.Conn {
+				conn := dataSocket()
+				if secure {
 					return tls.Client(conn, clientTLS)
 				}
 				return conn
+			}
+			if secure {
+				foreign := clientTLS.Clone()
+				foreign.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+				for range 2 {
+					conn := tls.Client(dataSocket(), foreign)
+					command("STOR foreign", 150)
+					_, _ = io.Copy(io.Discard, conn)
+					_ = conn.Close()
+					response(425)
+					if f := failed(); f.Phase != "connect" || f.Change.Effect != core.Unchanged {
+						t.Fatal(f)
+					}
+				}
 			}
 			upload := func(cmd, data string) {
 				t.Helper()
@@ -230,7 +265,7 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if policy == ftp.LiveEdit {
+			if secure {
 				conn = tls.Client(conn, clientTLS)
 			}
 			data, err := io.ReadAll(conn)
@@ -239,7 +274,7 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 				t.Fatal(string(data), err)
 			}
 			response(226)
-			if policy == ftp.CompletePublish {
+			if !secure {
 				// These control commands share the same behavior under either STOR policy.
 				for _, tc := range []struct {
 					line string
@@ -309,7 +344,21 @@ func TestTransferPoliciesAndAbort(t *testing.T) {
 				t.Fatalf("abort: %q want %q", value, want)
 			}
 			command("NOOP", 200)
-			if policy == ftp.CompletePublish {
+			if secure && policy == ftp.CompletePublish {
+				raw := dataSocket()
+				protected := tls.Client(raw, clientTLS)
+				command("STOR abort", 150)
+				if _, err := io.WriteString(protected, "truncated"); err != nil {
+					t.Fatal(err)
+				}
+				_ = raw.Close() // Drop the transport without TLS close_notify.
+				response(550)
+				value, err := os.ReadFile(filepath.Join(root, "abort"))
+				if f := failed(); !errors.Is(f.Err, io.ErrUnexpectedEOF) || f.Change.Effect != core.Unchanged || err != nil || string(value) != "old" {
+					t.Fatal("truncated TLS upload:", f, string(value), err)
+				}
+			}
+			if !secure {
 				// Abort while Accept is still pending, before any file is opened.
 				command("EPSV", 229)
 				command("STOR pending", 150)

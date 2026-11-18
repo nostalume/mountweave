@@ -1,4 +1,4 @@
-// Package weiyun mounts the Tencent Weiyun directory bound to a personal MCP token.
+// Package weiyun mounts a Tencent Weiyun directory within a personal MCP token's scope.
 package weiyun
 
 import (
@@ -22,6 +22,8 @@ const endpoint = "https://www.weiyun.com/api/v3/mcpserver"
 
 type Options struct {
 	Token string `json:"-"` // Personal MCP token from the Weiyun authorization page.
+	// RootPath is absolute within the token's scope. Empty or "/" uses the token's root.
+	RootPath string
 	// Clients are borrowed. Their transports must not add account credentials.
 	Client, ContentClient *http.Client
 	MaxResponseBytes      int64
@@ -29,14 +31,16 @@ type Options struct {
 
 type Driver struct {
 	api, content http.Client
-	token, root  string
+	token        string
+	tokenRoot    string
+	root         directory
 	limit        int64
 	requestID    atomic.Uint64
 	closed       atomic.Bool
 	cleanup      httpcontent.ResponseCleanup
 }
 
-// Open verifies the token-bound root. Close a non-nil failed result to retry cleanup.
+// Open verifies the selected root. Close a non-nil failed result to retry cleanup.
 func Open(ctx context.Context, o Options) (*Driver, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -45,15 +49,36 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 		o.MaxResponseBytes < 0 || o.MaxResponseBytes == math.MaxInt64 {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
+	if o.RootPath != "" {
+		if err := core.ValidatePath(o.RootPath); err != nil {
+			return nil, err
+		}
+	}
 	if o.MaxResponseBytes == 0 {
 		o.MaxResponseBytes = 4 << 20
 	}
 	d := &Driver{api: httpcontent.IsolatedClient(o.Client), content: httpcontent.IsolatedClient(o.ContentClient),
 		token: o.Token, limit: o.MaxResponseBytes}
-	root := iterator{d: d}
-	_, err := root.next(ctx)
-	if err == io.EOF || err == nil {
-		d.root, err = root.observedKey, ctx.Err()
+	var err error
+	if o.RootPath != "" && o.RootPath != "/" {
+		folder, parent, resolveErr := d.resolve(ctx, core.NativePath(o.RootPath))
+		if resolveErr != nil {
+			err = resolveErr
+		} else if folder.m.Kind != core.Directory {
+			err = core.Fail(core.NotDirectory, nil)
+		} else {
+			d.root = directory{folder.id, parent}
+		}
+	}
+	if err == nil {
+		root := iterator{d: d, dir: d.root}
+		_, err = root.next(ctx)
+		if err == io.EOF || err == nil {
+			if d.root.Key == "" {
+				d.tokenRoot = root.observedKey
+			}
+			err = ctx.Err()
+		}
 	}
 	if err != nil {
 		d.closed.Store(true)

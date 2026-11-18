@@ -1,7 +1,11 @@
 # Tencent Weiyun source
 
 `weiyun.Open(ctx, weiyun.Options{Token: token})` verifies the directory authorized
-by a [personal Weiyun MCP token](https://www.weiyun.com/act/openclaw). Obtain the
+by a [personal Weiyun MCP token](https://www.weiyun.com/act/openclaw). Set
+`RootPath: "/Documents"` to mount a subdirectory within that authorized tree.
+Open verifies the selected directory and binds its native directory and parent
+keys. The mount continues to use that binding until it is reconstructed, and
+can neither list nor read the parent through the mounted path. Obtain the
 token in the host and keep it out of serialized mount configuration. Close a
 non-nil Driver returned with an error to retry any retained response cleanup.
 After success, install the Driver at a Core path and use `Stat`, `List`, `Open`,

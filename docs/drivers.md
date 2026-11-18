@@ -46,9 +46,11 @@ also requires safe source deletion.
 | [Huawei Drive Kit](../drivers/huaweidrive/README.md) | Personal drive. `Stat` and `Open` accept a known version ID with history access | — |
 | [KDocs](../drivers/kdocs/README.md) | Personal My Documents or a selected folder | — |
 | [KooDrive](../drivers/koodrive/README.md) | Individual, department or group space | Optional Mkdir and known-length Create in the individual space |
+| [China Mobile Cloud](../drivers/mobilepan/README.md) | Personal drive. Metadata, paged listing and original-file reads with ranges. Library access through a registered application or a website session | — |
 | [115 Open](../drivers/pan115/README.md) | Authorized root or folder, ordinary unencrypted files and actual ranges | — |
 | [123 Open](../drivers/pan123/README.md) | Account tree, ordinary downloads and optional direct links for authorized directories | Optional Mkdir, single-file recycling and Create through single-step or multipart upload |
 | [Alibaba Cloud PDS](../drivers/pdsshare/README.md) | Authorized standard drive or received share | — |
+| [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | — |
 | [Teambition](../drivers/teambition/README.md) | Approved enterprise project collection and its original files | — |
 | [Tencent Docs](../drivers/tencentdocs/README.md) | Authorized folder and optional asynchronous document export | — |
 | [Tencent Cloud SMH](../drivers/tencentsmh/README.md) | Tenant space or recipient share, with signed downloads | — |

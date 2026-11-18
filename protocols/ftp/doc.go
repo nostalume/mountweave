@@ -21,6 +21,9 @@
 // returned resource even alongside an error. DataConnectTimeout covers setup,
 // Accept and TLS handshake, not total large-file duration. TLSConfig enables
 // AUTH TLS and protected data (PBSZ 0, PROT P); PROT C remains explicit.
+// WithPrivateData requires explicit TLS login and protected data. It uses the
+// TLS configuration's static certificate settings, with separate session
+// tickets per control connection. Data connections must resume one of them.
 //
 // Implemented commands include USER/PASS, QUIT/NOOP/FEAT/SYST, TYPE I/A N,
 // MODE S, STRU F, PWD/CWD/CDUP, SIZE (binary files), MDTM, LIST/MLST/MLSD/NLST,

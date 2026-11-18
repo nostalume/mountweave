@@ -82,6 +82,7 @@ type Driver struct {
 	failedBodies []io.Closer
 	closeErr     error
 	buffer       *upload.Budget
+	website      *Website
 }
 
 // New constructs a prepared root without network I/O. Only success transfers
@@ -163,7 +164,12 @@ func validEndpoint(endpoint string) error {
 }
 func (d *Driver) Close() error {
 	d.closed.Store(true)
-	err := d.opts.Credentials.Close()
+	var err error
+	if d.website != nil {
+		err = d.website.Release()
+	} else {
+		err = d.opts.Credentials.Close()
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	failed := d.failedBodies
@@ -229,7 +235,13 @@ type nativePage struct {
 
 func (d *Driver) page(ctx context.Context, parent, marker string, n int) ([]nativeFile, string, error) {
 	var out nativePage
-	err := d.post(ctx, "/adrive/v1.0/openFile/list", map[string]any{"drive_id": d.opts.DriveID, "parent_file_id": parent, "marker": marker, "limit": n}, &out)
+	input := map[string]any{"drive_id": d.opts.DriveID, "parent_file_id": parent, "marker": marker, "limit": n}
+	var err error
+	if d.website != nil {
+		err = d.website.request(ctx, "page", input, &out)
+	} else {
+		err = d.post(ctx, "/adrive/v1.0/openFile/list", input, &out)
+	}
 	if err != nil {
 		return nil, "", pageFailure(err)
 	}
@@ -338,7 +350,16 @@ func (d *Driver) Stat(ctx context.Context, pAddress core.NativeAddress, selectio
 		return core.Metadata{}, err
 	}
 	if p == "/" {
-		return core.Metadata{Kind: core.Directory}, nil
+		if d.website == nil || d.opts.RootID == "root" {
+			return core.Metadata{Kind: core.Directory}, nil
+		}
+		f, err = d.websiteFile(ctx, d.opts.RootID)
+		if err != nil {
+			return core.Metadata{}, err
+		}
+		if f.Type != "folder" {
+			return core.Metadata{}, core.Fail(core.NotDirectory, nil)
+		}
 	}
 	return f.metadata(), nil
 }
@@ -585,12 +606,22 @@ func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range)
 		URL    string `json:"url"`
 		Method string `json:"method"`
 	}
-	if err := d.post(ctx, "/adrive/v1.0/openFile/getDownloadUrl", map[string]string{"drive_id": d.opts.DriveID, "file_id": f.ID}, &link); err != nil {
+	input := map[string]string{"drive_id": d.opts.DriveID, "file_id": f.ID}
+	var err error
+	if d.website != nil {
+		err = d.website.request(ctx, "download", input, &link)
+	} else {
+		err = d.post(ctx, "/adrive/v1.0/openFile/getDownloadUrl", input, &link)
+	}
+	if err != nil {
 		return core.Opened{}, err
 	}
 	u, err := url.Parse(link.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" || link.Method != "GET" {
 		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid download target"))
+	}
+	if d.website != nil && !httpcontent.IsHTTPS(u) {
+		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	// This is a fresh request: provider bearer credentials never reach a download origin.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -598,6 +629,10 @@ func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range)
 		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	if d.website != nil {
+		// Website download grants can sign the public Referer along with the URL.
+		req.Header.Set("Referer", websiteOrigin)
+	}
 	if wanted != nil {
 		req.Header.Set("Range", httpcontent.Header(wanted))
 	}
@@ -611,7 +646,12 @@ func (d *Driver) openFile(ctx context.Context, f nativeFile, wanted *core.Range)
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		return core.Opened{Metadata: core.Metadata{Name: f.Name, Kind: core.File}, Body: response.Body}, statusError(response.StatusCode, "", nil)
 	}
-	opened, err := httpcontent.Open(response, wanted)
+	var opened core.Opened
+	if d.website != nil && f.Size != nil {
+		opened, err = httpcontent.OpenSized(response, wanted, *f.Size)
+	} else {
+		opened, err = httpcontent.Open(response, wanted)
+	}
 	opened.Metadata.Name = f.Name
 	return opened, err
 }

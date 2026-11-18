@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -68,6 +69,21 @@ type Driver struct {
 // Drivers; on failure the caller still owns all of them. Reopening must preserve
 // member identities and the stored layout. Missing runtime members remain offline.
 func New(opts Options) (*Driver, error) {
+	return openPool(opts, false)
+}
+
+// OpenExisting opens saved Pool metadata without creating a database or layout.
+// Missing metadata reports core.NotFound. Successful ownership transfer and
+// layout and member checks follow New.
+func OpenExisting(opts Options) (*Driver, error) {
+	d, err := openPool(opts, true)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, core.Fail(core.NotFound, err)
+	}
+	return d, err
+}
+
+func openPool(opts Options, requireExisting bool) (*Driver, error) {
 	n := opts.DataShards + opts.ParityShards
 	if opts.DataShards < 1 || opts.DataShards > 255 || opts.ParityShards < 1 || opts.ParityShards > 255 || n > 256 || n < 2 ||
 		opts.ShardBytes < 1 || opts.ShardBytes > math.MaxInt/n ||
@@ -98,11 +114,15 @@ func New(opts Options) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.db, err = bolt.Open(opts.MetadataPath, 0600, &bolt.Options{Timeout: opts.LockTimeout})
+	storage := bolt.Options{Timeout: opts.LockTimeout}
+	if requireExisting {
+		storage.OpenFile = openExistingMetadata
+	}
+	d.db, err = bolt.Open(opts.MetadataPath, 0600, &storage)
 	if err != nil {
 		return nil, err
 	}
-	if err = d.initialize(); err != nil {
+	if err = d.initialize(requireExisting); err != nil {
 		return nil, errors.Join(err, d.db.Close())
 	}
 	d.life, d.cancel = context.WithCancel(context.Background())

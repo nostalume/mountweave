@@ -93,7 +93,10 @@ func (i *iterator) next(ctx context.Context) ([]entry, error) {
 	}
 	expected := i.dir.Key
 	if expected == "" {
-		expected = i.d.root
+		expected = i.d.tokenRoot
+		if expected == "" {
+			expected = i.observedKey
+		}
 	}
 	if !validKey(result.Key) || expected != "" && !strings.EqualFold(result.Key, expected) {
 		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("Weiyun did not confirm the selected directory"))
@@ -172,8 +175,8 @@ func (d *Driver) resolve(ctx context.Context, address core.NativeAddress) (entry
 	if err := core.ValidatePath(address.Value()); err != nil {
 		return entry{}, "", err
 	}
-	current := entry{m: core.Metadata{Kind: core.Directory}}
-	var parent string
+	current := entry{id: d.root.Key, m: core.Metadata{Kind: core.Directory}}
+	parent := d.root.ParentKey
 	if address.Value() == "/" {
 		return current, parent, nil
 	}

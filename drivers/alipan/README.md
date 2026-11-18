@@ -129,6 +129,17 @@ the internal error cause for host diagnosis, not public wire responses. Native
 execution returns a root receipt; client plan budgets do not cap native descendants.
 There is no new public upload session or durable multipart resume API.
 
+## Website publication
+
+`WebsiteAccount.OpenWritable` enables known-length exclusive publication,
+directory creation, and file trash for the selected resource-drive folder.
+It requires a separate staging folder on the same drive and a bounded
+upload buffer. The Driver uploads each body to a unique staging name and
+uses the website's v2 move to claim the final name. It resolves an uncertain
+move by native file ID. It leaves the staging object available for
+reconciliation when the move may still complete. Use
+`core.Publish(core.IfAbsent())` for file publication.
+
 ## Rotating credentials
 
 The credential subpackage owns one refresh writer and durable-save operation.
@@ -219,6 +230,5 @@ unverified.
 The native contract was inspected in Alibaba's official
 [SDK at revision 66cdb2679e9cbacd7f682e43e784cf481f200a5a](https://github.com/alibaba/aliyunpan-ios-sdk/tree/66cdb2679e9cbacd7f682e43e784cf481f200a5a/Sources/AliyunpanSDK).
 The module identity is github.com/nostalume/mountweave/drivers/alipan.
-The relative replace is for checkout development only. This working-tree upload
-implementation requires the matching core revision containing the shared internal
-chunker; it is not yet part of the published v0.1.0 modules.
+The relative `replace` is for checkout development. Consumers of this module
+use the Core version declared in `go.mod`.

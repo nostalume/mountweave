@@ -100,6 +100,35 @@ func TestBasicFileWorkflow(t *testing.T) {
 		}
 		return data
 	}
+	t.Run("create-only publication", func(t *testing.T) {
+		createOpts := opts
+		createOpts.CreateOnly = true
+		create, err := webdav.New(c, createOpts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			body, condition string
+			status          int
+		}{
+			{"first", "", 201},
+			{"first", "", 204},
+			{"other", "", 409},
+			{"first", "*", 412},
+		} {
+			req := httptest.NewRequest("PUT", "/dav/create-only", strings.NewReader(tc.body))
+			req.Header.Set("X-Actor", "creator")
+			if tc.condition != "" {
+				req.Header.Set("If-None-Match", tc.condition)
+			}
+			res := httptest.NewRecorder()
+			create.ServeHTTP(res, req)
+			if res.Code != tc.status {
+				t.Fatalf("PUT: status %d, want %d: %s", res.Code, tc.status, res.Body)
+			}
+		}
+		request("DELETE", "/dav/create-only", "", nil, 204)
+	})
 	request("OPTIONS", "/dav/", "", nil, 204)
 	request("MKCOL", "/dav/folder/", "", nil, 201)
 	request("HEAD", "/dav/folder/", "", map[string]string{"If-None-Match": "*"}, 405)

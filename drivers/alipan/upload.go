@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
@@ -51,15 +52,6 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	if cleanup != nil {
 		return unchanged, core.Fail(core.UpstreamFailure, cleanup)
 	}
-	n := *length
-	length = &n
-	count := n / d.opts.PartSize
-	if n%d.opts.PartSize != 0 {
-		count++
-	}
-	if count > 10000 {
-		return unchanged, core.Fail(core.UnsupportedOperation, nil)
-	}
 	parent, name, err := d.destination(ctx, p)
 	if err != nil {
 		return unchanged, err
@@ -69,15 +61,30 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	} else if exists {
 		return unchanged, core.Fail(core.AlreadyExists, nil)
 	}
+	_, change, err := d.uploadFile(ctx, parent.ID, name, input, *length)
+	return change, err
+}
+
+// uploadFile retains the native identity for the owner of a staging object.
+func (d *Driver) uploadFile(ctx context.Context, parent, name string, input io.Reader, n int64) (file createdFile, result core.Change, err error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	length := &n
+	count := n / d.opts.PartSize
+	if n%d.opts.PartSize != 0 {
+		count++
+	}
+	if count > 10000 {
+		return file, unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
 	lease, err := d.buffer.Acquire(ctx, d.opts.PartSize, max(1, int(count)))
 	if err != nil {
-		return unchanged, uploadError(err)
+		return file, unchanged, uploadError(err)
 	}
 	defer lease.Release()
 	if n <= d.opts.PartSize {
 		data := lease.Buffer()[:int(n)]
 		if err := upload.ReadExact(ctx, input, data); err != nil {
-			return unchanged, uploadError(err)
+			return file, unchanged, uploadError(err)
 		}
 		input = bytes.NewReader(data)
 	}
@@ -85,24 +92,28 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 	for i := range parts {
 		parts[i].Number = i + 1
 	}
-	created, change, err := d.createEntry(ctx, parent.ID, name, "file", parts, length)
+	requestParts := parts
+	if d.website != nil {
+		requestParts = parts[:min(20, len(parts))]
+	}
+	created, change, err := d.createEntry(ctx, parent, name, "file", requestParts, length)
 	if change.Effect != core.Applied {
-		return change, err
+		return file, change, err
 	}
 	if n == 0 && (created.Available || created.Rapid) {
-		return change, err
+		return created, change, err
 	}
 	partial := core.Change{Effect: core.Incomplete}
 	if err != nil {
-		return partial, err
+		return created, partial, err
 	}
 	if created.Rapid || created.UploadID == "" {
-		return partial, core.Fail(core.InvalidUpstreamResponse, nil)
+		return created, partial, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	urls := make(map[int]string, len(created.Parts))
 	for _, part := range created.Parts {
 		if part.Number < 1 || part.Number > len(parts) || urls[part.Number] != "" {
-			return partial, core.Fail(core.InvalidUpstreamResponse, nil)
+			return created, partial, core.Fail(core.InvalidUpstreamResponse, nil)
 		}
 		urls[part.Number] = part.URL
 	}
@@ -115,10 +126,20 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 				Upload string       `json:"upload_id"`
 				Parts  []uploadPart `json:"part_info_list"`
 			}
-			if err := d.post(partCtx, "/adrive/v1.0/openFile/getUploadUrl", map[string]any{"drive_id": d.opts.DriveID, "file_id": created.ID, "upload_id": created.UploadID, "part_info_list": []uploadPart{{Number: index}}}, &out); err != nil {
+			request := map[string]any{"drive_id": d.opts.DriveID, "file_id": created.ID, "upload_id": created.UploadID, "part_info_list": []uploadPart{{Number: index}}}
+			var err error
+			if d.website != nil {
+				err = d.website.request(partCtx, "upload_url", request, &out)
+			} else {
+				err = d.post(partCtx, "/adrive/v1.0/openFile/getUploadUrl", request, &out)
+			}
+			if err != nil {
 				return err
 			}
-			if out.Drive != d.opts.DriveID || out.ID != created.ID || out.Upload != created.UploadID || len(out.Parts) != 1 || out.Parts[0].Number != index {
+			if (d.website == nil || out.Drive != "") && out.Drive != d.opts.DriveID ||
+				(d.website == nil || out.ID != "") && out.ID != created.ID ||
+				(d.website == nil || out.Upload != "") && out.Upload != created.UploadID ||
+				len(out.Parts) != 1 || out.Parts[0].Number != index {
 				return core.Fail(core.InvalidUpstreamResponse, nil)
 			}
 			target = out.Parts[0].URL
@@ -126,25 +147,28 @@ func (d *Driver) Create(ctx context.Context, pAddress core.NativeAddress, input 
 		return d.sendPart(partCtx, target, data)
 	})
 	if err != nil {
-		return partial, uploadError(err)
+		return created, partial, uploadError(err)
 	}
 	var completed nativeFile
 	change, err = d.mutate(ctx, "/adrive/v1.0/openFile/complete", map[string]string{"drive_id": d.opts.DriveID, "file_id": created.ID, "upload_id": created.UploadID}, &completed)
 	if change.Effect != core.Applied {
 		if change.Effect == core.Unchanged {
-			return partial, err
+			return created, partial, err
 		}
-		return change, err
+		return created, change, err
 	}
-	if completed.ID != created.ID || completed.Drive != d.opts.DriveID || completed.Parent != parent.ID || completed.Name != name || completed.Type != "file" || completed.Size == nil || *completed.Size != n {
-		return core.Change{Effect: core.Unknown}, errors.Join(err, core.Fail(core.InvalidUpstreamResponse, nil))
+	if completed.ID != created.ID || completed.Drive != d.opts.DriveID || completed.Parent != parent || completed.Name != name || completed.Type != "file" || completed.Size == nil || *completed.Size != n {
+		return created, core.Change{Effect: core.Unknown}, errors.Join(err, core.Fail(core.InvalidUpstreamResponse, nil))
 	}
-	return change, err
+	return created, change, err
 }
 
 func (d *Driver) sendPart(ctx context.Context, target string, data []byte) error {
 	u, err := url.Parse(target)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	if d.website != nil && (u.Port() != "" || !strings.HasSuffix(u.Hostname(), ".aliyuncs.com") && !strings.HasSuffix(u.Hostname(), ".aliyundrive.net")) {
 		return core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	// A fresh isolated request never forwards provider bearer credentials.

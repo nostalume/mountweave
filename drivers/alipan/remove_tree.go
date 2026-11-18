@@ -32,6 +32,9 @@ func (d *Driver) RemoveSubtree(ctx context.Context, pAddress core.NativeAddress,
 }
 
 func (d *Driver) deleteEntry(ctx context.Context, id string) (core.Change, error) {
+	if d.website != nil {
+		return d.websiteTrash(ctx, id)
+	}
 	var out struct {
 		Drive string `json:"drive_id"`
 		ID    string `json:"file_id"`

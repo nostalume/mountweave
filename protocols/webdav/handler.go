@@ -45,6 +45,8 @@ type Options struct {
 	// Tree bounds each COPY/MOVE/DELETE discovery plan. Both MaxEntries and
 	// MaxPlanBytes must be positive; Concurrency defaults to serial execution.
 	Tree core.TreeOptions
+	// CreateOnly restricts PUT to new files or a byte-equivalent unconditional retry.
+	CreateOnly bool
 }
 
 type Handler struct {
@@ -103,7 +105,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var one [1]byte
-		input := r.Body
+		var input io.Reader = r.Body
 		if input == nil {
 			input = http.NoBody
 		}
@@ -169,8 +171,6 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, p core.Principal, 
 		h.failure(w, r, parseErr)
 		return
 	}
-	// Core and its native publisher own the actual predicate observation.
-	policy := core.Publish(conditions.When)
 	for _, name := range []string{"If-Range", "Range", "Content-Range"} {
 		if len(r.Header.Values(name)) != 0 {
 			fail(w, 501, "unsupported-condition")
@@ -186,11 +186,31 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, p core.Principal, 
 		n := r.ContentLength
 		length = &n
 	}
-	input := r.Body
+	var input io.Reader = r.Body
 	if input == nil {
 		input = http.NoBody
 	}
-	change, err := h.files.Write(r.Context(), p, a, input, length, core.WriteOptions{Policy: policy, ObserveTarget: true})
+	when := conditions.When
+	var replay *putDigest
+	if h.options.CreateOnly {
+		if when.Empty() {
+			replay = newPutDigest(input)
+			input = replay
+			when = core.IfAbsent()
+		} else if !when.IsAbsent() {
+			fail(w, http.StatusNotImplemented, "unsupported-condition")
+			return
+		}
+	}
+	change, err := h.files.Write(r.Context(), p, a, input, length, core.WriteOptions{Policy: core.Publish(when), ObserveTarget: true})
+	if replay != nil && change.Effect == core.Unchanged && core.CodeOf(err) == core.PreconditionFailed {
+		if err := h.confirmPut(r.Context(), p, a, replay, length); err != nil {
+			h.failure(w, r, err)
+		} else {
+			w.WriteHeader(http.StatusNoContent)
+		}
+		return
+	}
 	httpwire.EvidenceHeaders(w, change.Evidence)
 	if err != nil {
 		h.failure(w, r, err)

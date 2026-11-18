@@ -6,6 +6,7 @@ package ftp
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -60,9 +61,10 @@ type Options struct {
 }
 
 type Server struct {
-	files   *core.Core
-	options Options
-	view    fileview.View
+	files       *core.Core
+	options     Options
+	view        fileview.View
+	privateData bool
 }
 
 // New snapshots configuration without authentication, network or native I/O.
@@ -81,13 +83,27 @@ func New(files *core.Core, o Options) (*Server, error) {
 	if o.TLSConfig != nil {
 		o.TLSConfig = o.TLSConfig.Clone()
 	}
-	return &Server{files, o, v}, nil
+	return &Server{files: files, options: o, view: v}, nil
+}
+
+// WithPrivateData returns a server requiring TLS on control and data. Data
+// connections must resume the session issued on their control connection.
+// Use explicit TLS with static certificates and standard session tickets.
+func (s *Server) WithPrivateData() (*Server, error) {
+	config := s.options.TLSConfig
+	if config == nil || config.SessionTicketsDisabled || config.GetConfigForClient != nil || config.WrapSession != nil || config.UnwrapSession != nil {
+		return nil, core.Fail(core.InvalidRequest, nil)
+	}
+	secured := *s
+	secured.privateData = true
+	return &secured, nil
 }
 
 type session struct {
 	*Server
 	ctx                   context.Context
 	base, conn            net.Conn
+	controlTLS, dataTLS   *tls.Config
 	reader                *bufio.Reader
 	writeMu               sync.Mutex
 	closeOnce             sync.Once
@@ -129,6 +145,12 @@ func (s *Server) ServeConn(ctx context.Context, control net.Conn) (err error) {
 	}()
 	if err = ctx.Err(); err != nil {
 		return err
+	}
+	x.controlTLS, x.dataTLS = s.options.TLSConfig, s.options.TLSConfig
+	if s.privateData {
+		if err := x.scopeDataTLS(); err != nil {
+			return err
+		}
 	}
 	if err = x.reply(220, "File service ready"); err != nil {
 		return err
@@ -176,6 +198,25 @@ func (s *Server) ServeConn(ctx context.Context, control net.Conn) (err error) {
 			return nil
 		}
 	}
+}
+
+func (x *session) scopeDataTLS() error {
+	// Tickets are scoped to one control connection. A full data handshake
+	// cannot mint a usable ticket; resumed connections may refresh theirs.
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return err
+	}
+	x.controlTLS = x.controlTLS.Clone()
+	x.controlTLS.SetSessionTicketKeys([][32]byte{key})
+	x.dataTLS = x.controlTLS.Clone()
+	x.dataTLS.WrapSession = func(conn tls.ConnectionState, ticket *tls.SessionState) ([]byte, error) {
+		if !conn.DidResume {
+			return nil, errors.New("data connection must resume its control TLS session")
+		}
+		return x.dataTLS.EncryptTicket(conn, ticket)
+	}
+	return nil
 }
 
 func (x *session) closeTransport() { x.closeOnce.Do(func() { x.closeErr = x.base.Close() }) }
@@ -299,6 +340,9 @@ func (x *session) command(cmd, arg string) (bool, error) {
 		x.pbsz = true
 		return false, x.reply(200, "OK")
 	case "PROT":
+		if x.privateData && arg == "C" {
+			return false, x.reply(534, "Private data protection required")
+		}
 		if !x.pbsz || x.options.TLSConfig == nil || arg != "C" && arg != "P" {
 			return false, x.reply(536, "Protection unavailable")
 		}
@@ -315,6 +359,9 @@ func (x *session) command(cmd, arg string) (bool, error) {
 		x.cwd = x.options.Home
 		return false, x.reply(331, "Password required")
 	case "PASS":
+		if x.privateData && x.tlsState() == nil {
+			return false, x.reply(534, "TLS required")
+		}
 		if x.username == "" {
 			return false, x.reply(503, "USER required")
 		}
@@ -492,7 +539,7 @@ func (x *session) authTLS(arg string) error {
 	if err := x.reply(234, "Start TLS"); err != nil {
 		return err
 	}
-	c := tls.Server(x.conn, x.options.TLSConfig)
+	c := tls.Server(x.conn, x.controlTLS)
 	ctx, cancel := context.WithTimeout(x.ctx, x.options.DataConnectTimeout)
 	defer cancel()
 	if err := c.HandshakeContext(ctx); err != nil {
