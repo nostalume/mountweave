@@ -62,11 +62,8 @@ func (d *Driver) createParts(ctx context.Context, dir, name string, source core.
 	if err != nil {
 		return result, err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := d.active(ctx); err != nil {
 		return result, err
-	}
-	if d.closed.Load() {
-		return result, core.Fail(core.MountUnavailable, nil)
 	}
 	result.Effect = core.Unknown
 	var session partSession
@@ -216,11 +213,8 @@ func (d *Driver) finishParts(ctx context.Context, base, sessionID string) (core.
 	route := complete
 	var unconfirmed, cleanup error
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := d.active(ctx); err != nil {
 			return result, errors.Join(unconfirmed, cleanup, err)
-		}
-		if d.closed.Load() {
-			return result, errors.Join(unconfirmed, cleanup, core.Fail(core.MountUnavailable, nil))
 		}
 		req, err := controlPost(ctx, route, fields)
 		if err != nil {

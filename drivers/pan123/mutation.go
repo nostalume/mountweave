@@ -34,11 +34,8 @@ func (d *Driver) Mkdir(ctx context.Context, address core.NativeAddress) (core.Ch
 	if err != nil {
 		return result, err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := d.active(ctx); err != nil {
 		return result, err
-	}
-	if d.closed.Load() {
-		return result, core.Fail(core.MountUnavailable, nil)
 	}
 	result.Effect = core.Unknown
 	var receipt struct {
@@ -91,11 +88,8 @@ func (d *Driver) Remove(ctx context.Context, address core.NativeAddress, policie
 	if err != nil {
 		return result, err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := d.active(ctx); err != nil {
 		return result, err
-	}
-	if d.closed.Load() {
-		return result, core.Fail(core.MountUnavailable, nil)
 	}
 	result.Effect = core.Unknown
 	decoded, err := d.request(&d.api, req, nil)

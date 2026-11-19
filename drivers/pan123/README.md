@@ -27,6 +27,10 @@ A non-nil failed Driver retains cleanup and must be closed. Successful
 ID; the constructor does not establish a directory snapshot or a permanent
 permission observation.
 
+For approved 123 Open applications, `Authorize` issues a token and verifies its
+account UID. Pass the saved UID to require the same account on renewal. The
+host controls secret storage, persistence and token reuse.
+
 ## Existing file API and cost
 
 - `Stat`, `List`, ordinary `Open` and Core `Copy` as a source use existing APIs.

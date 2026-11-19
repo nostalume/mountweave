@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync/atomic"
+	"time"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
@@ -19,10 +20,73 @@ import (
 )
 
 const (
-	endpoint        = "https://open-api.123pan.com"
+	// ControlHost is the only recipient of 123 Open control credentials.
+	ControlHost     = "open-api.123pan.com"
+	endpoint        = "https://" + ControlHost
+	tokenRoute      = "/api/v1/access_token"
+	accountRoute    = "/api/v1/user/info"
 	downloadRoute   = "/api/v1/file/download_info"
 	directLinkRoute = "/api/v1/direct-link/url"
 )
+
+// Authorization is a short-lived token bound to a verified account.
+type Authorization struct {
+	AccessToken   string    `json:"accessToken"`
+	ExpiresAt     time.Time `json:"expiredAt"`
+	UID, Nickname string    `json:"-"`
+}
+
+// Authorize issues a token and verifies its UID. Leave expectedUID empty for
+// initial authorization. A mismatch returns core.PreconditionFailed. The client
+// is borrowed without its cookies or redirects.
+func Authorize(ctx context.Context, client *http.Client, clientID, clientSecret, expectedUID string) (_ Authorization, err error) {
+	if err := ctx.Err(); err != nil {
+		return Authorization{}, err
+	}
+	if clientID == "" || clientSecret == "" {
+		return Authorization{}, core.Fail(core.InvalidRequest, nil)
+	}
+	req, err := controlPost(ctx, tokenRoute, struct {
+		ID     string `json:"clientID"`
+		Secret string `json:"clientSecret"`
+	}{clientID, clientSecret})
+	if err != nil {
+		return Authorization{}, err
+	}
+	httpClient := httpcontent.IsolatedClient(client)
+	if httpClient.Timeout == 0 {
+		httpClient.Timeout = 30 * time.Second
+	}
+	reader := responseReader{limit: 64 << 10}
+	defer func() { err = errors.Join(err, reader.cleanup.Retry()) }()
+	var grant Authorization
+	if _, err := reader.request(&httpClient, req, &grant); err != nil || ctx.Err() != nil {
+		return Authorization{}, errors.Join(err, ctx.Err())
+	}
+	if grant.AccessToken == "" || !time.Now().Before(grant.ExpiresAt) {
+		return Authorization{}, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, endpoint+accountRoute, nil)
+	if err != nil {
+		return Authorization{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+grant.AccessToken)
+	var account struct {
+		UID      nativeID `json:"uid"`
+		Nickname string   `json:"nickname"`
+	}
+	if _, err := reader.request(&httpClient, req, &account); err != nil || ctx.Err() != nil {
+		return Authorization{}, errors.Join(err, ctx.Err())
+	}
+	if account.UID == "" || account.UID == "0" {
+		return Authorization{}, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	grant.UID, grant.Nickname = string(account.UID), account.Nickname
+	if expectedUID != "" && grant.UID != expectedUID {
+		return Authorization{}, core.Fail(core.PreconditionFailed, errors.New("123 Open account does not match the saved UID"))
+	}
+	return grant, nil
+}
 
 // Options selects either an account-root-relative RootPath or a native RootID;
 // neither means account root 0. Client borrows control authentication from the
@@ -52,7 +116,7 @@ type Options struct {
 type Driver struct {
 	root         item
 	api, content http.Client
-	limit        int64
+	responseReader
 	resolvePages int
 	allowMkdir   bool
 	allowRemove  bool
@@ -62,7 +126,6 @@ type Driver struct {
 	singleLimit  int64
 	presigned    bool
 	closed       atomic.Bool
-	cleanup      httpcontent.ResponseCleanup
 }
 
 // Open validates options and confirms the directory root. A non-nil failed
@@ -90,7 +153,7 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 		o.MaxResponseBytes = 4 << 20
 	}
 	d := &Driver{root: item{ID: "0", meta: core.Metadata{Kind: core.Directory}}, api: httpcontent.IsolatedClient(o.Client),
-		content: httpcontent.IsolatedClient(o.ContentClient), limit: o.MaxResponseBytes, resolvePages: o.MaxResolvePages,
+		content: httpcontent.IsolatedClient(o.ContentClient), responseReader: responseReader{limit: o.MaxResponseBytes}, resolvePages: o.MaxResolvePages,
 		allowMkdir: o.AllowMkdir, allowRemove: o.AllowRemove, directLinks: o.UseDirectLinks, presigned: o.PresignedMultipart}
 	d.content.CheckRedirect = d.cleanup.RedirectDownload
 	if o.UploadClient != nil {
@@ -121,12 +184,19 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 
 type nativeID = httpcontent.DecimalID
 
-func (d *Driver) check(ctx context.Context, p core.NativeAddress) error {
+func (d *Driver) active(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if d.closed.Load() {
 		return core.Fail(core.MountUnavailable, nil)
+	}
+	return nil
+}
+
+func (d *Driver) check(ctx context.Context, p core.NativeAddress) error {
+	if err := d.active(ctx); err != nil {
+		return err
 	}
 	if p.Namespace() != core.TreeNamespace {
 		return core.Fail(core.UnsupportedOperation, nil)
@@ -147,7 +217,12 @@ func nativeFailure(err error, private bool) error {
 	return errors.New("123 private HTTP I/O failed")
 }
 
-func (d *Driver) closeBody(body io.Closer, private bool) error {
+type responseReader struct {
+	limit   int64
+	cleanup httpcontent.ResponseCleanup
+}
+
+func (d *responseReader) closeBody(body io.Closer, private bool) error {
 	if private {
 		return d.cleanup.CloseBody(body)
 	}
@@ -161,11 +236,8 @@ func (d *Driver) Close() error {
 }
 
 func (d *Driver) call(ctx context.Context, route string, query url.Values, out any) error {
-	if err := ctx.Err(); err != nil {
+	if err := d.active(ctx); err != nil {
 		return err
-	}
-	if d.closed.Load() {
-		return core.Fail(core.MountUnavailable, nil)
 	}
 	target := endpoint + route
 	if len(query) != 0 {
@@ -193,7 +265,7 @@ func controlPost(ctx context.Context, route string, fields any) (*http.Request, 
 	return req, nil
 }
 
-func (d *Driver) exchange(client *http.Client, req *http.Request, private bool) (*http.Response, error) {
+func (d *responseReader) exchange(client *http.Client, req *http.Request, private bool) (*http.Response, error) {
 	response, err := client.Do(req)
 	if err == nil {
 		return response, nil
@@ -206,17 +278,18 @@ func (d *Driver) exchange(client *http.Client, req *http.Request, private bool) 
 }
 
 // request reports decoded data independently of a subsequent close failure.
-func (d *Driver) request(client *http.Client, req *http.Request, out any) (bool, error) {
+func (d *responseReader) request(client *http.Client, req *http.Request, out any) (bool, error) {
 	decoded, _, err, closeErr := d.requestReply(client, req, out)
 	return decoded, errors.Join(err, closeErr)
 }
 
 // requestReply distinguishes an unusable receipt from a native rejection.
-func (d *Driver) requestReply(client *http.Client, req *http.Request, out any) (decoded, lost bool, err, closeErr error) {
+func (d *responseReader) requestReply(client *http.Client, req *http.Request, out any) (decoded, lost bool, err, closeErr error) {
 	req.Header.Set("Platform", "open_platform")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
-	private := req.Method == http.MethodPost || req.URL.Path == downloadRoute || req.URL.Path == directLinkRoute
+	authorization := req.URL.Path == tokenRoute || req.URL.Path == accountRoute
+	private := authorization || req.Method == http.MethodPost || req.URL.Path == downloadRoute || req.URL.Path == directLinkRoute
 	response, err := d.exchange(client, req, private)
 	if err != nil {
 		return false, true, err, nil
@@ -225,25 +298,31 @@ func (d *Driver) requestReply(client *http.Client, req *http.Request, out any) (
 	// A gateway failure may hide a successful native commit.
 	gateway := response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusGatewayTimeout
 	lost = response.StatusCode == http.StatusOK || gateway
-	if encoding := response.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
-		return false, lost, core.Fail(core.InvalidUpstreamResponse, nil), nil
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, d.limit+1))
-	err = nativeFailure(err, private)
-	if int64(len(data)) > d.limit {
-		return false, lost, core.Fail(core.ResponseBudgetExceeded, err), nil
-	}
-	if err != nil {
-		return false, lost, core.Fail(core.UpstreamFailure, err), nil
-	}
 	var reply struct {
 		Code    *int64          `json:"code"`
 		Message string          `json:"message"`
 		Trace   string          `json:"x-traceID"`
 		Data    json.RawMessage `json:"data"`
 	}
-	decodeErr := json.Unmarshal(data, &reply)
-	if response.StatusCode != 200 || (decodeErr == nil && reply.Code != nil && *reply.Code != 0) {
+	if !authorization || response.StatusCode == http.StatusOK {
+		if encoding := response.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
+			return false, lost, core.Fail(core.InvalidUpstreamResponse, nil), nil
+		}
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, d.limit+1))
+		if authorization {
+			defer clear(data)
+			defer func() { clear(reply.Data) }()
+		}
+		err = nativeFailure(readErr, private)
+		if int64(len(data)) > d.limit {
+			return false, lost, core.Fail(core.ResponseBudgetExceeded, err), nil
+		}
+		if err != nil {
+			return false, lost, core.Fail(core.UpstreamFailure, err), nil
+		}
+		err = json.Unmarshal(data, &reply)
+	}
+	if response.StatusCode != 200 || (err == nil && reply.Code != nil && *reply.Code != 0) {
 		code := core.UpstreamFailure
 		native := int64(0)
 		if reply.Code != nil {
@@ -252,11 +331,11 @@ func (d *Driver) requestReply(client *http.Client, req *http.Request, out any) (
 		switch {
 		case req.URL.Path == downloadRoute && native == 5113:
 			code = core.UpstreamThrottled
-		case response.StatusCode == 401 || response.StatusCode == 403 || native == 401 || native == 5113:
+		case response.StatusCode == 401 || response.StatusCode == 403 || !authorization && (native == 401 || native == 5113):
 			code = core.UpstreamAccessDenied
-		case response.StatusCode == 404 || native == 5066:
+		case !authorization && (response.StatusCode == 404 || native == 5066):
 			code = core.NotFound
-		case response.StatusCode == 429 || response.StatusCode == 503 || native == 429:
+		case response.StatusCode == 429 || !authorization && (response.StatusCode == 503 || native == 429):
 			code = core.UpstreamThrottled
 		}
 		if private {
@@ -264,19 +343,20 @@ func (d *Driver) requestReply(client *http.Client, req *http.Request, out any) (
 		}
 		return false, gateway, core.Fail(code, fmt.Errorf("123 returned HTTP %d, code %d, trace %s: %s", response.StatusCode, native, reply.Trace, reply.Message)), nil
 	}
-	if decodeErr != nil || reply.Code == nil {
-		return false, true, core.Fail(core.InvalidUpstreamResponse, decodeErr), nil
+	if err == nil && reply.Code != nil {
+		if out == nil {
+			return true, false, nil, nil
+		}
+		if len(reply.Data) != 0 && string(reply.Data) != "null" {
+			if err = json.Unmarshal(reply.Data, out); err == nil {
+				return true, false, nil, nil
+			}
+		}
 	}
-	if out == nil {
-		return true, false, nil, nil
+	if authorization {
+		err = nil
 	}
-	if len(reply.Data) == 0 || string(reply.Data) == "null" {
-		return false, true, core.Fail(core.InvalidUpstreamResponse, nil), nil
-	}
-	if err := json.Unmarshal(reply.Data, out); err != nil {
-		return false, true, core.Fail(core.InvalidUpstreamResponse, err), nil
-	}
-	return true, false, nil, nil
+	return false, true, core.Fail(core.InvalidUpstreamResponse, err), nil
 }
 
 func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...core.ReadSelection) (core.Metadata, error) {
