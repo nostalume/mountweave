@@ -52,6 +52,7 @@ also requires safe source deletion.
 | [Alibaba Cloud PDS](../drivers/pdsshare/README.md) | Authorized standard drive or received share | — |
 | [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | — |
 | [UC Cloud Drive](../drivers/uc/README.md) | Authenticated website folder, native pagination, original attachments and exact single byte ranges | — |
+| [LanZou Cloud](../drivers/lanzou/README.md) | Authenticated website folder, native listing, and original-file downloads through supported existing shares. Reports actual byte ranges or complete originals | — |
 | [Teambition](../drivers/teambition/README.md) | Approved enterprise project collection and its original files | — |
 | [Tencent Docs](../drivers/tencentdocs/README.md) | Authorized folder and optional asynchronous document export | — |
 | [Tencent Cloud SMH](../drivers/tencentsmh/README.md) | Tenant space or recipient share, with signed downloads | — |
