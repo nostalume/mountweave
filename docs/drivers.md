@@ -51,6 +51,7 @@ also requires safe source deletion.
 | [123 Open](../drivers/pan123/README.md) | Account tree, ordinary downloads and optional direct links for authorized directories | Optional Mkdir, single-file recycling and Create through single-step or multipart upload |
 | [Alibaba Cloud PDS](../drivers/pdsshare/README.md) | Authorized standard drive or received share | — |
 | [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | — |
+| [UC Cloud Drive](../drivers/uc/README.md) | Authenticated website folder, native pagination, original attachments and exact single byte ranges | — |
 | [Teambition](../drivers/teambition/README.md) | Approved enterprise project collection and its original files | — |
 | [Tencent Docs](../drivers/tencentdocs/README.md) | Authorized folder and optional asynchronous document export | — |
 | [Tencent Cloud SMH](../drivers/tencentsmh/README.md) | Tenant space or recipient share, with signed downloads | — |
