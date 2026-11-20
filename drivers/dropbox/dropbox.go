@@ -3,6 +3,7 @@ package dropbox
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,12 +12,19 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
 
 	core "github.com/nostalume/mountweave"
+	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 )
+
+// ControlHost is the Dropbox account and metadata API host.
+const ControlHost = "api.dropboxapi.com"
+
+const accountRoute = "/users/get_current_account"
 
 // Root selects the API's application default, current account root or a fixed
 // namespace. Its zero value preserves the application's authorized default.
@@ -48,6 +56,24 @@ type Options struct {
 	AllowCreate      bool
 }
 
+// AuthorizationScopes returns the Dropbox permissions required by these file options.
+func (o Options) AuthorizationScopes() []string {
+	scopes := []string{"account_info.read", "files.metadata.read", "files.content.read"}
+	if o.AllowCreate {
+		scopes = append(scopes, "files.content.write")
+	}
+	return scopes
+}
+
+// Validate checks the file options before sending any native request.
+func (o Options) Validate() error {
+	if o.MaxResponseBytes < 0 || o.MaxResponseBytes == math.MaxInt64 || o.Root.mode > 2 ||
+		(o.Root.mode == 2 && !namespaceID(o.Root.id)) || (o.Export != nil && !utf8.ValidString(o.Export.Format)) {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	return core.ValidatePath(cmp.Or(o.RootPath, "/"))
+}
+
 type Driver struct {
 	client      http.Client
 	root        item
@@ -65,34 +91,44 @@ type responseCleanup struct {
 	private bool
 }
 
+// VerifyAccount uses the prepared client to confirm the token's account and returns its email.
+func VerifyAccount(ctx context.Context, client *http.Client, expectedID string) (string, error) {
+	if client == nil {
+		return "", core.Fail(core.InvalidRequest, nil)
+	}
+	d := Driver{client: httpcontent.IsolatedClient(client), limit: 64 << 10}
+	var account struct {
+		ID    string `json:"account_id"`
+		Email string `json:"email"`
+	}
+	if err := errors.Join(d.rpc(ctx, accountRoute, nil, &account), d.Close(), ctx.Err()); err != nil {
+		return "", core.Fail(core.CodeOf(err), httpcontent.PrivateIOError(err))
+	}
+	if account.ID == "" || account.ID != expectedID || account.Email == "" {
+		return "", core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return account.Email, nil
+}
+
 // Open confirms the selected directory. A failed non-nil result retains cleanup
 // and must be closed; the borrowed client and its credentials remain host-owned.
 func Open(ctx context.Context, o Options) (*Driver, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if o.Client == nil || o.MaxResponseBytes < 0 || o.MaxResponseBytes == math.MaxInt64 ||
-		o.Root.mode > 2 || (o.Root.mode == 2 && !namespaceID(o.Root.id)) ||
-		(o.Export != nil && !utf8.ValidString(o.Export.Format)) {
+	if o.Client == nil {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
-	if o.RootPath == "" {
-		o.RootPath = "/"
-	}
-	if err := core.ValidatePath(o.RootPath); err != nil {
+	if err := o.Validate(); err != nil {
 		return nil, err
 	}
-	if o.MaxResponseBytes == 0 {
-		o.MaxResponseBytes = 4 << 20
-	}
-	d := &Driver{client: *o.Client, root: item{meta: core.Metadata{Kind: core.Directory}},
-		limit: o.MaxResponseBytes, allowCreate: o.AllowCreate}
+	o.RootPath = cmp.Or(o.RootPath, "/")
+	d := &Driver{client: httpcontent.IsolatedClient(o.Client), root: item{meta: core.Metadata{Kind: core.Directory}},
+		limit: cmp.Or(o.MaxResponseBytes, 4<<20), allowCreate: o.AllowCreate}
 	if o.Export != nil {
 		chosen := *o.Export
 		d.export = &chosen
 	}
-	d.client.Jar = nil
-	d.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	var err error
 	if o.Root.mode == 1 {
 		var account struct {
@@ -100,13 +136,11 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 				ID string `json:"root_namespace_id"`
 			} `json:"root_info"`
 		}
-		err = d.rpc(ctx, "/users/get_current_account", nil, &account)
+		if err = d.rpc(ctx, accountRoute, nil, &account); err == nil && !namespaceID(account.Root.ID) {
+			err = core.Fail(core.InvalidUpstreamResponse, errors.New("account root namespace is missing"))
+		}
 		if err == nil {
-			if !namespaceID(account.Root.ID) {
-				err = core.Fail(core.InvalidUpstreamResponse, errors.New("account root namespace is missing"))
-			} else {
-				d.pathRoot = rootHeader("root", account.Root.ID)
-			}
+			d.pathRoot = rootHeader("root", account.Root.ID)
 		}
 	} else if o.Root.mode == 2 {
 		d.pathRoot = rootHeader("namespace_id", o.Root.id)
@@ -131,15 +165,9 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 }
 
 func namespaceID(id string) bool {
-	if id == "" {
-		return false
-	}
-	for _, c := range id {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == ':') {
-			return false
-		}
-	}
-	return true
+	return id != "" && !strings.ContainsFunc(id, func(c rune) bool {
+		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-_:", c))
+	})
 }
 
 func rootHeader(tag, id string) string {
@@ -182,7 +210,7 @@ func (d *Driver) rpc(ctx context.Context, route string, argument, output any) (e
 	if err != nil {
 		return core.Fail(core.InvalidRequest, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.dropboxapi.com/2"+route, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+ControlHost+"/2"+route, bytes.NewReader(payload))
 	if err != nil {
 		return core.Fail(core.InvalidRequest, err)
 	}

@@ -110,6 +110,7 @@ func (d *Driver) readPage(ctx context.Context, parent string, offset int64, n in
 	if p.State != "" && p.State != "1" {
 		return p, core.Fail(core.UpstreamAccessDenied, errors.New("directory is not active"))
 	}
+	p.readable = parent == "0" || len(p.Data) != 0
 	for _, a := range p.Path {
 		if a.Encrypted != nil && *a.Encrypted != 0 {
 			return p, core.Fail(core.UnsupportedOperation, errors.New("encrypted directory contents are not available"))
@@ -117,9 +118,6 @@ func (d *Driver) readPage(ctx context.Context, parent string, offset int64, n in
 		if string(a.ID) == parent && a.Encrypted != nil {
 			p.readable = true
 		}
-	}
-	if parent == "0" || len(p.Data) != 0 {
-		p.readable = true
 	}
 	if len(p.Data) == 0 && offset < *p.Count {
 		return p, core.Fail(core.InvalidUpstreamResponse, errors.New("native page cannot advance"))
