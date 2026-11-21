@@ -16,10 +16,7 @@ func (d *Driver) destination(ctx context.Context, p string) (parent nativeFile, 
 		err = core.Fail(core.InvalidRequest, nil)
 		return
 	}
-	parent, err = d.resolve(ctx, path.Dir(p))
-	if err == nil && parent.Type != "folder" {
-		err = core.Fail(core.NotDirectory, nil)
-	}
+	parent, err = d.resolveFolder(ctx, path.Dir(p))
 	name = path.Base(p)
 	return
 }

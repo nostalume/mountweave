@@ -105,58 +105,45 @@ func (s *Source) access(ctx context.Context, rejected string) (string, error) {
 }
 func (s *Source) startLocked(saveOnly bool) {
 	s.pending = make(chan struct{})
-	token := s.token
+	token, refreshFailure := s.token, s.refreshFailure
 	go func() {
+		known := saveOnly
 		var err error
 		if saveOnly {
-			s.mu.Lock()
-			err = s.refreshFailure
-			s.mu.Unlock()
-		}
-		known := saveOnly
-		if !saveOnly {
-			if commitErr := s.save(s.life, Record{Token: token, Pending: true}); commitErr != nil {
-				// No external refresh was invoked. Reload/reconcile the checkpoint;
-				// RetrySave is reserved for a known rotated credential.
-				err = errors.Join(ErrPersistence, commitErr)
-			} else if cause := s.life.Err(); cause != nil {
-				err = cause
-			} else {
-				token, err = s.refresh(s.life, token.Refresh)
-				known = token.Refresh != ""
-				if err == nil && !known {
-					err = errors.New("refresh returned an unusable token")
-				}
-				if err != nil {
-					err = errors.Join(ErrRefreshUncertain, err)
-				}
-				s.mu.Lock()
-				s.refreshFailure = err
-				s.mu.Unlock()
+			err = refreshFailure
+		} else if commitErr := s.save(s.life, Record{Token: token, Pending: true}); commitErr != nil {
+			// A failed checkpoint prevents external refresh. RetrySave only saves
+			// a known rotated credential.
+			err = errors.Join(ErrPersistence, commitErr)
+		} else if cause := s.life.Err(); cause != nil {
+			err = cause
+		} else {
+			token, err = s.refresh(s.life, token.Refresh)
+			known = token.Refresh != ""
+			if err == nil && !known {
+				err = errors.New("refresh returned an unusable token")
 			}
+			if err != nil {
+				err = errors.Join(ErrRefreshUncertain, err)
+			}
+			refreshFailure = err
 		}
+		var dirty bool
 		if known {
-			// Preserve the new refresh token even when persistence fails. Never retry the old token.
-			s.mu.Lock()
-			s.token = token
-			s.dirty = true
-			s.mu.Unlock()
 			if saveErr := s.save(s.life, Record{Token: token}); saveErr != nil {
+				dirty = true
 				err = errors.Join(err, ErrPersistence, saveErr)
-			} else {
-				s.mu.Lock()
-				s.dirty = false
-				s.mu.Unlock()
-				if !saveOnly && (token.Access == "" || !time.Now().Before(token.ExpiresAt)) {
-					err = errors.Join(err, ErrUnusableAccess)
-				}
+			} else if !saveOnly && (token.Access == "" || !time.Now().Before(token.ExpiresAt)) {
+				err = errors.Join(err, ErrUnusableAccess)
 			}
 		}
 		s.mu.Lock()
-		s.failed = err
-		if err == nil {
-			s.dirty = false
+		// Waiters observe the terminal state and retain any new token even
+		// when its durable save failed. A retry never uses the old token.
+		if known {
+			s.token = token
 		}
+		s.dirty, s.failed, s.refreshFailure = dirty, err, refreshFailure
 		close(s.pending)
 		s.pending = nil
 		s.mu.Unlock()

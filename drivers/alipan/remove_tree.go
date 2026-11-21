@@ -21,12 +21,9 @@ func (d *Driver) RemoveSubtree(ctx context.Context, pAddress core.NativeAddress,
 	if p == "/" || limits.MaxEntries <= 0 || limits.MaxPlanBytes <= 0 || limits.Concurrency < 0 {
 		return unchanged, core.Fail(core.InvalidRequest, nil)
 	}
-	f, err := d.resolve(ctx, p)
+	f, err := d.resolveFolder(ctx, p)
 	if err != nil {
 		return unchanged, err
-	}
-	if f.Type != "folder" {
-		return unchanged, core.Fail(core.NotDirectory, nil)
 	}
 	return d.deleteEntry(ctx, f.ID)
 }

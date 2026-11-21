@@ -189,40 +189,41 @@ func (a WebsiteAccount) open(ctx context.Context, rootID, rootPath string, clien
 		client:  isolatedClient(client),
 		website: &a.website,
 	}
-	switch {
-	case rootPath != "":
-		root, err := d.resolve(ctx, rootPath)
+	if rootPath != "" {
+		root, err := d.resolveFolder(ctx, rootPath)
 		if err != nil {
 			return nil, "", err
 		}
-		if root.Type != "folder" {
-			return nil, "", core.Fail(core.NotDirectory, nil)
-		}
 		rootID = root.ID
-	case rootID != "root":
-		if err := a.checkRootIdentity(ctx, rootID); err != nil {
-			return nil, "", err
-		}
 	}
 	d.opts.RootID = rootID
-	if _, _, err := d.page(ctx, rootID, "", 1); err != nil {
+	if err := d.checkWebsiteRoot(ctx, rootID, rootPath != ""); err != nil {
 		return nil, "", err
 	}
 	return d, rootID, nil
 }
 
-func (a WebsiteAccount) checkRootIdentity(ctx context.Context, rootID string) error {
-	var root nativeFile
-	if err := a.website.request(ctx, "file", map[string]string{"drive_id": a.ResourceDrive, "file_id": rootID}, &root); err != nil {
-		return err
+func (d *Driver) websiteFile(ctx context.Context, id string) (nativeFile, error) {
+	var f nativeFile
+	err := d.website.request(ctx, "file", map[string]string{"drive_id": d.opts.DriveID, "file_id": id}, &f)
+	if err == nil && (f.ID != id || f.Drive != d.opts.DriveID) {
+		err = core.Fail(core.InvalidUpstreamResponse, nil)
 	}
-	if root.Drive != a.ResourceDrive || root.ID != rootID {
-		return core.Fail(core.InvalidUpstreamResponse, nil)
+	return f, err
+}
+
+func (d *Driver) checkWebsiteRoot(ctx context.Context, rootID string, resolvedByPath bool) error {
+	if !resolvedByPath && rootID != "root" {
+		root, err := d.websiteFile(ctx, rootID)
+		if err != nil {
+			return err
+		}
+		if root.Type != "folder" {
+			return core.Fail(core.NotDirectory, nil)
+		}
 	}
-	if root.Type != "folder" {
-		return core.Fail(core.NotDirectory, nil)
-	}
-	return nil
+	_, _, err := d.page(ctx, rootID, "", 1)
+	return err
 }
 
 // CheckRoot verifies a second folder using a retained session, without owning it.
@@ -230,12 +231,6 @@ func (a WebsiteAccount) CheckRoot(ctx context.Context, rootID string) error {
 	if a.website.Call == nil || a.ResourceDrive == "" || rootID == "" {
 		return core.Fail(core.InvalidRequest, nil)
 	}
-	if rootID != "root" {
-		if err := a.checkRootIdentity(ctx, rootID); err != nil {
-			return err
-		}
-	}
 	d := &Driver{opts: Options{DriveID: a.ResourceDrive}, website: &a.website}
-	_, _, err := d.page(ctx, rootID, "", 1)
-	return err
+	return d.checkWebsiteRoot(ctx, rootID, false)
 }

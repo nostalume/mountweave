@@ -2,6 +2,7 @@
 package googledrive
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,62 @@ import (
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 )
 
-const endpoint = "https://www.googleapis.com/drive/v3"
+// ControlHost is the Google Drive account and file API host.
+const ControlHost = "www.googleapis.com"
+
+const endpoint = "https://" + ControlHost + "/drive/v3"
+
+// Account uses a borrowed authenticated client to return the stable account ID
+// and a display label. The client must authorize requests to ControlHost.
+func Account(ctx context.Context, client *http.Client) (id, label string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	if client == nil {
+		return "", "", core.Fail(core.InvalidRequest, nil)
+	}
+	target := apiURL("/about", url.Values{"fields": {"user(permissionId,emailAddress,displayName)"}})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	clientCopy := httpcontent.IsolatedClient(client)
+	response, err := clientCopy.Do(req)
+	if err != nil {
+		if cause := ctx.Err(); cause != nil {
+			return "", "", cause
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", "", context.DeadlineExceeded
+		}
+		return "", "", core.Fail(core.UpstreamFailure, httpcontent.PrivateIOError(err))
+	}
+	defer func() {
+		closeErr := httpcontent.PrivateIOError(response.Body.Close())
+		if cause := ctx.Err(); cause != nil {
+			id, label, err = "", "", cause
+		}
+		if closeErr != nil {
+			id, label, err = "", "", errors.Join(err, core.Fail(core.UpstreamFailure, closeErr))
+		}
+	}()
+	if response.StatusCode != http.StatusOK {
+		return "", "", core.Fail(core.UpstreamFailure, nil)
+	}
+	data, err := httpcontent.ReadIdentity(response, 64<<10)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "", "", context.DeadlineExceeded
+	}
+	defer clear(data)
+	var about struct {
+		User struct {
+			ID    string `json:"permissionId"`
+			Email string `json:"emailAddress"`
+			Name  string `json:"displayName"`
+		} `json:"user"`
+	}
+	if err != nil || json.Unmarshal(data, &about) != nil || about.User.ID == "" {
+		return "", "", core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return about.User.ID, cmp.Or(about.User.Email, about.User.Name, about.User.ID), nil
+}
 
 // Options borrows a prepared authenticated Client and an independent content
 // client. RootID and account-root-relative RootPath are alternative selections;
@@ -72,39 +128,23 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 	if o.MaxResponseBytes == 0 {
 		o.MaxResponseBytes = 4 << 20
 	}
-	content := o.ContentClient
-	if content == nil {
-		content = &http.Client{}
-	}
-	d := &Driver{api: *o.Client, content: *content, exports: exports, limit: o.MaxResponseBytes, resolvePages: o.MaxResolvePages}
-	d.api.Jar, d.content.Jar = nil, nil
-	refuse := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	d.api.CheckRedirect, d.content.CheckRedirect = refuse, refuse
-	id := o.RootID
-	if id == "" {
-		id = "root"
-	}
+	d := &Driver{api: httpcontent.IsolatedClient(o.Client), content: httpcontent.IsolatedClient(o.ContentClient),
+		exports: exports, limit: o.MaxResponseBytes, resolvePages: o.MaxResolvePages}
+	id := cmp.Or(o.RootID, "root")
 	key := o.RootResourceKey
 	if o.RootPath != "" {
 		key = ""
 	}
 	root, err := d.getItem(ctx, item{ID: id, ResourceKey: key})
-	if err == nil && root.meta.Kind != core.Directory {
-		err = core.Fail(core.NotDirectory, nil)
-	}
-	if err == nil {
+	if err == nil && root.meta.Kind == core.Directory && o.RootPath != "" && o.RootPath != "/" {
 		d.root = root
-		if o.RootPath != "" && o.RootPath != "/" {
-			root, err = d.resolve(ctx, o.RootPath)
-		}
+		root, err = d.resolve(ctx, o.RootPath)
 	}
 	if err == nil && root.meta.Kind != core.Directory {
 		err = core.Fail(core.NotDirectory, nil)
 	}
 	if err == nil {
-		if root.ResourceKey == "" {
-			root.ResourceKey = o.RootResourceKey
-		}
+		root.ResourceKey = cmp.Or(root.ResourceKey, o.RootResourceKey)
 		if root.ResourceKey != "" && !headerPart(root.ID) {
 			err = core.Fail(core.InvalidUpstreamResponse, errors.New("root ID cannot carry its resource key"))
 		}
@@ -155,9 +195,6 @@ func (d *Driver) do(client *http.Client, req *http.Request, private bool) (*http
 				err = failure.Err
 			}
 			err = failedEOF(err)
-		}
-		if response != nil && response.Body != nil {
-			err = errors.Join(err, d.cleanup.CloseBody(response.Body))
 		}
 		return nil, errors.Join(core.Fail(core.UpstreamFailure, err), req.Context().Err())
 	}

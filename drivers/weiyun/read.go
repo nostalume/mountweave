@@ -1,13 +1,12 @@
 package weiyun
 
 import (
+	"cmp"
 	"context"
-	"encoding/hex"
 	"errors"
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -37,11 +36,9 @@ type iterator struct {
 }
 
 func validKey(key string) bool {
-	if key == "" {
-		return false
-	}
-	_, err := hex.DecodeString(key)
-	return err == nil
+	return key != "" && len(key)%2 == 0 && !strings.ContainsFunc(key, func(r rune) bool {
+		return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F')
+	})
 }
 
 func metadata(name string, size *int64, updated int64) core.Metadata {
@@ -84,20 +81,10 @@ func (i *iterator) next(ctx context.Context) ([]entry, error) {
 			Updated int64  `json:"file_mtime"`
 		} `json:"file_list"`
 	}
-	isError, err := i.d.call(ctx, "weiyun.list", request, &result)
-	if err != nil {
+	if err := i.d.call(ctx, "weiyun.list", request, &result); err != nil {
 		return nil, err
 	}
-	if err := result.failure(isError); err != nil {
-		return nil, err
-	}
-	expected := i.dir.Key
-	if expected == "" {
-		expected = i.d.tokenRoot
-		if expected == "" {
-			expected = i.observedKey
-		}
-	}
+	expected := cmp.Or(i.dir.Key, i.d.tokenRoot, i.observedKey)
 	if !validKey(result.Key) || expected != "" && !strings.EqualFold(result.Key, expected) {
 		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("Weiyun did not confirm the selected directory"))
 	}
@@ -274,11 +261,7 @@ func (d *Driver) Open(ctx context.Context, address core.NativeAddress, o core.Op
 			Cookie string `json:"cookie"`
 		}
 	}
-	isError, err := d.call(ctx, "weiyun.download", request, &grant)
-	if err != nil {
-		return core.Opened{}, err
-	}
-	if err := grant.failure(isError); err != nil {
+	if err := d.call(ctx, "weiyun.download", request, &grant); err != nil {
 		return core.Opened{}, err
 	}
 	if len(grant.Items) != 1 || grant.Items[0].ID != f.id || grant.Items[0].Size == nil || *grant.Items[0].Size != *f.m.Size {
@@ -294,18 +277,14 @@ func (d *Driver) Open(ctx context.Context, address core.NativeAddress, o core.Op
 		if err := d.check(ctx); err != nil {
 			return nil, err
 		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.Fragment != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+		if err != nil || !httpcontent.IsHTTPS(req.URL) {
 			return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid Weiyun download URL"))
 		}
-		host := strings.ToLower(u.Hostname())
-		cookieAllowed = cookieAllowed && (host == "weiyun.com" || strings.HasSuffix(host, ".weiyun.com")) && (u.Port() == "" || u.Port() == "443")
+		host, port := strings.ToLower(req.URL.Hostname()), req.URL.Port()
+		cookieAllowed = cookieAllowed && (host == "weiyun.com" || strings.HasSuffix(host, ".weiyun.com")) && (port == "" || port == "443")
 		if !redirected && !cookieAllowed {
 			return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid Weiyun download cookie receiver"))
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
-		if err != nil {
-			return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid Weiyun download request"))
 		}
 		if cookieAllowed {
 			req.AddCookie(cookies[0])

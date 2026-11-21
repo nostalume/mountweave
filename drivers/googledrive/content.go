@@ -1,10 +1,12 @@
 package googledrive
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	core "github.com/nostalume/mountweave"
@@ -31,14 +33,7 @@ func (d *Driver) confirmExports(ctx context.Context) error {
 		return err
 	}
 	for source, target := range d.exports {
-		found := false
-		for _, available := range about.Formats[source] {
-			if available == target {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(about.Formats[source], target) {
 			return core.Fail(core.InvalidRequest, errors.New("configured export MIME pair is not available"))
 		}
 	}
@@ -91,23 +86,20 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 	return d.cleanup.OpenBody(response, wanted, f.Name)
 }
 
-func bodyURL(u *url.URL) bool {
-	return u != nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil && u.Opaque == "" && u.Fragment == ""
-}
-
 func apiOrigin(u *url.URL) bool {
-	return u.Scheme == "https" && strings.EqualFold(u.Hostname(), "www.googleapis.com") && (u.Port() == "" || u.Port() == "443")
+	return u.Scheme == "https" && strings.EqualFold(u.Hostname(), ControlHost) && (u.Port() == "" || u.Port() == "443")
 }
 
 // The ordinary no-redirect path performs one authenticated GET. After crossing
 // the API origin, the chain remains on the independent unauthenticated client.
 func (d *Driver) body(ctx context.Context, target *url.URL, f item, wanted *core.Range) (*http.Response, bool, error) {
 	authenticated := true
-	for requests := 0; requests < 10; requests++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	response, err := httpcontent.FollowDownload(target.String(), func(target string, _ bool) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return nil, false, core.Fail(core.InvalidUpstreamResponse, nil)
+			return nil, core.Fail(core.InvalidUpstreamResponse, nil)
 		}
+		authenticated = authenticated && apiOrigin(req.URL)
 		req.Header.Set("Accept-Encoding", "identity")
 		if wanted != nil {
 			req.Header.Set("Range", httpcontent.Header(wanted))
@@ -118,27 +110,13 @@ func (d *Driver) body(ctx context.Context, target *url.URL, f item, wanted *core
 			resourceHeader(req, f)
 		}
 		response, err := d.do(client, req, true)
-		if err != nil {
-			return nil, false, err
+		if err == nil {
+			// An empty fragment is equivalent to no fragment for Drive redirects.
+			if next, emptyFragment := strings.CutSuffix(response.Header.Get("Location"), "#"); emptyFragment {
+				response.Header.Set("Location", cmp.Or(next, target))
+			}
 		}
-		switch response.StatusCode {
-		case 301, 302, 303, 307, 308:
-		default:
-			return response, authenticated, nil
-		}
-		location := response.Header.Get("Location")
-		next, parseErr := target.Parse(location)
-		if parseErr != nil || location == "" || !bodyURL(next) {
-			err = core.Fail(core.InvalidUpstreamResponse, errors.New("invalid native content redirect"))
-		}
-		err = errors.Join(err, d.cleanup.CloseBody(response.Body))
-		if err != nil {
-			return nil, false, err
-		}
-		if !apiOrigin(next) {
-			authenticated = false
-		}
-		target = next
-	}
-	return nil, false, core.Fail(core.InvalidUpstreamResponse, errors.New("native content redirect limit exceeded"))
+		return response, err
+	}, d.cleanup.CloseBody)
+	return response, err == nil && authenticated, err
 }

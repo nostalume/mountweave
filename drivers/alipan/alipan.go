@@ -135,10 +135,7 @@ func Open(ctx context.Context, opts Options) (*Driver, error) {
 	if err != nil || rootPath == "" {
 		return d, err
 	}
-	root, err := d.resolve(ctx, rootPath)
-	if err == nil && root.Type != "folder" {
-		err = core.Fail(core.NotDirectory, nil)
-	}
+	root, err := d.resolveFolder(ctx, rootPath)
 	if err == nil {
 		err = ctx.Err()
 	}
@@ -150,10 +147,8 @@ func Open(ctx context.Context, opts Options) (*Driver, error) {
 	return d, nil
 }
 func isolatedClient(client *http.Client) *http.Client {
-	copy := *client
-	copy.Jar = nil
-	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &copy
+	isolated := httpcontent.IsolatedClient(client)
+	return &isolated
 }
 func validEndpoint(endpoint string) error {
 	u, err := url.Parse(endpoint)
@@ -315,6 +310,14 @@ func (d *Driver) resolve(ctx context.Context, p string) (nativeFile, error) {
 	}
 	return current, nil
 }
+func (d *Driver) resolveFolder(ctx context.Context, p string) (nativeFile, error) {
+	f, err := d.resolve(ctx, p)
+	if err == nil && f.Type != "folder" {
+		err = core.Fail(core.NotDirectory, nil)
+	}
+	return f, err
+}
+
 func (d *Driver) child(ctx context.Context, parent, name string) (nativeFile, bool, error) {
 	scan := iterator{driver: d, parent: parent}
 	return childscan.Unique(ctx, name, func(ctx context.Context) ([]nativeFile, error) {
@@ -369,12 +372,9 @@ func (d *Driver) Enumerate(ctx context.Context, pAddress core.NativeQuery) (core
 	}
 	p := pAddress.Address().Value()
 
-	f, err := d.resolve(ctx, p)
+	f, err := d.resolveFolder(ctx, p)
 	if err != nil {
 		return nil, err
-	}
-	if f.Type != "folder" {
-		return nil, core.Fail(core.NotDirectory, nil)
 	}
 	return &iterator{driver: d, parent: f.ID}, nil
 }

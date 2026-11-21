@@ -14,12 +14,9 @@ func (d *Driver) OpenDirectory(ctx context.Context, pAddress core.NativeAddress)
 	}
 	p := pAddress.Value()
 
-	f, err := d.resolve(ctx, p)
+	f, err := d.resolveFolder(ctx, p)
 	if err != nil {
 		return nil, err
-	}
-	if f.Type != "folder" {
-		return nil, core.Fail(core.NotDirectory, nil)
 	}
 	return &directoryScope{iterator: &iterator{driver: d, parent: f.ID, files: make(map[string]nativeFile)}}, nil
 }

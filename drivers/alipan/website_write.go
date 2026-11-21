@@ -62,15 +62,6 @@ type websiteWriter struct {
 	staging string
 }
 
-func (d *Driver) websiteFile(ctx context.Context, id string) (nativeFile, error) {
-	var f nativeFile
-	err := d.website.request(ctx, "file", map[string]string{"drive_id": d.opts.DriveID, "file_id": id}, &f)
-	if err == nil && (f.ID != id || f.Drive != d.opts.DriveID) {
-		err = core.Fail(core.InvalidUpstreamResponse, nil)
-	}
-	return f, err
-}
-
 func (w *websiteWriter) Mkdir(ctx context.Context, p core.NativeAddress) (core.Change, error) {
 	return w.d.Mkdir(ctx, p)
 }

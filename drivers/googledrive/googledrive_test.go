@@ -35,6 +35,35 @@ type wire func(*http.Request) (*http.Response, error)
 
 func (f wire) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func TestAccountBoundsAndRedirects(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		code   core.Code
+	}{
+		{"missing ID", http.StatusOK, `{"user":{"emailAddress":"example@fixture.invalid"}}`, core.InvalidUpstreamResponse},
+		{"over budget", http.StatusOK, `{"user":{"permissionId":"id","displayName":"` + strings.Repeat("x", 64<<10) + `"}}`, core.InvalidUpstreamResponse},
+		{"redirect", http.StatusFound, "", core.UpstreamFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &badClose{ReadCloser: io.NopCloser(strings.NewReader(tc.body))}
+			calls := 0
+			client := &http.Client{Transport: wire(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.Host != ControlHost || r.URL.Scheme != "https" || r.URL.Path != "/drive/v3/about" {
+					t.Fatalf("unexpected account request to %s", r.URL)
+				}
+				return &http.Response{StatusCode: tc.status, Body: body, Header: http.Header{"Location": {"https://untrusted.invalid"}}}, nil
+			})}
+			id, label, err := Account(t.Context(), client)
+			if id != "" || label != "" || core.CodeOf(err) != tc.code || calls != 1 || body.calls != 1 {
+				t.Fatalf("account result (%q, %q, %v), calls %d, closes %d", id, label, err, calls, body.calls)
+			}
+		})
+	}
+}
+
 type fixture struct {
 	mu       sync.Mutex
 	mode     string
@@ -330,7 +359,7 @@ func (s *fixture) control(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "meta-redirect" {
-		w.Header().Set("Location", s.bodyURL)
+		w.Header().Set("Location", s.bodyURL+"#")
 		w.WriteHeader(302)
 		return
 	}
