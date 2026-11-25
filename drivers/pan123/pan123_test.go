@@ -23,6 +23,100 @@ type wire func(*http.Request) (*http.Response, error)
 
 func (f wire) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+type websiteFixture struct {
+	account, grantID, target string
+	size                     int64
+}
+
+func (s *websiteFixture) List(_ context.Context, parent, cursor string) (WebsitePage, error) {
+	page := WebsitePage{Account: s.account}
+	switch {
+	case parent == "0" && cursor == "":
+		page.Items = []WebsiteItem{{ID: "1", ParentID: "0", Name: "archive", Directory: true}}
+	case parent == "1" && cursor == "":
+		page.Items = []WebsiteItem{{ID: "2", ParentID: "1", Name: "sub", Directory: true}}
+		page.Next = "second"
+	case parent == "1" && cursor == "second":
+		page.Items = []WebsiteItem{{ID: "9007199254740993", ParentID: "1", Name: "original", Size: s.size}}
+	default:
+		return WebsitePage{}, errors.New("unexpected website page")
+	}
+	return page, nil
+}
+
+func (s *websiteFixture) Download(_ context.Context, parent string, file WebsiteFile) (WebsiteGrant, error) {
+	if parent != "1" || file != (WebsiteFile{Account: s.account, ID: "9007199254740993", Name: "original", Size: s.size}) {
+		return WebsiteGrant{}, errors.New("website download lost the selected file")
+	}
+	return WebsiteGrant{Account: s.account, FileID: s.grantID, URL: s.target}, nil
+}
+
+func TestWebsiteMountBindsAccountDirectoryAndBody(t *testing.T) {
+	s, _, c, _, opts := setup(t)
+	ctx := context.Background()
+	site := &websiteFixture{account: "40", grantID: "9007199254740993", target: s.content + "/blob", size: 6}
+	released := 0
+	o := WebsiteOptions{Session: site, Account: site.account, RootPath: "/archive", RootID: "1", ContentClient: opts.ContentClient,
+		Release: func() error { released++; return nil }}
+	d, err := OpenWebsite(ctx, o)
+	if err != nil || d.RootID() != "1" {
+		t.Fatal(d, err)
+	}
+	if _, err := c.Install("/site", d); err != nil {
+		_ = d.Close()
+		t.Fatal(err)
+	}
+	file := core.Path("/site/original")
+	opened, err := c.Open(ctx, "u", file, core.OpenOptions{Range: &core.Range{Start: 1, End: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(opened.Body)
+	err = errors.Join(err, opened.Body.Close())
+	if err != nil || string(data) != "b" || opened.Range == nil || *opened.Range != (core.ContentRange{Start: 1, End: 1, Total: 6}) {
+		t.Fatal(opened.Range, string(data), err)
+	}
+
+	site.grantID = "2"
+	_, err = c.Open(ctx, "u", file, core.OpenOptions{})
+	if core.CodeOf(err) != core.InvalidUpstreamResponse || s.bodyCalls.Load() != 1 {
+		t.Fatal("mismatched grant reached the body endpoint", err)
+	}
+	site.account = "41"
+	_, err = c.Open(ctx, "u", file, core.OpenOptions{})
+	if !errors.Is(err, ErrWebsiteBindingMismatch) || s.bodyCalls.Load() != 1 {
+		t.Fatal("changed account reached the body endpoint", err)
+	}
+	if got, err := OpenWebsite(ctx, o); got != nil || !errors.Is(err, ErrWebsiteBindingMismatch) || released != 0 {
+		t.Fatal("unsuccessful reopen acquired session ownership", err, released)
+	}
+	site.account, site.grantID, site.size = "40", "9007199254740993", 7
+	if _, err = c.Open(ctx, "u", file, core.OpenOptions{}); core.CodeOf(err) != core.InvalidUpstreamResponse {
+		t.Fatal("body length disagreed with selected file", err)
+	}
+	if err := c.Close(ctx); err != nil || released != 1 {
+		t.Fatal("Core retirement did not release the website session once", err, released)
+	}
+	releaseErr := errors.New("temporary website release failure")
+	o.Release = func() error {
+		released++
+		if released == 2 {
+			return releaseErr
+		}
+		return nil
+	}
+	owned, err := OpenWebsite(ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owned.Close(); !errors.Is(err, releaseErr) {
+		t.Fatal("failed website release was lost", err)
+	}
+	if err := errors.Join(owned.Close(), owned.Close()); err != nil || released != 3 {
+		t.Fatal("website release did not stop retrying after success", err, released)
+	}
+}
+
 type fixture struct {
 	mu                sync.Mutex
 	mode              string

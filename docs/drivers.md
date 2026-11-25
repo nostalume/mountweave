@@ -48,7 +48,7 @@ also requires safe source deletion.
 | [KooDrive](../drivers/koodrive/README.md) | Individual, department or group space | Optional Mkdir and known-length Create in the individual space |
 | [China Mobile Cloud](../drivers/mobilepan/README.md) | Personal drive. Metadata, paged listing and original-file reads with ranges. Library access through a registered application or a website session | — |
 | [115 Open](../drivers/pan115/README.md) | Authorized root or folder, ordinary unencrypted files and actual ranges | — |
-| [123 Open](../drivers/pan123/README.md) | Account tree, ordinary downloads and optional direct links for authorized directories | Optional Mkdir, single-file recycling and Create through single-step or multipart upload |
+| [123 Cloud Drive](../drivers/pan123/README.md) | Open API or authenticated website folder. Website reads use ordinary downloads offered by the provider | Open API supports optional Mkdir, single-file recycling and Create through single-step or multipart upload |
 | [Alibaba Cloud PDS](../drivers/pdsshare/README.md) | Authorized standard drive or received share | — |
 | [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | — |
 | [UC Cloud Drive](../drivers/uc/README.md) | Authenticated website folder, native pagination, original attachments and exact single byte ranges | — |
@@ -82,6 +82,7 @@ also requires safe source deletion.
 | [CloudFlare ImgBed](../drivers/imgbed/README.md) | Indexed deployment folder and ordinary files | — |
 | [IPFS](../drivers/ipfs/README.md) | Fixed UnixFS directory CID through a trusted Kubo endpoint | — |
 | [MediaFire](../drivers/mediafire/README.md) | Authorized folder and files with eligible native download links | — |
+| [PikPak](../drivers/pikpak/README.md) | Read-only personal access token, selected folder or current drive root, native pagination and original-file ranges | — |
 | [Misskey](../drivers/misskey/README.md) | Selected account folder and downloadable entries | — |
 | [Seafile](../drivers/seafile/README.md) | Authorized library or directory | — |
 | [Teldrive](../drivers/teldrive/README.md) | Active directory and ordinary files from the supported deployment | — |

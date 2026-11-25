@@ -1,4 +1,4 @@
-# 123 Open source
+# 123 Cloud Drive source
 
 This optional Go 1.24 module connects ordinary 123 Open account files to
 Mountweave. It uses the standard library, Core and its existing private helpers.
@@ -30,6 +30,25 @@ permission observation.
 For approved 123 Open applications, `Authorize` issues a token and verifies its
 account UID. Pass the saved UID to require the same account on renewal. The
 host controls secret storage, persistence and token reuse.
+
+`OpenWebsite` mounts a verified website account for browsing and reading.
+The caller supplies an authenticated `WebsiteSession` and releases it on a
+failed open. A successful mount owns its release. The website confirms the
+selected file before its independent HTTPS body is read.
+
+## Website connection
+
+`pan123.OpenWebsite` mounts a read-only folder from a protected website session.
+Provide the account, the folder path and the session. A saved `RootID` verifies
+the same folder after reopening. The optional `pan123/cdp` module observes the
+site's directory pages and ordinary download receipts in a dedicated browser
+tab. A successful construction takes ownership of the supplied release function.
+
+The existing `Stat`, `List`, `Open` and Copy source operations apply. The shared
+content client reads the original over HTTPS, separately from the browser
+account, and verifies the listed length and any actual byte-range receipt.
+An expired sign-in requires reconnecting the original account. Availability
+depends on the site's ordinary download eligibility for the selected file.
 
 ## Existing file API and cost
 

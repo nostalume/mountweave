@@ -6,15 +6,57 @@ import (
 	"errors"
 	"io"
 	"math/bits"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/childscan"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 )
+
+// reader shares path resolution, page ownership, and body handling across the
+// Open API and website. Each source validates its own native receipts.
+type reader struct {
+	responseReader
+	root         item
+	content      http.Client
+	resolvePages int
+	closed       atomic.Bool
+	page         func(context.Context, string, string, int) ([]item, string, error)
+	verifyRoot   func(context.Context) (item, error)
+	grant        func(context.Context, item) (string, *int64, error)
+}
+
+func newReader(client *http.Client, maxResolvePages int) *reader {
+	d := &reader{root: item{ID: "0", meta: core.Metadata{Kind: core.Directory}},
+		content: httpcontent.IsolatedClient(client), resolvePages: maxResolvePages}
+	d.content.CheckRedirect = d.cleanup.RedirectDownload
+	return d
+}
+
+func (d *reader) active(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d.closed.Load() {
+		return core.Fail(core.MountUnavailable, nil)
+	}
+	return nil
+}
+
+func (d *reader) check(ctx context.Context, p core.NativeAddress) error {
+	if err := d.active(ctx); err != nil {
+		return err
+	}
+	if p.Namespace() != core.TreeNamespace {
+		return core.Fail(core.UnsupportedOperation, nil)
+	}
+	return core.ValidatePath(p.Value())
+}
 
 type item struct {
 	meta    core.Metadata
@@ -65,6 +107,32 @@ func (d *Driver) info(ctx context.Context, id string) (item, error) {
 	return f, err
 }
 
+func (d *Driver) statRoot(ctx context.Context) (item, error) {
+	if d.root.ID != "0" {
+		return d.info(ctx, string(d.root.ID))
+	}
+	_, _, err := d.readPage(ctx, "0", "", 1)
+	return d.root, err
+}
+
+func (d *Driver) download(ctx context.Context, file item) (string, *int64, error) {
+	route, idParam := downloadRoute, "fileId"
+	if d.directLinks {
+		route, idParam = directLinkRoute, "fileID"
+	}
+	var capability struct {
+		DownloadURL string `json:"downloadUrl"`
+		DirectURL   string `json:"url"`
+	}
+	if err := d.call(ctx, route, url.Values{idParam: {string(file.ID)}}, &capability); err != nil {
+		return "", nil, err
+	}
+	if d.directLinks {
+		return capability.DirectURL, nil, nil
+	}
+	return capability.DownloadURL, nil, nil
+}
+
 func (d *Driver) readPage(ctx context.Context, parent, after string, n int) ([]item, string, error) {
 	query := url.Values{"parentFileId": {parent}, "limit": {strconv.Itoa(min(n, 100))}}
 	if after != "" {
@@ -104,7 +172,7 @@ func (d *Driver) readPage(ctx context.Context, parent, after string, n int) ([]i
 // listing owns only the provider's continuation, shared by lookup and Iterator.
 // Filtering recycle-bin entries never changes this progress or its terminal mark.
 type listing struct {
-	d             *Driver
+	d             *reader
 	parent, after string
 	checkpoint    string
 	pages         uint64
@@ -115,7 +183,10 @@ func (s *listing) next(ctx context.Context, n int) ([]item, error) {
 	if s.done {
 		return nil, io.EOF
 	}
-	files, next, err := s.d.readPage(ctx, s.parent, s.after, n)
+	if err := s.d.active(ctx); err != nil {
+		return nil, err
+	}
+	files, next, err := s.d.page(ctx, s.parent, s.after, n)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +206,7 @@ func (s *listing) next(ctx context.Context, n int) ([]item, error) {
 	return files, nil
 }
 
-func (d *Driver) resolve(ctx context.Context, p string) (item, error) {
+func (d *reader) resolve(ctx context.Context, p string) (item, error) {
 	current := d.root
 	if p == "/" {
 		return current, nil
@@ -167,7 +238,7 @@ func (d *Driver) resolve(ctx context.Context, p string) (item, error) {
 	return current, nil
 }
 
-func (d *Driver) Enumerate(ctx context.Context, q core.NativeQuery) (core.Iterator, error) {
+func (d *reader) Enumerate(ctx context.Context, q core.NativeQuery) (core.Iterator, error) {
 	if q.Delimiter() != "" || q.StartAfter() != "" {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}

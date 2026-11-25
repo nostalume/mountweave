@@ -1,4 +1,4 @@
-// Package pan123 connects ordinary 123 Open account files to Mountweave.
+// Package pan123 connects 123 Open and website account files to Mountweave.
 package pan123
 
 import (
@@ -11,7 +11,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"sync/atomic"
 	"time"
 
 	core "github.com/nostalume/mountweave"
@@ -114,10 +113,8 @@ type Options struct {
 }
 
 type Driver struct {
-	root         item
-	api, content http.Client
-	responseReader
-	resolvePages int
+	*reader
+	api          http.Client
 	allowMkdir   bool
 	allowRemove  bool
 	directLinks  bool
@@ -125,7 +122,6 @@ type Driver struct {
 	uploadBudget *upload.Budget
 	singleLimit  int64
 	presigned    bool
-	closed       atomic.Bool
 }
 
 // Open validates options and confirms the directory root. A non-nil failed
@@ -152,10 +148,10 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 	if o.MaxResponseBytes == 0 {
 		o.MaxResponseBytes = 4 << 20
 	}
-	d := &Driver{root: item{ID: "0", meta: core.Metadata{Kind: core.Directory}}, api: httpcontent.IsolatedClient(o.Client),
-		content: httpcontent.IsolatedClient(o.ContentClient), responseReader: responseReader{limit: o.MaxResponseBytes}, resolvePages: o.MaxResolvePages,
+	d := &Driver{reader: newReader(o.ContentClient, o.MaxResolvePages), api: httpcontent.IsolatedClient(o.Client),
 		allowMkdir: o.AllowMkdir, allowRemove: o.AllowRemove, directLinks: o.UseDirectLinks, presigned: o.PresignedMultipart}
-	d.content.CheckRedirect = d.cleanup.RedirectDownload
+	d.limit = o.MaxResponseBytes
+	d.page, d.verifyRoot, d.grant = d.readPage, d.statRoot, d.download
 	if o.UploadClient != nil {
 		budget, err := upload.New(o.MaxUploadBytes, 1)
 		if err != nil {
@@ -184,26 +180,6 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 
 type nativeID = httpcontent.DecimalID
 
-func (d *Driver) active(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if d.closed.Load() {
-		return core.Fail(core.MountUnavailable, nil)
-	}
-	return nil
-}
-
-func (d *Driver) check(ctx context.Context, p core.NativeAddress) error {
-	if err := d.active(ctx); err != nil {
-		return err
-	}
-	if p.Namespace() != core.TreeNamespace {
-		return core.Fail(core.UnsupportedOperation, nil)
-	}
-	return core.ValidatePath(p.Value())
-}
-
 func nativeFailure(err error, private bool) error {
 	if !private {
 		return httpcontent.ControlIOError(err)
@@ -230,7 +206,7 @@ func (d *responseReader) closeBody(body io.Closer, private bool) error {
 }
 
 // Close retries owned response cleanup after Core has joined active uses.
-func (d *Driver) Close() error {
+func (d *reader) Close() error {
 	d.closed.Store(true)
 	return d.cleanup.Retry()
 }
@@ -359,7 +335,7 @@ func (d *responseReader) requestReply(client *http.Client, req *http.Request, ou
 	return false, true, core.Fail(core.InvalidUpstreamResponse, err), nil
 }
 
-func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...core.ReadSelection) (core.Metadata, error) {
+func (d *reader) Stat(ctx context.Context, p core.NativeAddress, selections ...core.ReadSelection) (core.Metadata, error) {
 	if len(selections) > 1 {
 		return core.Metadata{}, core.Fail(core.InvalidRequest, nil)
 	}
@@ -381,11 +357,7 @@ func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...c
 		return core.Metadata{}, err
 	}
 	if p.Value() == "/" {
-		if file.ID == "0" {
-			_, _, err = d.readPage(ctx, "0", "", 1)
-		} else {
-			file, err = d.info(ctx, string(file.ID))
-		}
+		file, err = d.verifyRoot(ctx)
 		if err != nil {
 			return core.Metadata{}, err
 		}
@@ -397,7 +369,7 @@ func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...c
 	return meta, selection.Check(meta.Evidence)
 }
 
-func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOptions) (core.Opened, error) {
+func (d *reader) Open(ctx context.Context, p core.NativeAddress, o core.OpenOptions) (core.Opened, error) {
 	if err := o.Validate(); err != nil {
 		return core.Opened{}, err
 	}
@@ -421,20 +393,9 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 	if selectionErr != nil {
 		return core.Opened{}, selectionErr
 	}
-	route, idParam := downloadRoute, "fileId"
-	if d.directLinks {
-		route, idParam = directLinkRoute, "fileID"
-	}
-	var capability struct {
-		DownloadURL string `json:"downloadUrl"`
-		DirectURL   string `json:"url"`
-	}
-	if err := d.call(ctx, route, url.Values{idParam: {string(file.ID)}}, &capability); err != nil {
+	target, size, err := d.grant(ctx, file)
+	if err != nil {
 		return core.Opened{}, err
-	}
-	target := capability.DownloadURL
-	if d.directLinks {
-		target = capability.DirectURL
 	}
 	u, err := url.Parse(target)
 	if err != nil || !httpcontent.IsHTTPS(u) {
@@ -456,15 +417,10 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 		return core.Opened{}, errors.Join(core.Fail(core.UpstreamFailure, fmt.Errorf("123 content returned HTTP %d", response.StatusCode)),
 			d.closeBody(response.Body, true))
 	}
-	opened, err := httpcontent.Open(response, o.Range)
-	if o.Range == nil && response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		err = core.Fail(core.InvalidUpstreamResponse, errors.New("range rejected without a range request"))
+	if size != nil {
+		return d.cleanup.OpenSizedBody(response, o.Range, file.Name, *size)
 	}
-	if err != nil {
-		return core.Opened{}, errors.Join(err, d.closeBody(response.Body, true))
-	}
-	opened.Metadata.Name = file.Name
-	return opened, nil
+	return d.cleanup.OpenBody(response, o.Range, file.Name)
 }
 
 var _ core.Driver = (*Driver)(nil)
