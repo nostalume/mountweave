@@ -12,3 +12,5 @@ require (
 require github.com/go-json-experiment/json v0.0.0-20260213210345-44df1a37e875 // indirect
 
 replace github.com/nostalume/mountweave/drivers/pan123 => ..
+
+replace github.com/nostalume/mountweave => ../../..
