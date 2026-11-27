@@ -22,6 +22,216 @@ type transport func(*http.Request) (*http.Response, error)
 
 func (f transport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func TestWebsiteMountBindingPaginationAndOrdinaryBody(t *testing.T) {
+	ctx := t.Context()
+	account := strings.Repeat("a", 64)
+	const fileID = "9007199254740993"
+	const folderID = "folder-id"
+	var bodyCalls, releases int
+	content := &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		bodyCalls++
+		if r.URL.String() != "https://body.example/file?sig=a%2B" || r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+			t.Fatal("website body request changed the signed address or sent account credentials")
+		}
+		return &http.Response{StatusCode: 200, ContentLength: 3, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("zip"))}, nil
+	})}
+	wrongParent := false
+	denied := false
+	wrongAccount := false
+	var mkdirCode int
+	var mkdirParent string
+	fileName := "sample.zip"
+	var renameCalls int
+	confirmRename := false
+	var moveCalls int
+	wrongTask, moved := true, false
+	session := guangyapan.NewBrowserSession(func(_ context.Context, script string, args json.RawMessage) (json.RawMessage, error) {
+		var q struct {
+			Operation, Account, ParentID, FileID, Name, TaskID string
+			Index, PageSize, Size                              int64
+		}
+		if err := json.Unmarshal(args, &q); err != nil {
+			t.Fatal(err)
+		}
+		if script == "" || (q.Operation != "account" && q.Account != account) {
+			t.Fatal("website request lost its account binding")
+		}
+		if wrongAccount {
+			return json.RawMessage(`{"Mismatch":true}`), nil
+		}
+		switch q.Operation {
+		case "account":
+			return json.Marshal(map[string]any{"Status": 200, "Account": account})
+		case "list":
+			if q.ParentID == folderID && q.Index == 0 {
+				list := []map[string]any{{"fileId": "occupant", "fileName": "renamed.zip", "resType": 2}}
+				if moved {
+					list = append(list, map[string]any{"fileId": fileID, "fileName": "renamed (1).zip",
+						"resType": 1, "fileSize": 3, "parentId": folderID})
+				}
+				return json.Marshal(map[string]any{"Status": 200, "Account": account, "Total": len(list), "Page": 0, "List": list})
+			}
+			if q.ParentID != "" || q.PageSize != 50 || q.Index > 1 {
+				t.Fatal("website directory pagination changed")
+			}
+			var list []map[string]any
+			if q.Index == 0 {
+				list = append(list, map[string]any{"fileId": folderID, "fileName": "folder", "resType": 2})
+				for j := range 49 {
+					list = append(list, map[string]any{"fileId": fmt.Sprint(j), "fileName": fmt.Sprintf("f-%d", j), "resType": 1})
+				}
+			} else {
+				entry := map[string]any{"fileId": fileID, "fileName": fileName, "resType": 1, "fileSize": 3}
+				if wrongParent {
+					entry["parentId"] = "other"
+				}
+				list = append(list, entry)
+			}
+			total := 51
+			if moved {
+				if q.Index != 0 {
+					t.Fatal("moved item was still paged from the source")
+				}
+				total = 50
+			}
+			return json.Marshal(map[string]any{"Status": 200, "Account": account, "Total": total, "Page": q.Index, "List": list})
+		case "mkdir":
+			if q.ParentID != folderID || q.Name != "new" || !strings.Contains(script, "failIfNameExist:true") {
+				t.Fatal("website mkdir lost its native parent, name, or exclusive policy")
+			}
+			reply := map[string]any{"Status": 200, "Account": account, "Code": mkdirCode}
+			if mkdirCode == 0 {
+				reply["Folder"] = map[string]any{"fileId": "new-id", "fileName": "new", "parentId": mkdirParent, "resType": 2}
+			}
+			return json.Marshal(reply)
+		case "rename":
+			if q.FileID != fileID || q.Name != "occupied.zip" && q.Name != "renamed.zip" ||
+				!strings.Contains(script, "/userres/v1/file/rename") {
+				t.Fatal("website rename lost its native identity or exact target")
+			}
+			renameCalls++
+			reply := map[string]any{"Status": 200, "Account": account}
+			if q.Name == "occupied.zip" {
+				reply["Code"] = 160
+			} else if confirmRename {
+				fileName = q.Name
+			}
+			return json.Marshal(reply)
+		case "move":
+			if q.FileID != fileID || q.ParentID != folderID || !strings.Contains(script, "/userres/v1/file/move_file") {
+				t.Fatal("move lost its source identity or destination parent")
+			}
+			moveCalls++
+			return json.Marshal(map[string]any{"Status": 200, "Account": account, "TaskID": "bound-task"})
+		case "move-status":
+			if q.TaskID != "bound-task" {
+				t.Fatal("poll lost the issued task")
+			}
+			task := q.TaskID
+			if wrongTask {
+				task = "other"
+			} else {
+				moved = true
+			}
+			return json.Marshal(map[string]any{"Status": 200, "Account": account, "TaskID": task, "State": 2})
+		case "download":
+			if q.FileID != fileID || q.Size != 3 {
+				t.Fatal("download broke the selected file binding")
+			}
+			if denied {
+				return json.RawMessage(`{"Denied":true}`), nil
+			}
+			return json.Marshal(map[string]any{"Status": 200, "Account": account, "FileID": fileID, "SignedURL": "https://body.example/file?sig=a%2B"})
+		}
+		t.Fatal("unexpected browser operation")
+		return nil, nil
+	})
+	if got, err := session.Account(ctx); err != nil || got != account {
+		t.Fatalf("verify account: %v", err)
+	}
+	options := guangyapan.WebsiteOptions{Session: session, Account: account, RootPath: "/", RootID: "/", ContentClient: content, Release: func() error { releases++; return nil }}
+	d, err := guangyapan.OpenWebsite(ctx, options)
+	if err != nil || d.RootID() != "/" {
+		t.Fatalf("mount website account root: %v", err)
+	}
+	file := core.NativePath("/sample.zip")
+	opened, err := d.Open(ctx, file, core.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, readErr := io.ReadAll(opened.Body); string(body) != "zip" || errors.Join(readErr, opened.Body.Close()) != nil {
+		t.Fatalf("ordinary body did not complete: %v", readErr)
+	}
+	target := core.NativePath("/folder/new")
+	for _, test := range []struct {
+		code   int
+		parent string
+		effect core.Effect
+		before core.TargetPresence
+		err    core.Code
+	}{
+		{0, folderID, core.Applied, core.TargetMissing, ""},
+		{159, "", core.Unchanged, core.TargetPresent, core.AlreadyExists},
+		{160, "", core.Unchanged, core.TargetPresent, core.AlreadyExists},
+		{0, "wrong-parent", core.Unknown, 0, core.InvalidUpstreamResponse},
+	} {
+		mkdirCode, mkdirParent = test.code, test.parent
+		result, err := d.Mkdir(ctx, target)
+		if result.Effect != test.effect || result.Before != test.before ||
+			(test.err == "" && err != nil) || (test.err != "" && core.CodeOf(err) != test.err) {
+			t.Fatalf("mkdir native code %d: result=%+v error=%v", test.code, result, err)
+		}
+	}
+	denied = true
+	if _, err = d.Open(ctx, file, core.OpenOptions{}); core.CodeOf(err) != core.UnsupportedOperation || bodyCalls != 1 {
+		t.Fatalf("website ordinary download restriction was lost: %v", err)
+	}
+	wrongParent = true
+	if _, err = d.Open(ctx, file, core.OpenOptions{}); core.CodeOf(err) != core.InvalidUpstreamResponse || bodyCalls != 1 {
+		t.Fatalf("wrong native parent was accepted: %v", err)
+	}
+	wrongParent = false
+	renamed := core.NativePath("/renamed.zip")
+	if result, err := d.Relocate(ctx, file, core.NativePath("/folder/sample.zip")); result.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || renameCalls != 0 {
+		t.Fatalf("cross-directory rename was not refused before dispatch: %+v %v", result, err)
+	}
+	if result, err := d.Relocate(ctx, core.NativePath("/folder"), renamed); result.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || renameCalls != 0 {
+		t.Fatalf("directory rename was not refused before dispatch: %+v %v", result, err)
+	}
+	if result, err := d.Relocate(ctx, file, core.NativePath("/occupied.zip")); result.Effect != core.Unchanged ||
+		result.Before != core.TargetPresent || core.CodeOf(err) != core.AlreadyExists || renameCalls != 1 {
+		t.Fatalf("native name conflict did not preserve the target: %+v %v", result, err)
+	}
+	if result, err := d.Relocate(ctx, file, renamed); result.Effect != core.Unknown ||
+		core.CodeOf(err) != core.InvalidUpstreamResponse || renameCalls != 2 {
+		t.Fatalf("success without destination readback was accepted: %+v %v", result, err)
+	}
+	confirmRename = true
+	if result, err := d.Relocate(ctx, file, renamed); result.Effect != core.Applied ||
+		result.Before != core.TargetMissing || err != nil || renameCalls != 3 {
+		t.Fatalf("bound rename did not complete: %+v %v", result, err)
+	}
+	directory := core.NativePath("/folder")
+	if name, result, err := d.RelocateInto(ctx, renamed, directory); name != "" || result.Effect != core.Unknown ||
+		core.CodeOf(err) != core.InvalidUpstreamResponse || moveCalls != 1 {
+		t.Fatalf("a different task confirmed the move: %q %+v %v", name, result, err)
+	}
+	wrongTask = false
+	if name, result, err := d.RelocateInto(ctx, renamed, directory); name != "renamed (1).zip" ||
+		result.Effect != core.Applied || err != nil || moveCalls != 2 {
+		t.Fatalf("directory move did not return the allocated name: %q %+v %v", name, result, err)
+	}
+	if err := errors.Join(d.Close(), d.Close()); err != nil || releases != 1 {
+		t.Fatalf("website ownership was released %d times: %v", releases, err)
+	}
+	wrongAccount = true
+	if _, err := guangyapan.OpenWebsite(ctx, options); !errors.Is(err, guangyapan.ErrWebsiteBindingMismatch) || releases != 1 {
+		t.Fatalf("wrong account or failed constructor changed ownership: %v", err)
+	}
+}
+
 func TestOwnDriveAndSignedBody(t *testing.T) {
 	const rootID, fileID, name = "9007199254740993", "9007199254741001", "space % &"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

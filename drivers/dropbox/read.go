@@ -16,14 +16,17 @@ type nativeMetadata struct {
 	Tag          string     `json:".tag"`
 	ID           string     `json:"id"`
 	Name         string     `json:"name"`
+	PathLower    string     `json:"path_lower"`
+	Symlink      *struct{}  `json:"symlink_info"`
 	Size         *int64     `json:"size"`
 	Modified     *time.Time `json:"server_modified"`
 	Downloadable *bool      `json:"is_downloadable"`
 }
 
 type item struct {
-	ID   string
-	meta core.Metadata
+	ID, pathLower string
+	symlink       bool
+	meta          core.Metadata
 }
 
 // FileMetadata is not a Metadata tagged union. Only typed file responses
@@ -40,7 +43,7 @@ func accept(m nativeMetadata, file bool) (item, error) {
 		strings.ContainsAny(m.ID, "/\\\r\n") || !core.ValidName(m.Name) {
 		return item{}, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid native item identity or name"))
 	}
-	f := item{ID: m.ID, meta: core.Metadata{Name: m.Name, Kind: core.Directory}}
+	f := item{ID: m.ID, pathLower: m.PathLower, symlink: m.Symlink != nil, meta: core.Metadata{Name: m.Name, Kind: core.Directory}}
 	if tag == "file" {
 		if m.Size == nil || *m.Size < 0 {
 			return item{}, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid native file size"))

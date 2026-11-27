@@ -21,11 +21,11 @@ const (
 type ucOpenBody func(context.Context, ucFile, core.OpenOptions) (core.Opened, error)
 
 type ucFile struct {
-	id, route string
-	meta      core.Metadata
+	id, parent, route string
+	meta              core.Metadata
 }
 
-// Driver exposes read-only access to a verified UC folder.
+// Driver exposes an authenticated UC folder.
 type Driver struct {
 	account string
 	root    ucFile
@@ -40,6 +40,7 @@ type ucMetadataRequest struct {
 	Account   string `json:"account,omitempty"`
 	Parent    string `json:"parent,omitempty"`
 	Page      int    `json:"page,omitempty"`
+	FileID    string `json:"fid,omitempty"`
 }
 
 type ucMetadataReply struct {
@@ -48,6 +49,7 @@ type ucMetadataReply struct {
 	Page    int          `json:"page"`
 	Total   *int         `json:"total"`
 	Items   []ucListItem `json:"items"`
+	Task    string       `json:"task"`
 }
 
 type ucListItem struct {
@@ -256,7 +258,7 @@ func (item ucListItem) file(parent ucFile) (ucFile, error) {
 	if !core.ValidName(item.Name) {
 		return ucFile{}, core.Fail(core.UnrepresentableName, nil)
 	}
-	file := ucFile{id: item.ID, route: parent.route, meta: core.Metadata{Name: item.Name}}
+	file := ucFile{id: item.ID, parent: parent.id, route: parent.route, meta: core.Metadata{Name: item.Name}}
 	switch *item.Kind {
 	case 0:
 		file.meta.Kind = core.Directory
@@ -325,6 +327,62 @@ func (d *Driver) resolve(ctx context.Context, address core.NativeAddress) (ucFil
 		}
 	}
 	return found, nil
+}
+
+func (d *Driver) RemoveWithDisposition(ctx context.Context, target core.NativeAddress, options core.RemoveOptions) (core.Change, error) {
+	if options.Disposition != core.RemoveTrash {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	options.Disposition = ""
+	return d.Remove(ctx, target, options)
+}
+
+func (d *Driver) Remove(ctx context.Context, p core.NativeAddress, options ...core.RemoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if len(options) > 1 {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(options) == 1 {
+		o := options[0]
+		if o.Disposition != "" || !o.When.Empty() || o.Target != "" && o.Target != core.RemoveNonDirectory {
+			return unchanged, core.Fail(core.UnsupportedOperation, nil)
+		}
+	}
+	f, err := d.resolve(ctx, p)
+	if err != nil {
+		return unchanged, err
+	}
+	if f.meta.Kind != core.File {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return unchanged, err
+	}
+	unknown := core.Change{Effect: core.Unknown}
+	receipt, err := readUCMetadata(ctx, d.call, ucMetadataRequest{Operation: "recycle", Account: d.account, FileID: f.id})
+	if err != nil {
+		return unknown, err
+	}
+	if !ucFID.MatchString(receipt.Task) {
+		return unknown, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	// A terminal receipt belongs to a unique submitted task. Confirm the same
+	// file ID left its original directory, even if another file took its name.
+	list := ucListing{driver: d, parent: ucFile{id: f.parent}}
+	for {
+		files, err := list.next(ctx)
+		if err != nil && err != io.EOF {
+			return unknown, err
+		}
+		for _, current := range files {
+			if current.id == f.id {
+				return unknown, core.Fail(core.InvalidUpstreamResponse, nil)
+			}
+		}
+		if err == io.EOF {
+			return core.Change{Effect: core.Applied}, nil
+		}
+	}
 }
 
 func ucReadSelection(selection core.ReadSelection) error {

@@ -130,19 +130,8 @@ func TestLiveEditAndOrderedNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	installCopyMount(t, c, "/files", d)
-	scope, err := core.NewOrderScope(4)
-	if err != nil {
-		t.Fatal(err)
-	}
+	scope, reserve := orderFixture(t, ctx, 4)
 	defer scope.Stop()
-	reserve := func() *core.OrderTurn {
-		t.Helper()
-		turn, err := scope.Reserve(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return turn
-	}
 	opening := reserve()
 	opened, err := c.Open(opening.Context(), "alice", core.Path("/files/item"), core.OpenOptions{Mode: core.LiveEdit, Read: true})
 	if err != nil || opened.Change.Effect != core.Unchanged {
@@ -334,6 +323,22 @@ func (f *partialEditor) WriteAt(ctx context.Context, p []byte, offset int64) (in
 	return n, change, f.owner.fault
 }
 
+func orderFixture(t *testing.T, ctx context.Context, capacity int) (*core.OrderScope, func() *core.OrderTurn) {
+	t.Helper()
+	scope, err := core.NewOrderScope(capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope, func() *core.OrderTurn {
+		t.Helper()
+		turn, err := scope.Reserve(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return turn
+	}
+}
+
 func TestOrderedEditPartialCancellationAndCleanup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -347,19 +352,8 @@ func TestOrderedEditPartialCancellationAndCleanup(t *testing.T) {
 	c := newCore(t, core.Options{})
 	defer closeCore(t, c)
 	installCopyMount(t, c, "/files", d)
-	scope, err := core.NewOrderScope(2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	scope, reserve := orderFixture(t, ctx, 2)
 	defer scope.Stop()
-	reserve := func() *core.OrderTurn {
-		t.Helper()
-		turn, err := scope.Reserve(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return turn
-	}
 	open := func() core.Content {
 		t.Helper()
 		turn := reserve()
@@ -416,5 +410,27 @@ func TestOrderedEditPartialCancellationAndCleanup(t *testing.T) {
 	}
 	if err := opened.File.Close(); err != nil {
 		t.Fatal("stopped scope blocked cleanup", err)
+	}
+}
+
+func TestWriteIntoPreservesDanglingLink(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "archive")
+	if err := os.Mkdir(archive, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(archive, "a")
+	if err := os.Symlink("absent", link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	c := newCore(t, core.Options{Authorize: allow})
+	defer closeCore(t, c)
+	mountLocal(t, c, root)
+	destination, change, err := c.WriteInto(t.Context(), "alice", core.Path("/files/archive"), "a", strings.NewReader("source"), nil)
+	if destination != core.Path("/files/archive/a (2)") || change.Effect != core.Applied || err != nil {
+		t.Fatal(destination, change, err)
+	}
+	if got, err := os.Readlink(link); err != nil || got != "absent" {
+		t.Fatal("occupied link changed", got, err)
 	}
 }

@@ -20,7 +20,7 @@ type WebsiteWriteOptions struct {
 	MaxBufferedBytes int64  `json:"max_buffered_bytes"`
 }
 
-// OpenWritable adds exclusive publication, directory creation and file trash.
+// OpenWritable adds exclusive file creation, relocation, trash and directory creation.
 // The staging directory must be separate from the mounted tree on the same drive.
 func (a WebsiteAccount) OpenWritable(ctx context.Context, rootID string, opts WebsiteWriteOptions, client *http.Client, release func() error) (core.Driver, error) {
 	if rootID == "root" || opts.StagingRootID == "" || opts.StagingRootID == "root" || opts.StagingRootID == rootID {
@@ -62,12 +62,64 @@ type websiteWriter struct {
 	staging string
 }
 
+func (d *Driver) websiteFile(ctx context.Context, id string) (nativeFile, error) {
+	var f nativeFile
+	err := d.website.request(ctx, "file", map[string]string{"drive_id": d.opts.DriveID, "file_id": id}, &f)
+	if err == nil && (f.ID != id || f.Drive != d.opts.DriveID) {
+		err = core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return f, err
+}
+
 func (w *websiteWriter) Mkdir(ctx context.Context, p core.NativeAddress) (core.Change, error) {
 	return w.d.Mkdir(ctx, p)
 }
 
+func (w *websiteWriter) RemoveWithDisposition(ctx context.Context, target core.NativeAddress, options core.RemoveOptions) (core.Change, error) {
+	if options.Disposition != core.RemoveTrash {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	options.Disposition = ""
+	return w.Remove(ctx, target, options)
+}
+
 func (w *websiteWriter) Remove(ctx context.Context, p core.NativeAddress, opts ...core.RemoveOptions) (core.Change, error) {
 	return w.d.Remove(ctx, p, opts...)
+}
+
+func (w *websiteWriter) Relocate(ctx context.Context, source, target core.NativeAddress, options ...core.MoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if len(options) > 1 {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(options) == 1 {
+		o := options[0]
+		if !o.Source.Empty() || !o.Target.Empty() || (o.Existing != "" && o.Existing != core.CreateNew) {
+			return unchanged, core.Fail(core.UnsupportedOperation, nil)
+		}
+	}
+	if source.Namespace() != core.TreeNamespace || target.Namespace() != core.TreeNamespace {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if source.Value() == "/" || target.Value() == "/" || source == target {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	f, err := w.d.resolve(ctx, source.Value())
+	if err != nil {
+		return unchanged, err
+	}
+	if f.Type != "file" {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	parent, name, err := w.d.destination(ctx, target.Value())
+	if err != nil {
+		return unchanged, &core.OperationError{Side: core.TargetSide, Phase: core.CreatePhase, Cause: err}
+	}
+	return w.d.websiteMove(ctx, f, parent.ID, name)
+}
+
+func (w *websiteWriter) Create(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {
+	return w.Publish(ctx, p, input, length, core.PublicationOptions{When: core.IfAbsent()})
 }
 
 func (w *websiteWriter) Publish(ctx context.Context, p core.NativeAddress, input io.Reader, length *int64, options core.PublicationOptions) (core.Change, error) {
@@ -96,32 +148,42 @@ func (w *websiteWriter) Publish(ctx context.Context, p core.NativeAddress, input
 		}
 		return unchanged, errors.Join(err, w.discard(ctx, staged.ID, temporary))
 	}
-	if err := ctx.Err(); err != nil {
-		return unchanged, errors.Join(err, w.discard(ctx, staged.ID, temporary))
+	change, err := d.websiteMove(ctx, nativeFile{ID: staged.ID, Name: temporary, Size: &n}, parent.ID, name)
+	if change.Effect == core.Unchanged {
+		err = errors.Join(err, w.discard(ctx, staged.ID, temporary))
 	}
-	request := map[string]string{"drive_id": d.opts.DriveID, "file_id": staged.ID, "type": "file", "file_name": temporary,
-		"to_drive_id": d.opts.DriveID, "to_parent_file_id": parent.ID, "new_name": name, "check_name_mode": "refuse"}
+	return change, err
+}
+
+func (d *Driver) websiteMove(ctx context.Context, source nativeFile, parent, name string) (core.Change, error) {
+	if err := ctx.Err(); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	request := map[string]string{"drive_id": d.opts.DriveID, "file_id": source.ID, "type": "file", "file_name": source.Name,
+		"to_drive_id": d.opts.DriveID, "to_parent_file_id": parent, "new_name": name, "check_name_mode": "refuse"}
 	var reply struct {
 		createdFile
 		Task string `json:"async_task_id"`
 	}
-	err = d.website.request(ctx, "move", request, &reply)
-	if err == nil && reply.Exists && reply.Task == "" {
-		return unchanged, errors.Join(core.Fail(core.AlreadyExists, nil), w.discard(ctx, staged.ID, temporary))
-	}
-	if err == nil && reply.ID == staged.ID && reply.Drive == d.opts.DriveID && reply.Task == "" &&
-		(reply.Parent == "" || reply.Parent == parent.ID) && (reply.Name == "" || reply.Name == name) {
-		return core.Change{Effect: core.Applied, Before: core.TargetMissing}, nil
+	err := d.website.request(ctx, "move", request, &reply)
+	if err == nil && reply.Task == "" {
+		if reply.Exists {
+			return core.Change{Effect: core.Unchanged, Before: core.TargetPresent}, core.Fail(core.AlreadyExists, nil)
+		}
+		if reply.ID == source.ID && reply.Drive == d.opts.DriveID && reply.Parent == parent && reply.Name == name {
+			return core.Change{Effect: core.Applied, Before: core.TargetMissing}, nil
+		}
 	}
 	// A missing acknowledgement can outlive cancellation. Inspect by ID without
 	// replaying the move or deleting an object whose commit can still arrive.
 	reconcile, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
 	defer cancel()
-	observed, readErr := d.websiteFile(reconcile, staged.ID)
-	if readErr == nil && observed.Parent == parent.ID && observed.Name == name && observed.Type == "file" && observed.Size != nil && *observed.Size == n {
+	observed, readErr := d.websiteFile(reconcile, source.ID)
+	if readErr == nil && observed.Parent == parent && observed.Name == name && observed.Type == "file" &&
+		(source.Size == nil || observed.Size != nil && *observed.Size == *source.Size) {
 		return core.Change{Effect: core.Applied, Before: core.TargetMissing}, nil
 	}
-	return core.Change{Effect: core.Unknown}, errors.Join(err, readErr, core.Fail(core.InvalidUpstreamResponse, errors.New("Aliyun Drive publication could not be confirmed")))
+	return core.Change{Effect: core.Unknown}, errors.Join(err, readErr, core.Fail(core.InvalidUpstreamResponse, errors.New("Aliyun Drive move could not be confirmed")))
 }
 
 func (w *websiteWriter) discard(ctx context.Context, id, name string) error {
@@ -145,6 +207,9 @@ func (w *websiteWriter) discard(ctx context.Context, id, name string) error {
 }
 
 func (d *Driver) websiteTrash(ctx context.Context, id string) (core.Change, error) {
+	if err := ctx.Err(); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
 	var reply struct {
 		createdFile
 		Task string `json:"async_task_id"`

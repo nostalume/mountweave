@@ -3,6 +3,10 @@
 This source mounts a folder from an authenticated UC website session.
 It supports metadata, paged directory listing, original-file streaming and
 exact single byte ranges. It can serve as a Core Copy source.
+`Core.Remove` moves one file into the UC recycle bin by file ID. The driver
+confirms the native task result and rechecks the original directory by ID.
+An unconfirmed result retains an unknown effect. Directory and conditional
+removal are unavailable.
 
 The host opens a browser tab on [the UC website](https://drive.uc.cn/) and
 provides its CDP context and a page call that evaluates a function with one JSON

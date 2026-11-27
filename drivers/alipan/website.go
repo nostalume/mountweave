@@ -12,13 +12,19 @@ import (
 const (
 	websiteOrigin = "https://www.alipan.com/"
 	WebsiteURL    = websiteOrigin + "drive"
+
+	// WebsiteLoginURL lands on a static page after saving the sign-in.
+	WebsiteLoginURL = websiteOrigin + "sign/in?back=%2Frobots.txt"
 )
 
 // WebsiteWritePaths lists automatic website operations that must be blocked
 // before loading a page for read access.
 func WebsiteWritePaths() []string { return []string{"/v2/user/driveMigrate"} }
 
-var ErrWebsiteSignIn = errors.New("sign in to the Aliyun Drive website")
+var (
+	ErrWebsiteSignIn          = errors.New("sign in to the Aliyun Drive website")
+	ErrWebsiteBindingMismatch = errors.New("the Aliyun Drive website account or resource drive differs from the selected binding")
+)
 
 // Website calls source-owned functions in an isolated authenticated page.
 // Call receives the function and its JSON argument. Release relinquishes the
@@ -72,7 +78,7 @@ const websiteRequest = `async ({operation, data}) => {
 					else if (operation === "file") value = projectFile(v);
 					else if (operation === "page") value = {items: Array.isArray(v?.items) ? v.items.map(projectFile) : null, next_marker: v?.next_marker};
 					else if (operation === "download") value = {url: v?.url || v?.encrypt_url, method: "GET"};
-					else if (operation === "trash") value = projectFile(v) || {};
+					else if (operation === "trash") value = {...projectFile(v), async_task_id: v?.async_task_id};
 					else if (v && typeof v === "object") value = {...projectFile(v), name: v.name || v.file_name,
 						file_name: v.file_name || v.name, exist: v.exist, upload_id: v.upload_id, available: v.available,
 						rapid_upload: v.rapid_upload, async_task_id: v.async_task_id,
@@ -174,6 +180,20 @@ func (a WebsiteAccount) Open(ctx context.Context, rootID, rootPath string, clien
 	return &websiteDriver{d}, root, nil
 }
 
+// OpenBound reopens a saved directory with its account and resource-drive
+// identity. A nil write configuration selects read-only access. The caller
+// retains release on failure.
+func (a WebsiteAccount) OpenBound(ctx context.Context, accountID, driveID, rootID string, write *WebsiteWriteOptions, client *http.Client, release func() error) (core.Driver, error) {
+	if a.ID != accountID || a.ResourceDrive != driveID {
+		return nil, core.Fail(core.UpstreamAccessDenied, ErrWebsiteBindingMismatch)
+	}
+	if write != nil {
+		return a.OpenWritable(ctx, rootID, *write, client, release)
+	}
+	d, _, err := a.Open(ctx, rootID, "", client, release)
+	return d, err
+}
+
 func (a WebsiteAccount) open(ctx context.Context, rootID, rootPath string, client *http.Client, release func() error) (*Driver, string, error) {
 	if a.website.Call == nil || a.ID == "" || a.ResourceDrive == "" || (rootID == "") == (rootPath == "") {
 		return nil, "", core.Fail(core.InvalidRequest, nil)
@@ -189,41 +209,40 @@ func (a WebsiteAccount) open(ctx context.Context, rootID, rootPath string, clien
 		client:  isolatedClient(client),
 		website: &a.website,
 	}
-	if rootPath != "" {
-		root, err := d.resolveFolder(ctx, rootPath)
+	switch {
+	case rootPath != "":
+		root, err := d.resolve(ctx, rootPath)
 		if err != nil {
 			return nil, "", err
 		}
+		if root.Type != "folder" {
+			return nil, "", core.Fail(core.NotDirectory, nil)
+		}
 		rootID = root.ID
+	case rootID != "root":
+		if err := a.checkRootIdentity(ctx, rootID); err != nil {
+			return nil, "", err
+		}
 	}
 	d.opts.RootID = rootID
-	if err := d.checkWebsiteRoot(ctx, rootID, rootPath != ""); err != nil {
+	if _, _, err := d.page(ctx, rootID, "", 1); err != nil {
 		return nil, "", err
 	}
 	return d, rootID, nil
 }
 
-func (d *Driver) websiteFile(ctx context.Context, id string) (nativeFile, error) {
-	var f nativeFile
-	err := d.website.request(ctx, "file", map[string]string{"drive_id": d.opts.DriveID, "file_id": id}, &f)
-	if err == nil && (f.ID != id || f.Drive != d.opts.DriveID) {
-		err = core.Fail(core.InvalidUpstreamResponse, nil)
+func (a WebsiteAccount) checkRootIdentity(ctx context.Context, rootID string) error {
+	var root nativeFile
+	if err := a.website.request(ctx, "file", map[string]string{"drive_id": a.ResourceDrive, "file_id": rootID}, &root); err != nil {
+		return err
 	}
-	return f, err
-}
-
-func (d *Driver) checkWebsiteRoot(ctx context.Context, rootID string, resolvedByPath bool) error {
-	if !resolvedByPath && rootID != "root" {
-		root, err := d.websiteFile(ctx, rootID)
-		if err != nil {
-			return err
-		}
-		if root.Type != "folder" {
-			return core.Fail(core.NotDirectory, nil)
-		}
+	if root.Drive != a.ResourceDrive || root.ID != rootID {
+		return core.Fail(core.InvalidUpstreamResponse, nil)
 	}
-	_, _, err := d.page(ctx, rootID, "", 1)
-	return err
+	if root.Type != "folder" {
+		return core.Fail(core.NotDirectory, nil)
+	}
+	return nil
 }
 
 // CheckRoot verifies a second folder using a retained session, without owning it.
@@ -231,6 +250,12 @@ func (a WebsiteAccount) CheckRoot(ctx context.Context, rootID string) error {
 	if a.website.Call == nil || a.ResourceDrive == "" || rootID == "" {
 		return core.Fail(core.InvalidRequest, nil)
 	}
+	if rootID != "root" {
+		if err := a.checkRootIdentity(ctx, rootID); err != nil {
+			return err
+		}
+	}
 	d := &Driver{opts: Options{DriveID: a.ResourceDrive}, website: &a.website}
-	return d.checkWebsiteRoot(ctx, rootID, false)
+	_, _, err := d.page(ctx, rootID, "", 1)
+	return err
 }

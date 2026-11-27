@@ -36,6 +36,7 @@ type Driver struct {
 	limit          int64
 	closed         atomic.Bool
 	cleanup        httpcontent.ResponseCleanup
+	website        *websiteAccess
 }
 
 // Open verifies the account root or the selected native directory.
@@ -176,7 +177,11 @@ func responseError(status int) error {
 // Close retries internal response cleanup. HTTP clients remain host-owned.
 func (d *Driver) Close() error {
 	d.closed.Store(true)
-	return d.cleanup.Retry()
+	err := d.cleanup.Retry()
+	if d.website != nil {
+		return errors.Join(err, d.website.close())
+	}
+	return err
 }
 
 var _ core.Driver = (*Driver)(nil)

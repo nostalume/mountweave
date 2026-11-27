@@ -67,7 +67,7 @@ func (d *Driver) Remove(ctx context.Context, relAddress core.NativeAddress, poli
 	if len(policies) == 1 {
 		options = policies[0]
 	}
-	if relAddress.Namespace() != core.TreeNamespace || !options.When.Empty() {
+	if relAddress.Namespace() != core.TreeNamespace || !options.When.Empty() || options.Disposition != "" {
 		return change, core.Fail(core.UnsupportedOperation, nil)
 	}
 	parent, name, err := d.openParent(ctx, relAddress.Value())
@@ -76,6 +76,14 @@ func (d *Driver) Remove(ctx context.Context, relAddress core.NativeAddress, poli
 	}
 	defer func() { err = errors.Join(err, d.closeFile(parent)) }()
 	return d.removeWith(ctx, parent, name, options)
+}
+
+func (d *Driver) RemoveWithDisposition(ctx context.Context, target core.NativeAddress, options core.RemoveOptions) (core.Change, error) {
+	if options.Disposition != core.RemovePermanent {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	options.Disposition = ""
+	return d.Remove(ctx, target, options)
 }
 
 func (d *Driver) Create(ctx context.Context, relAddress core.NativeAddress, input io.Reader, length *int64) (core.Change, error) {

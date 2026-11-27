@@ -15,17 +15,18 @@ import (
 )
 
 type item struct {
-	meta      core.Metadata
-	ID        nativeID `json:"fid"`
-	Parent    nativeID `json:"pid"`
-	Name      string   `json:"fn"`
-	Category  string   `json:"fc"`
-	Pick      string   `json:"pc"`
-	Size      *int64   `json:"fs"`
-	Encrypted *int     `json:"isp"`
-	State     string   `json:"aid"`
-	Uploaded  string   `json:"fta"`
-	Modified  *int64   `json:"upt"`
+	meta          core.Metadata
+	websiteOffset int64
+	ID            nativeID `json:"fid"`
+	Parent        nativeID `json:"pid"`
+	Name          string   `json:"fn"`
+	Category      string   `json:"fc"`
+	Pick          string   `json:"pc"`
+	Size          *int64   `json:"fs"`
+	Encrypted     *int     `json:"isp"`
+	State         string   `json:"aid"`
+	Uploaded      string   `json:"fta"`
+	Modified      *int64   `json:"upt"`
 }
 
 func (f *item) prepare() error {
@@ -99,17 +100,25 @@ type page struct {
 }
 
 func (d *Driver) readPage(ctx context.Context, parent string, offset int64, n int) (page, error) {
+	if d.website != nil {
+		return d.website.readPage(ctx, parent, offset, min(n, 1150))
+	}
 	var p page
 	q := url.Values{"cid": {parent}, "offset": {strconv.FormatInt(offset, 10)}, "limit": {strconv.Itoa(min(n, 1150))}, "cur": {"1"}, "show_dir": {"1"}, "o": {"file_name"}, "asc": {"1"}, "custom_order": {"1"}}
 	if err := d.call(ctx, "GET", "/open/ufile/files", q, nil, &p); err != nil {
 		return p, err
 	}
+	return preparePage(p, parent, offset)
+}
+
+func preparePage(p page, parent string, offset int64) (page, error) {
 	if string(p.ID) != parent || p.Data == nil || p.Count == nil || p.Offset == nil || p.Limit == nil || *p.Offset != offset || *p.Limit < 1 || *p.Limit > 1150 || *p.Count < offset || int64(len(p.Data)) > *p.Limit || int64(len(p.Data)) > *p.Count-offset {
 		return p, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid native directory page"))
 	}
 	if p.State != "" && p.State != "1" {
 		return p, core.Fail(core.UpstreamAccessDenied, errors.New("directory is not active"))
 	}
+	p.readable = p.readable || parent == "0" || len(p.Data) != 0
 	for _, a := range p.Path {
 		if a.Encrypted != nil && *a.Encrypted != 0 {
 			return p, core.Fail(core.UnsupportedOperation, errors.New("encrypted directory contents are not available"))
@@ -117,9 +126,6 @@ func (d *Driver) readPage(ctx context.Context, parent string, offset int64, n in
 		if string(a.ID) == parent && a.Encrypted != nil {
 			p.readable = true
 		}
-	}
-	if parent == "0" || len(p.Data) != 0 {
-		p.readable = true
 	}
 	if len(p.Data) == 0 && offset < *p.Count {
 		return p, core.Fail(core.InvalidUpstreamResponse, errors.New("native page cannot advance"))

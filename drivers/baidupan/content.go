@@ -25,7 +25,7 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 	if selectionErr != nil && core.CodeOf(selectionErr) != core.PreconditionFailed {
 		return core.Opened{}, selectionErr
 	}
-	full, err := d.address(p)
+	full, err := rootedPath(d.root, p)
 	if err != nil {
 		return core.Opened{}, err
 	}

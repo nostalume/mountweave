@@ -454,6 +454,13 @@
 // recursive or delayed-success fallback. S3 and Alipan read scopes remain read-only;
 // their default Discovered removal is unsupported. Pool supplies ChildRemover.
 //
+// Core.Remove accepts a disposition for one entry. RemoveTrash requires a
+// confirmed move to the source's Trash. RemovePermanent requests direct removal
+// without a Trash entry and requires PurgeAction. Explicit calls require the
+// optional DispositionRemover and preserve native type and condition constraints.
+// With no disposition, Remove uses the source's ordinary behavior. RemoveTree
+// and protocol removal use that ordinary behavior.
+//
 // Explicit DirectoryRemoveOptions{Scope: Subtree} requires RemoveTreeAction on
 // the target, including its physical alias target. That grant authorizes subtree
 // traversal and deletion, including newly added descendants; an entry's ordinary

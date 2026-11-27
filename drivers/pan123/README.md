@@ -38,7 +38,7 @@ selected file before its independent HTTPS body is read.
 
 ## Website connection
 
-`pan123.OpenWebsite` mounts a read-only folder from a protected website session.
+`pan123.OpenWebsite` mounts a verified folder from a protected website session.
 Provide the account, the folder path and the session. A saved `RootID` verifies
 the same folder after reopening. The optional `pan123/cdp` module observes the
 site's directory pages and ordinary download receipts in a dedicated browser
@@ -49,6 +49,13 @@ content client reads the original over HTTPS, separately from the browser
 account, and verifies the listed length and any actual byte-range receipt.
 An expired sign-in requires reconnecting the original account. Availability
 depends on the site's ordinary download eligibility for the selected file.
+
+The browser adapter checks a fresh record for the selected file ID before
+sending one mutation and confirms the same ID afterward. Exact file rename
+works within the original directory and refuses an existing name. A directory
+destination allows the website to choose an available name when moving a file.
+The Driver returns the confirmed name in that directory. Single-file removal
+sends the file to the recycle bin and verifies its trash flag.
 
 ## Existing file API and cost
 

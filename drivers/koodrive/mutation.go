@@ -27,16 +27,9 @@ func (d *Driver) Mkdir(ctx context.Context, address core.NativeAddress) (change 
 		change.Before = core.TargetPresent
 		return change, core.Fail(core.AlreadyExists, nil)
 	}
-	name := path.Base(address.Value())
-	if !validMutationName(name) {
-		return change, core.Fail(core.UnrepresentableName, nil)
-	}
-	parent, err := d.resolve(ctx, core.NativePath(path.Dir(address.Value())))
+	parent, name, err := d.mutationTarget(ctx, address.Value())
 	if err != nil {
 		return change, err
-	}
-	if parent.meta.Kind != core.Directory {
-		return change, core.Fail(core.NotDirectory, nil)
 	}
 	fields := struct {
 		Container string   `json:"containerId"`
@@ -45,19 +38,12 @@ func (d *Driver) Mkdir(ctx context.Context, address core.NativeAddress) (change 
 		Type      string   `json:"fileType"`
 		MIME      string   `json:"mimeType"`
 		Rename    int      `json:"renameMode"`
-	}{d.container, []string{d.parentParameter(parent.ID)}, name, "10", folderMIME, 3}
+	}{d.container, []string{d.parentParameter(parent)}, name, "10", folderMIME, 3}
 	response, change, err := d.beginMutation(ctx, "/directory", fields)
 	if err != nil {
 		return change, err
 	}
 	defer func() { err = errors.Join(err, d.cleanup.CloseBody(response.Body), ctx.Err()) }()
-	var refusal error
-	if response.StatusCode != http.StatusOK {
-		refusal = statusError(response.StatusCode)
-		if response.StatusCode != http.StatusConflict {
-			return change, refusal
-		}
-	}
 	var receipt struct {
 		result
 		ID       string `json:"id"`
@@ -65,8 +51,9 @@ func (d *Driver) Mkdir(ctx context.Context, address core.NativeAddress) (change 
 		Name     string `json:"fileName"`
 		MIME     string `json:"mimeType"`
 	}
-	if err := httpcontent.DecodeJSON(response, d.limit, &receipt); err != nil {
-		return change, errors.Join(refusal, err)
+	refusal, err := d.decodeMutationReceipt(response, &receipt)
+	if err != nil {
+		return change, err
 	}
 	if receipt.Existing != "" {
 		if receipt.ID != "" && receipt.ID != receipt.Existing || receipt.Name != "" && receipt.Name != name {
@@ -77,14 +64,38 @@ func (d *Driver) Mkdir(ctx context.Context, address core.NativeAddress) (change 
 	if err := errors.Join(refusal, receipt.result.check()); err != nil {
 		return change, err
 	}
-	if receipt.ID == "" || receipt.ID == parent.ID || receipt.ID == d.root || receipt.Name != name || receipt.MIME != folderMIME {
+	if receipt.ID == "" || receipt.ID == parent || receipt.ID == d.root || receipt.Name != name || receipt.MIME != folderMIME {
 		return change, core.Fail(core.InvalidUpstreamResponse, errors.New("KooDrive did not confirm the exact new directory"))
 	}
 	return core.Change{Effect: core.Applied, Before: core.TargetMissing}, nil
 }
 
-func validMutationName(name string) bool {
-	return !strings.ContainsAny(name, `<>|:\"*?`) && utf8.RuneCountInString(name) <= 250
+func (d *Driver) mutationTarget(ctx context.Context, target string) (parentID, name string, err error) {
+	name = path.Base(target)
+	if strings.ContainsAny(name, `<>|:\"*?`) || utf8.RuneCountInString(name) > 250 {
+		return "", "", core.Fail(core.UnrepresentableName, nil)
+	}
+	parent, err := d.resolve(ctx, core.NativePath(path.Dir(target)))
+	if err != nil {
+		return "", "", err
+	}
+	if parent.meta.Kind != core.Directory {
+		return "", "", core.Fail(core.NotDirectory, nil)
+	}
+	return parent.ID, name, nil
+}
+
+func (d *Driver) decodeMutationReceipt(response *http.Response, receipt any) (refusal, err error) {
+	if response.StatusCode != http.StatusOK {
+		refusal = statusError(response.StatusCode)
+		if response.StatusCode != http.StatusConflict {
+			return nil, refusal
+		}
+	}
+	if err := httpcontent.DecodeJSON(response, d.limit, receipt); err != nil {
+		return nil, errors.Join(refusal, err)
+	}
+	return refusal, nil
 }
 
 func (d *Driver) beginMutation(ctx context.Context, route string, fields any) (*http.Response, core.Change, error) {

@@ -494,3 +494,127 @@ func TestMutationAuthRejectionRefreshesWithoutReplay(t *testing.T) {
 		t.Fatal(change, err, creates, refreshes)
 	}
 }
+
+func TestWebsiteFileChanges(t *testing.T) {
+	ctx := context.Background()
+	entries := map[string]*idEntry{
+		"scope":   {id: "scope", parent: "root", name: "scope", kind: "folder"},
+		"staging": {id: "staging", parent: "root", name: "staging", kind: "folder"},
+		"folder":  {id: "folder", parent: "scope", name: "folder", kind: "folder"},
+		"file":    {id: "file", parent: "scope", name: "old", kind: "file", size: 4},
+		"peer":    {id: "peer", parent: "folder", name: "peer", kind: "file"},
+	}
+	var moves, trashes, absentReads int
+	web := driver.Website{
+		Release: func() error { return nil },
+		Call: func(_ context.Context, _ string, raw json.RawMessage) (json.RawMessage, error) {
+			var request struct {
+				Operation string         `json:"operation"`
+				Data      map[string]any `json:"data"`
+			}
+			if err := json.Unmarshal(raw, &request); err != nil {
+				t.Fatal(err)
+			}
+			in := request.Data
+			var value any
+			switch request.Operation {
+			case "account":
+				value = map[string]string{"user_id": "owner", "resource_drive_id": "drive"}
+			case "file":
+				entry := entries[in["file_id"].(string)]
+				if entry == nil {
+					absentReads++
+					return json.RawMessage(`{"status":404}`), nil
+				}
+				value = entry.metadata()
+			case "page":
+				page := []any{}
+				for _, e := range entries {
+					if e.parent == in["parent_file_id"] {
+						page = append(page, e.metadata())
+					}
+				}
+				value = map[string]any{"items": page}
+			case "create":
+				e := &idEntry{id: "new-id", parent: "staging", name: in["name"].(string), kind: "file"}
+				entries[e.id] = e
+				out := e.metadata()
+				out["file_name"], out["available"] = e.name, true
+				value = out
+			case "move":
+				moves++
+				id := in["file_id"].(string)
+				e, parent, name := entries[id], in["to_parent_file_id"].(string), in["new_name"].(string)
+				if e == nil || in["drive_id"] != "drive" || in["to_drive_id"] != "drive" || in["type"] != "file" ||
+					in["file_name"] != e.name || in["check_name_mode"] != "refuse" {
+					t.Fatalf("invalid move request: %v", in)
+				}
+				for _, other := range entries {
+					if other.parent == parent && other.name == name {
+						return json.RawMessage(`{"value":{"exist":true}}`), nil
+					}
+				}
+				if name == "unknown" {
+					return json.RawMessage(`{"value":{"drive_id":"drive","file_id":"peer"}}`), nil
+				}
+				e.parent, e.name = parent, name
+				if name == "moved" {
+					return nil, io.ErrUnexpectedEOF
+				}
+				out := e.metadata()
+				out["file_name"] = e.name
+				value = out
+			case "trash":
+				trashes++
+				if in["drive_id"] != "drive" || in["file_id"] != "file" {
+					t.Fatalf("invalid trash request: %v", in)
+				}
+				delete(entries, "file")
+				value = map[string]string{"async_task_id": "recycle"}
+			default:
+				t.Fatalf("unexpected website operation: %s", request.Operation)
+			}
+			return json.Marshal(map[string]any{"value": value})
+		},
+	}
+	account, err := web.Account(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := account.OpenWritable(ctx, "scope", driver.WebsiteWriteOptions{StagingRootID: "staging", PartSize: 3, MaxBufferedBytes: 3}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := testCore(t)
+	if _, err := c.Install("/cloud", d); err != nil {
+		t.Fatal(err)
+	}
+	checkMove := func(from, to string, effect core.Effect, code core.Code) {
+		t.Helper()
+		result, err := c.Move(ctx, "writer", core.Path("/cloud/"+from), core.Path("/cloud/"+to))
+		if result.Source.Effect != effect || result.Target.Effect != effect || core.CodeOf(err) != code {
+			t.Fatalf("move %s to %s: %+v, %v", from, to, result, err)
+		}
+	}
+	checkMove("old", "renamed", core.Applied, core.CodeOf(nil))
+	checkMove("renamed", "folder/peer", core.Unchanged, core.AlreadyExists)
+	checkMove("renamed", "folder/moved", core.Applied, core.CodeOf(nil))
+	checkMove("folder/moved", "unknown", core.Unknown, core.InvalidUpstreamResponse)
+	checkMove("folder", "another-folder", core.Unchanged, core.UnsupportedOperation)
+	typed := core.RemoveOptions{Target: core.RemoveNonDirectory}
+	if got, err := c.Remove(ctx, "writer", core.Path("/cloud/folder"), typed); got.Effect != core.Unchanged || core.CodeOf(err) != core.UnsupportedOperation {
+		t.Fatalf("wrong type: %+v, %v", got, err)
+	}
+	typed.Disposition = core.RemoveTrash
+	if got, err := c.Remove(ctx, "writer", core.Path("/cloud/folder/moved"), typed); got.Effect != core.Applied || err != nil {
+		t.Fatalf("recycle: %+v, %v", got, err)
+	}
+	var empty int64
+	if got, err := c.Write(ctx, "writer", core.Path("/cloud/created"), strings.NewReader(""), &empty); got.Effect != core.Applied || err != nil {
+		t.Fatalf("create: %+v, %v", got, err)
+	}
+	if created := entries["new-id"]; moves != 5 || trashes != 1 || absentReads != 1 || entries["file"] != nil ||
+		entries["peer"].name != "peer" || created.parent != "scope" || created.name != "created" {
+		t.Fatalf("unexpected final state: %d moves, %d trash, %d missing-ID checks, created=%+v", moves, trashes, absentReads, created)
+	}
+}

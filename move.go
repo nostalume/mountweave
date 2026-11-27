@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 )
 
 // Relocator atomically moves an admitted regular file or directory without
@@ -16,6 +17,14 @@ import (
 // Source and target belong to the same installed Driver and an existing parent.
 type Relocator interface {
 	Relocate(context.Context, NativeAddress, NativeAddress, ...MoveOptions) (Change, error)
+}
+
+// DirectoryRelocator atomically moves one item into an existing directory.
+// The driver binds the source and parent at commit, prefers the source name,
+// preserves existing children, and returns the confirmed direct-child name
+// with Applied. It reports unsupported modes before changing either side.
+type DirectoryRelocator interface {
+	RelocateInto(context.Context, NativeAddress, NativeAddress) (string, Change, error)
 }
 
 type MoveOptions struct {
@@ -44,10 +53,16 @@ func (o MoveOptions) validate() error {
 type MoveResult struct {
 	Source Change
 	Target Change
+	// Destination is the confirmed path chosen for a directory-target move.
+	Destination Address
 	// Removed records a separately confirmed target-removal phase. It never
 	// claims that the later source relocation or target creation succeeded.
 	Removed *TreeResult
 	Tree    *TreeResult // Attempted phases of a cross-mount directory move.
+}
+
+func (r MoveResult) uncertain() bool {
+	return r.Source.Effect == Unknown || r.Target.Effect == Unknown || r.Removed != nil && r.Removed.Change.Effect == Unknown
 }
 
 // Move renames or moves a file or directory. The zero policy never replaces.
@@ -64,9 +79,7 @@ func (c *Core) Move(ctx context.Context, p Principal, source, target Address, po
 	if err != nil {
 		return result, err
 	}
-	defer func() {
-		turn.finish(result.Source.Effect == Unknown || result.Target.Effect == Unknown || result.Removed != nil && result.Removed.Change.Effect == Unknown)
-	}()
+	defer func() { turn.finish(result.uncertain()) }()
 	if len(policies) > 1 {
 		return result, Fail(InvalidRequest, nil)
 	}
@@ -108,6 +121,104 @@ func (c *Core) Move(ctx context.Context, p Principal, source, target Address, po
 		return result, fmt.Errorf("target: %w", err)
 	}
 	return c.moveUses(ctx, p, from, to, policy)
+}
+
+// MoveInto moves one item into a mounted directory. The requested directory
+// stays fixed; the resulting leaf name is returned in Destination. Cross-mount
+// directory moves use the optional tree budgets, as in Move.
+func (c *Core) MoveInto(ctx context.Context, p Principal, source, directory Address, trees ...TreeOptions) (result MoveResult, err error) {
+	result = MoveResult{Source: Change{Effect: Unchanged}, Target: Change{Effect: Unchanged}}
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer func() { turn.finish(result.uncertain()); err = observedCause(ctx, err) }()
+	var options MoveOptions
+	if len(trees) > 1 {
+		return result, Fail(InvalidRequest, nil)
+	}
+	if len(trees) == 1 {
+		options.Tree = trees[0]
+		if err := options.validate(); err != nil {
+			return result, err
+		}
+	}
+	if c == nil {
+		return result, Fail(InvalidRequest, nil)
+	}
+	if source.Namespace() != TreeNamespace || directory.Namespace() != TreeNamespace {
+		return result, Fail(UnsupportedOperation, nil)
+	}
+	ctx, err = c.selectOperation(ctx, AddressAccess{Address: source, Write: true}, AddressAccess{Address: directory, Write: true})
+	if err != nil {
+		return result, err
+	}
+	if err := c.validateInput(ctx, directory); err != nil {
+		return result, err
+	}
+	from, err := c.beginChange(ctx, p, RemoveAction, source)
+	if err != nil {
+		return result, fmt.Errorf("source: %w", err)
+	}
+	defer from.release()
+	c.mu.Lock()
+	parent, _, err := c.resolveRequestLocked(ctx, directory)
+	c.mu.Unlock()
+	if err != nil {
+		return result, err
+	}
+	if parent == nil {
+		return result, Fail(InvalidRequest, errors.New("a real mounted directory is required"))
+	}
+	sameMount := from.mount == parent.mount
+	if sameMount && (Within(parent.path, from.path) || path.Dir(from.path) == parent.path) {
+		return result, Fail(InvalidRequest, errors.New("the source cannot move into itself or its current directory"))
+	}
+	relocator, ok := from.mount.driver.(DirectoryRelocator)
+	if !sameMount || !ok {
+		return c.moveIntoExact(ctx, p, from, directory, options, result)
+	}
+	to, err := c.admitAt(from.ctx, p, CreateChildAction, parent)
+	if err != nil {
+		return result, fmt.Errorf("target directory: %w", err)
+	}
+	defer to.release()
+	visible := to.visible()
+	room := min(childRoom(visible), childRoom(to.primary()))
+	if room <= 0 {
+		return result, Fail(InvalidPath, nil)
+	}
+	if err := to.ctx.Err(); err != nil {
+		return result, err
+	}
+	name, change, err := relocator.RelocateInto(to.ctx, from.native(), to.native())
+	if change.Effect == Applied {
+		if ValidName(name) && len(name) <= room {
+			result.Destination = Path(childPath(visible, name))
+		} else {
+			change = Change{Effect: Unknown}
+			err = errors.Join(err, Fail(InvalidUpstreamResponse, errors.New("relocation returned an invalid child name")))
+		}
+	}
+	change, err = c.finishRelocation(to, change, err)
+	result.Source, result.Target = relocationEffects(change)
+	return result, err
+}
+
+func (c *Core) moveIntoExact(ctx context.Context, p Principal, from *use, directory Address, options MoveOptions, result MoveResult) (MoveResult, error) {
+	child, err := c.availableChild(from.ctx, p, directory, path.Base(from.path))
+	if err != nil {
+		return result, err
+	}
+	to, err := c.beginChangeAt(from.ctx, p, CreateAction, child)
+	if err != nil {
+		return result, err
+	}
+	result, err = c.moveUses(ctx, p, from, to, options)
+	if result.Target.Effect == Applied || result.Target.Effect == Incomplete {
+		result.Destination = child.address()
+	}
+	return result, err
 }
 
 func (c *Core) moveAt(ctx context.Context, p Principal, source, target *location, options MoveOptions) (result MoveResult, err error) {
@@ -193,19 +304,29 @@ func (c *Core) relocate(from, to *use, options MoveOptions) (result MoveResult, 
 		return MoveResult{Source: Change{Effect: Unchanged}, Target: Change{Effect: Unchanged}}, err
 	}
 	change, err := mover.Relocate(from.ctx, from.native(), to.native(), options)
+	change, err = c.finishRelocation(from, change, err)
+	result.Source, result.Target = relocationEffects(change)
+	return result, err
+}
+
+func (c *Core) finishRelocation(u *use, change Change, err error) (Change, error) {
 	if change.Effect == Incomplete {
 		change.Effect = Unknown
 		err = errors.Join(err, Fail(InvalidUpstreamResponse, errors.New("atomic relocation reported partial effects")))
 	}
-	change, err = c.finishChange(from, change, err)
-	result.Source, result.Target = change, change
-	result.Source.Evidence = Evidence{}
-	result.Source.Before = TargetUnknown
-	if result.Target.Effect == Applied {
-		result.Target.Before = TargetMissing
-	}
+	change, err = c.finishChange(u, change, err)
 	if err != nil {
 		err = fmt.Errorf("relocate: %w", err)
 	}
-	return result, err
+	return change, err
+}
+
+func relocationEffects(change Change) (source, target Change) {
+	source, target = change, change
+	source.Evidence = Evidence{}
+	source.Before = TargetUnknown
+	if target.Effect == Applied {
+		target.Before = TargetMissing
+	}
+	return source, target
 }

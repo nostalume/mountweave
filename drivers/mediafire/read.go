@@ -21,8 +21,11 @@ type item struct {
 	FolderKey, QuickKey, Name, Filename string
 	ParentKey                           string `json:"parent_folderkey"`
 	Size                                json.Number
-	key                                 string
-	meta                                core.Metadata
+	Links                               struct {
+		NormalDownload string `json:"normal_download"`
+	}
+	key  string
+	meta core.Metadata
 }
 
 type listing struct {
@@ -42,16 +45,15 @@ func (s *listing) next(ctx context.Context) ([]item, error) {
 	if s.files {
 		kind = "files"
 	}
-	response, err := s.d.call(ctx, "folder/get_content", url.Values{
-		"folder_key": {s.parent}, "content_type": {kind}, "chunk": {strconv.FormatInt(s.chunk, 10)},
-		"chunk_size": {strconv.Itoa(chunkSize)},
-	})
+	request := WebsiteListRequest{FolderKey: s.parent, ContentType: kind, Chunk: s.chunk, ChunkSize: chunkSize}
+	response, err := s.d.listContent(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	page := response.FolderContent
 	chunk, err := page.Chunk.Int64()
 	if err != nil || chunk != s.chunk || page.Type != kind || page.More != "yes" && page.More != "no" ||
+		s.d.website != nil && page.FolderKey != s.parent ||
 		s.files && len(page.Folders) != 0 || !s.files && len(page.Files) != 0 {
 		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("MediaFire returned an invalid content chunk"))
 	}
@@ -94,6 +96,16 @@ func (s *listing) next(ctx context.Context) ([]item, error) {
 	return items, io.EOF
 }
 
+func (d *Driver) listContent(ctx context.Context, request WebsiteListRequest) (receipt, error) {
+	if d.website != nil {
+		return d.listWebsite(ctx, request)
+	}
+	return d.call(ctx, "folder/get_content", url.Values{
+		"folder_key": {request.FolderKey}, "content_type": {request.ContentType},
+		"chunk": {strconv.FormatInt(request.Chunk, 10)}, "chunk_size": {strconv.Itoa(request.ChunkSize)},
+	})
+}
+
 func (d *Driver) lookup(ctx context.Context, a core.NativeAddress) (item, error) {
 	if err := d.active(ctx); err != nil {
 		return item{}, err
@@ -112,19 +124,24 @@ func (d *Driver) lookup(ctx context.Context, a core.NativeAddress) (item, error)
 		if current.meta.Kind != core.Directory {
 			return item{}, core.Fail(core.NotDirectory, nil)
 		}
-		scan := listing{d: d, parent: current.key, chunk: 1}
-		found, exists, err := childscan.Unique(ctx, name, scan.next, func(f item) (string, string) {
-			return string(f.meta.Kind) + ":" + f.key, f.meta.Name
-		})
+		var err error
+		current, err = d.child(ctx, current.key, name)
 		if err != nil {
 			return item{}, err
 		}
-		if !exists {
-			return item{}, core.Fail(core.NotFound, nil)
-		}
-		current = found
 	}
 	return current, nil
+}
+
+func (d *Driver) child(ctx context.Context, parent, name string) (item, error) {
+	scan := listing{d: d, parent: parent, chunk: 1}
+	found, exists, err := childscan.Unique(ctx, name, scan.next, func(f item) (string, string) {
+		return string(f.meta.Kind) + ":" + f.key, f.meta.Name
+	})
+	if err == nil && !exists {
+		err = core.Fail(core.NotFound, nil)
+	}
+	return found, err
 }
 
 func (d *Driver) Stat(ctx context.Context, a core.NativeAddress, selections ...core.ReadSelection) (core.Metadata, error) {
@@ -190,12 +207,18 @@ func (d *Driver) Open(ctx context.Context, a core.NativeAddress, o core.OpenOpti
 	if o.Mode != core.StreamRead || o.NoFollow || o.Selection.Version != "" || !o.Selection.When.Empty() {
 		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
 	}
+	if d.website != nil && o.Range != nil {
+		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+	}
 	f, err := d.lookup(ctx, a)
 	if err != nil {
 		return core.Opened{}, err
 	}
 	if f.meta.Kind != core.File {
 		return core.Opened{}, core.Fail(core.NotFile, nil)
+	}
+	if d.website != nil {
+		return d.downloadWebsite(ctx, f)
 	}
 	target, err := d.directDownload(ctx, f.key)
 	if err != nil {

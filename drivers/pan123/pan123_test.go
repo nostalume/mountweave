@@ -117,6 +117,109 @@ func TestWebsiteMountBindsAccountDirectoryAndBody(t *testing.T) {
 	}
 }
 
+type websiteMutationFixture struct {
+	*websiteFixture
+	calls int
+	moved bool
+}
+
+func (s *websiteMutationFixture) List(ctx context.Context, parent, cursor string) (WebsitePage, error) {
+	if parent == "2" && cursor == "" && s.moved {
+		return WebsitePage{Account: s.account, Items: []WebsiteItem{
+			{ID: "3", ParentID: parent, Name: "original", Size: 8},
+			{ID: "9007199254740993", ParentID: parent, Name: "original (1)", Size: 6},
+		}}, nil
+	}
+	return s.websiteFixture.List(ctx, parent, cursor)
+}
+
+func (s *websiteMutationFixture) Move(_ context.Context, parent string, file WebsiteFile, directory string) (string, core.Change, error) {
+	if err := s.checkMutation(parent, file); err != nil || directory != "2" {
+		return "", core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, err)
+	}
+	s.moved = true
+	return "original (1)", core.Change{Effect: core.Applied, Before: core.TargetMissing}, nil
+}
+
+func (s *websiteMutationFixture) Rename(_ context.Context, parent string, file WebsiteFile, name string) (core.Change, error) {
+	if err := s.checkMutation(parent, file); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	switch name {
+	case "renamed":
+		return core.Change{Effect: core.Applied}, nil
+	case "occupied":
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.AlreadyExists, nil)
+	default:
+		return core.Change{}, core.Fail(core.UpstreamTimeout, nil)
+	}
+}
+
+func (s *websiteMutationFixture) Recycle(_ context.Context, parent string, file WebsiteFile) (core.Change, error) {
+	if err := s.checkMutation(parent, file); err != nil {
+		return core.Change{Effect: core.Unchanged}, err
+	}
+	return core.Change{Effect: core.Applied}, nil
+}
+
+func (s *websiteMutationFixture) checkMutation(parent string, file WebsiteFile) error {
+	s.calls++
+	if parent != "1" || file != (WebsiteFile{Account: "40", ID: "9007199254740993", Name: "original", Size: 6}) {
+		return errors.New("unexpected website mutation identity")
+	}
+	return nil
+}
+
+func TestWebsiteMutations(t *testing.T) {
+	_, _, c, _, _ := setup(t)
+	ctx := t.Context()
+	site := &websiteMutationFixture{websiteFixture: &websiteFixture{account: "40", size: 6}}
+	d, err := OpenWebsite(ctx, WebsiteOptions{Session: site, Account: "40", RootPath: "/archive", Release: func() error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Install("/site", d); err != nil {
+		t.Fatal(err)
+	}
+	file, dir := core.Path("/site/original"), core.Path("/site/sub")
+	for _, target := range []core.Address{core.Path("/site/sub/original"), core.Path("/site/sub/renamed")} {
+		result, err := c.Move(ctx, "u", file, target)
+		if result.Source.Effect != core.Unchanged || result.Target.Effect != core.Unchanged ||
+			core.CodeOf(err) != core.UnsupportedOperation || site.calls != 0 {
+			t.Fatal("cross-directory move reached dispatch", result, err, site.calls)
+		}
+	}
+	if result, err := c.Move(ctx, "u", dir, core.Path("/site/sub-renamed")); result.Target.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || site.calls != 0 {
+		t.Fatal("directory rename reached dispatch", result, err, site.calls)
+	}
+	if result, err := c.Remove(ctx, "u", dir, core.RemoveOptions{Target: core.RemoveNonDirectory}); result.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || site.calls != 0 {
+		t.Fatal("directory recycle reached dispatch", result, err, site.calls)
+	}
+	if result, err := c.Move(ctx, "u", file, core.Path("/site/occupied")); result.Source.Effect != core.Unchanged ||
+		result.Target.Effect != core.Unchanged || core.CodeOf(err) != core.AlreadyExists {
+		t.Fatal("native name conflict was lost", result, err)
+	}
+	if result, err := c.Move(ctx, "u", file, core.Path("/site/no-reply")); result.Source.Effect != core.Unknown ||
+		result.Target.Effect != core.Unknown || core.CodeOf(err) != core.UpstreamTimeout {
+		t.Fatal("missing native reply changed the effect", result, err)
+	}
+	if result, err := c.Move(ctx, "u", file, core.Path("/site/renamed")); result.Source.Effect != core.Applied ||
+		result.Target.Effect != core.Applied || result.Target.Before != core.TargetMissing || err != nil {
+		t.Fatal("rename did not preserve the native effect", result, err)
+	}
+	if result, err := c.Remove(ctx, "u", file, core.RemoveOptions{Target: core.RemoveNonDirectory}); result.Effect != core.Applied ||
+		err != nil || site.calls != 4 {
+		t.Fatal("file recycle did not preserve the native effect", result, err, site.calls)
+	}
+	result, err := c.MoveInto(ctx, "u", file, dir)
+	if result.Source.Effect != core.Applied || result.Target.Effect != core.Applied ||
+		result.Destination != core.Path("/site/sub/original (1)") || err != nil || site.calls != 5 {
+		t.Fatal("directory move did not return the confirmed allocated name", result, err, site.calls)
+	}
+}
+
 type fixture struct {
 	mu                sync.Mutex
 	mode              string

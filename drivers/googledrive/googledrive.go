@@ -22,6 +22,28 @@ import (
 // ControlHost is the Google Drive account and file API host.
 const ControlHost = "www.googleapis.com"
 
+// OAuth endpoints and the delegated scope for read-only Drive access.
+const (
+	AuthorizeURL  = "https://accounts.google.com/o/oauth2/v2/auth"
+	TokenURL      = "https://oauth2.googleapis.com/token"
+	ReadOnlyScope = "https://" + ControlHost + "/auth/drive.readonly"
+)
+
+// ParseDesktopOAuthClient reads the credentials of a Google Desktop OAuth app.
+// The file's endpoint fields do not select authorization or token recipients.
+func ParseDesktopOAuthClient(data []byte) (id, secret string, err error) {
+	var doc struct {
+		Installed *struct {
+			ID     string `json:"client_id"`
+			Secret string `json:"client_secret"`
+		} `json:"installed"`
+	}
+	if json.Unmarshal(data, &doc) != nil || doc.Installed == nil || strings.TrimSpace(doc.Installed.ID) == "" {
+		return "", "", core.Fail(core.InvalidRequest, nil)
+	}
+	return doc.Installed.ID, doc.Installed.Secret, nil
+}
+
 const endpoint = "https://" + ControlHost + "/drive/v3"
 
 // Account uses a borrowed authenticated client to return the stable account ID

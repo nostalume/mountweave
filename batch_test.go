@@ -79,7 +79,8 @@ func TestBatchStopAndCancellation(t *testing.T) {
 }
 
 func TestBoundedBatches(t *testing.T) {
-	t.Run("alias-conflict-order", func(t *testing.T) {
+	newCopyPair := func(t *testing.T) (*core.Core, *local.Driver, string) {
+		t.Helper()
 		from, to := t.TempDir(), t.TempDir()
 		write(t, from, "a", []byte("payload"))
 		c := copyCore(t, copyPermit)
@@ -92,6 +93,14 @@ func TestBoundedBatches(t *testing.T) {
 			t.Fatal(err)
 		}
 		installCopyMount(t, c, "/from", source)
+		return c, target, to
+	}
+	type outcome struct {
+		rows []core.ItemResult
+		err  error
+	}
+	t.Run("alias-conflict-order", func(t *testing.T) {
+		c, target, to := newCopyPair(t)
 		first, second, duplicate := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		releaseFirst, releaseSecond, secondDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		unblockFirst, unblockSecond := sync.OnceFunc(func() { close(releaseFirst) }), sync.OnceFunc(func() { close(releaseSecond) })
@@ -119,10 +128,6 @@ func TestBoundedBatches(t *testing.T) {
 		}})
 		if err := c.BindAlias(context.Background(), "/alias", m, "/"); err != nil {
 			t.Fatal(err)
-		}
-		type outcome struct {
-			rows []core.ItemResult
-			err  error
 		}
 		done := make(chan outcome, 1)
 		go func() {
@@ -161,18 +166,7 @@ func TestBoundedBatches(t *testing.T) {
 		}
 	})
 	t.Run("cancel-keeps-started-effects", func(t *testing.T) {
-		from, to := t.TempDir(), t.TempDir()
-		write(t, from, "a", []byte("payload"))
-		c := copyCore(t, copyPermit)
-		source, err := local.New(from)
-		if err != nil {
-			t.Fatal(err)
-		}
-		target, err := local.New(to)
-		if err != nil {
-			t.Fatal(err)
-		}
-		installCopyMount(t, c, "/from", source)
+		c, target, to := newCopyPair(t)
 		acknowledged := make(chan struct{}, 2)
 		installCopyMount(t, c, "/to", &copyWriter{Driver: target, create: func(ctx context.Context, name string, input io.Reader, length *int64) (core.Change, error) {
 			change, err := target.Create(ctx, core.NativePath(name), input, length)
@@ -182,10 +176,6 @@ func TestBoundedBatches(t *testing.T) {
 		}})
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		type outcome struct {
-			rows []core.ItemResult
-			err  error
-		}
 		done := make(chan outcome, 1)
 		go func() {
 			rows, err := c.CopyBatch(ctx, "caller", []core.CopyRequest{

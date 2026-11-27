@@ -198,7 +198,7 @@ func (s *directoryScope) RemoveChild(ctx context.Context, name string, options c
 
 func (d *Driver) removeWith(ctx context.Context, parent *os.File, name string, options core.RemoveOptions) (core.Change, error) {
 	unchanged := core.Change{Effect: core.Unchanged}
-	if !options.When.Empty() {
+	if !options.When.Empty() || options.Disposition != "" {
 		return unchanged, core.Fail(core.UnsupportedOperation, nil)
 	}
 	if options.Target != "" && options.Target != core.RemoveNonDirectory && options.Target != core.RemoveEmptyDirectory {

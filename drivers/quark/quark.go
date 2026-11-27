@@ -188,8 +188,8 @@ func (d *Driver) post(ctx context.Context, route string, args, data any) (token 
 }
 
 type entry struct {
-	fid  string
-	meta core.Metadata
+	fid, parent string
+	meta        core.Metadata
 }
 
 type cursor struct {

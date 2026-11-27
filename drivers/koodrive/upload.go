@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"path"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
@@ -34,16 +33,9 @@ func (d *Driver) Create(ctx context.Context, address core.NativeAddress, input i
 		change.Before = core.TargetPresent
 		return change, core.Fail(core.AlreadyExists, nil)
 	}
-	name := path.Base(address.Value())
-	if !validMutationName(name) {
-		return change, core.Fail(core.UnrepresentableName, nil)
-	}
-	parent, err := d.resolve(ctx, core.NativePath(path.Dir(address.Value())))
+	parent, name, err := d.mutationTarget(ctx, address.Value())
 	if err != nil {
 		return change, err
-	}
-	if parent.meta.Kind != core.Directory {
-		return change, core.Fail(core.NotDirectory, nil)
 	}
 	if size == 0 {
 		// A zero-length HTTP request has no body for the transport to read.
@@ -55,7 +47,7 @@ func (d *Driver) Create(ctx context.Context, address core.NativeAddress, input i
 		}
 	}
 
-	receipt, change, err := d.initializeUpload(ctx, parent.ID, name, size)
+	receipt, change, err := d.initializeUpload(ctx, parent, name, size)
 	if err != nil {
 		return change, err
 	}
@@ -124,15 +116,9 @@ func (d *Driver) initializeUpload(ctx context.Context, parent, name string, size
 		return receipt, change, err
 	}
 	defer func() { err = errors.Join(err, d.cleanup.CloseBody(response.Body), ctx.Err()) }()
-	var refusal error
-	if response.StatusCode != http.StatusOK {
-		refusal = statusError(response.StatusCode)
-		if response.StatusCode != http.StatusConflict {
-			return receipt, change, refusal
-		}
-	}
-	if err := httpcontent.DecodeJSON(response, d.limit, &receipt); err != nil {
-		return receipt, change, errors.Join(refusal, err)
+	refusal, err := d.decodeMutationReceipt(response, &receipt)
+	if err != nil {
+		return receipt, change, err
 	}
 	if receipt.Existing != "" {
 		if receipt.ID != "" && receipt.ID != receipt.Existing ||

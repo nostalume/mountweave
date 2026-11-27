@@ -47,3 +47,18 @@ this source's scope.
 
 [Official Guangya Pan Open API v1.3](https://ossdata.guangyapan.com/doc/guangyapan_openapi_cn.md)
 [Official business API reference](https://github.com/guangyapan/agent-skills/blob/master/skills/guangyapan-open-api/references/business-api.md)
+
+## Website connection
+
+`OpenWebsite` mounts a folder from a protected profile signed in to the
+official website. It verifies the account and selected native folder and
+reuses the Open driver's namespace and body checks. The browser obtains the
+ordinary download grant under the account's current website policy. The
+signed HTTPS body request carries no account credentials.
+
+The website connection is a development candidate for browsing, full-file
+reads and exclusive directory creation. It can rename a regular file within
+its current directory or move it into a selected directory. The website may
+choose an available name when moving into a directory. The Driver confirms
+the issued task and original file ID, then returns the actual name. The Open
+API remains the verified connection for byte ranges.

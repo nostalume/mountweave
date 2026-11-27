@@ -307,6 +307,30 @@ func (s *graphProtocol) roundTrip(r *http.Request, api bool) (*http.Response, er
 	}
 	if strings.HasSuffix(route, "/children") {
 		parent := strings.TrimSuffix(route, "/children")
+		if r.Method == http.MethodPost {
+			var q struct {
+				Name     string    `json:"name"`
+				Folder   *struct{} `json:"folder"`
+				Conflict string    `json:"@microsoft.graph.conflictBehavior"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&q); err != nil || parent != "vault" ||
+				r.Header.Get("Content-Type") != "application/json" || q.Folder == nil || q.Conflict != "fail" {
+				return nil, errors.New("incorrect exclusive folder create")
+			}
+			if s.child(parent, q.Name) != nil {
+				return conflict()
+			}
+			if q.Name == "unrelated-conflict" {
+				return reply(r, 409, map[string]any{"error": map[string]string{"code": "resourceModified"}}), nil
+			}
+			created := s.publish(parent, q.Name, nil)
+			created.folder = true
+			metadata := created.metadata()
+			if q.Name == "receipt-wrong-drive" {
+				metadata["parentReference"] = map[string]string{"id": parent, "driveId": "another-drive"}
+			}
+			return reply(r, 201, metadata), nil
+		}
 		var items []*item
 		for _, e := range s.items {
 			if e.parent == parent {
@@ -571,6 +595,10 @@ func TestTypedConstructionAndReadScope(t *testing.T) {
 	apiCalls := s.apiCalls
 	body, size := strings.NewReader("x"), int64(1)
 	address := core.Path("/shared/new")
+	if changed, err := c.Mkdir(ctx, "user", address); changed.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || s.apiCalls != apiCalls {
+		t.Fatalf("shared folder mkdir reached Graph: %+v, %v", changed, err)
+	}
 	for _, policy := range []core.WritePolicy{{}, core.Publish(core.IfAbsent())} {
 		if changed, err := c.Write(ctx, "user", address, body, &size, core.WriteOptions{Policy: policy}); changed.Effect != core.Unchanged ||
 			core.CodeOf(err) != core.UnsupportedOperation || body.Len() != 1 {
@@ -665,6 +693,36 @@ func (r failedTail) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+func TestExclusiveMkdir(t *testing.T) {
+	ctx := t.Context()
+	s := newProtocol()
+	_, c, _ := mount(t, s, func(o *driver.Options) {
+		o.ChunkSize, o.MaxBufferedBytes = 0, 0
+	})
+	for _, tc := range []struct {
+		name   string
+		effect core.Effect
+		before core.TargetPresence
+		code   core.Code
+	}{
+		{"created", core.Applied, core.TargetMissing, core.CodeOf(nil)},
+		{"created", core.Unchanged, core.TargetPresent, core.AlreadyExists},
+		{"A.TXT", core.Unchanged, core.TargetPresent, core.AlreadyExists},
+		{"unrelated-conflict", core.Unchanged, core.TargetUnknown, core.UpstreamFailure},
+		{"receipt-wrong-drive", core.Unknown, core.TargetUnknown, core.InvalidUpstreamResponse},
+	} {
+		requests := s.apiCalls
+		change, err := c.Mkdir(ctx, "user", core.Path("/cloud/"+tc.name))
+		if change.Effect != tc.effect || change.Before != tc.before || core.CodeOf(err) != tc.code || s.apiCalls != requests+1 {
+			t.Fatalf("mkdir %s: %+v %v, Graph requests=%d", tc.name, change, err, s.apiCalls-requests)
+		}
+	}
+	if got := s.child("vault", "a.txt"); got == nil || got.id != "a" || got.folder {
+		t.Fatal("name conflict changed the original file")
+	}
+}
+
 func TestExclusiveWriteAndNativeConfirmation(t *testing.T) {
 	ctx := context.Background()
 	s := newProtocol()

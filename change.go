@@ -49,6 +49,12 @@ type Remover interface {
 	Remove(context.Context, NativeAddress, ...RemoveOptions) (Change, error)
 }
 
+// DispositionRemover opts into explicit removal. It obeys the Remover contract
+// and rejects unsupported dispositions before changing the target.
+type DispositionRemover interface {
+	RemoveWithDisposition(context.Context, NativeAddress, RemoveOptions) (Change, error)
+}
+
 type RemoveTarget string
 
 const (
@@ -56,10 +62,19 @@ const (
 	RemoveEmptyDirectory RemoveTarget = "empty_directory"
 )
 
+type RemoveDisposition string
+
+const (
+	RemoveTrash     RemoveDisposition = "trash"
+	RemovePermanent RemoveDisposition = "permanent"
+)
+
 type RemoveOptions struct {
 	When Condition `json:"when"`
 	// Target constrains the native deletion. Zero allows either kind.
 	Target RemoveTarget `json:"target,omitempty"`
+	// Disposition selects strict removal. Zero uses the source's ordinary removal.
+	Disposition RemoveDisposition `json:"disposition,omitempty"`
 }
 
 func (c *Core) Mkdir(ctx context.Context, p Principal, target Address) (result Change, err error) {
@@ -115,7 +130,15 @@ func (c *Core) Remove(ctx context.Context, p Principal, target Address, policies
 	if err := policy.When.Validate(); err != nil {
 		return Change{Effect: Unchanged}, err
 	}
-	u, err := c.beginChange(ctx, p, RemoveAction, target)
+	action := RemoveAction
+	switch policy.Disposition {
+	case "", RemoveTrash:
+	case RemovePermanent:
+		action = PurgeAction
+	default:
+		return result, Fail(InvalidRequest, nil)
+	}
+	u, err := c.beginChange(ctx, p, action, target)
 	return c.removeUse(u, policy, err)
 }
 
@@ -129,6 +152,17 @@ func (c *Core) removeUse(u *use, options RemoveOptions, err error) (Change, erro
 		return Change{Effect: Unchanged}, err
 	}
 	defer u.release()
+	if options.Disposition != "" {
+		remover, ok := u.mount.driver.(DispositionRemover)
+		if !ok {
+			return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)
+		}
+		if err = u.ctx.Err(); err != nil {
+			return Change{Effect: Unchanged}, err
+		}
+		result, err := remover.RemoveWithDisposition(u.ctx, u.native(), options)
+		return c.finishChange(u, result, err)
+	}
 	remover, ok := u.mount.driver.(Remover)
 	if !ok {
 		return Change{Effect: Unchanged}, Fail(UnsupportedOperation, nil)

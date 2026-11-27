@@ -39,6 +39,12 @@ func (f item) metadata() core.Metadata {
 }
 
 func (d *Driver) page(ctx context.Context, parent string, index int64) ([]item, int64, error) {
+	if d.website != nil {
+		if err := d.check(ctx); err != nil {
+			return nil, 0, err
+		}
+		return d.website.page(ctx, parent, index)
+	}
 	q := url.Values{"page": {strconv.FormatInt(index, 10)}, "pageSize": {strconv.Itoa(nativePageSize)},
 		"orderBy": {"0"}, "sortType": {"0"}}
 	if parent != "" {
@@ -80,12 +86,16 @@ func (i *iterator) next(ctx context.Context) ([]item, error) {
 	if err != nil {
 		return nil, err
 	}
-	remaining := max(0, total-i.index*nativePageSize)
-	if int64(len(entries)) != min(remaining, nativePageSize) {
+	pageSize := int64(nativePageSize)
+	if i.d.website != nil {
+		pageSize = websitePageSize
+	}
+	remaining := max(0, total-i.index*pageSize)
+	if int64(len(entries)) != min(remaining, pageSize) {
 		return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("Guangya Pan page did not match its total"))
 	}
 	i.index++
-	i.done = remaining <= nativePageSize
+	i.done = remaining <= pageSize
 	if i.done {
 		return entries, io.EOF
 	}
@@ -188,7 +198,7 @@ func (d *Driver) Open(ctx context.Context, a core.NativeAddress, o core.OpenOpti
 	if err := o.Validate(); err != nil {
 		return core.Opened{}, err
 	}
-	if o.Mode != core.StreamRead || o.NoFollow || o.Selection.Version != "" {
+	if o.Mode != core.StreamRead || o.NoFollow || o.Selection.Version != "" || d.website != nil && o.Range != nil {
 		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
 	}
 	if err := o.Selection.When.ForDomain(""); err != nil {
@@ -204,11 +214,11 @@ func (d *Driver) Open(ctx context.Context, a core.NativeAddress, o core.OpenOpti
 	if err := o.Selection.Check(core.Evidence{}); err != nil {
 		return core.Opened{}, err
 	}
-	var grant struct{ SignedURL string }
-	if err := d.control(ctx, "get_res_download_url", url.Values{"fileId": {f.ID}}, &grant); err != nil {
+	address, err := d.downloadAddress(ctx, f)
+	if err != nil {
 		return core.Opened{}, err
 	}
-	response, err := httpcontent.FollowDownload(grant.SignedURL, func(raw string, _ bool) (*http.Response, error) {
+	response, err := httpcontent.FollowDownload(address, func(raw string, _ bool) (*http.Response, error) {
 		u, err := url.Parse(raw)
 		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.Fragment != "" {
 			return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("invalid Guangya Pan signed URL"))
@@ -227,4 +237,13 @@ func (d *Driver) Open(ctx context.Context, a core.NativeAddress, o core.OpenOpti
 		return d.cleanup.OpenSizedBody(response, o.Range, f.Name, *f.Size)
 	}
 	return d.cleanup.OpenBody(response, o.Range, f.Name)
+}
+
+func (d *Driver) downloadAddress(ctx context.Context, f item) (string, error) {
+	if d.website != nil {
+		return d.website.download(ctx, f)
+	}
+	var grant struct{ SignedURL string }
+	err := d.control(ctx, "get_res_download_url", url.Values{"fileId": {f.ID}}, &grant)
+	return grant.SignedURL, err
 }

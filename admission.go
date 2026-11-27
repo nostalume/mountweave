@@ -10,13 +10,15 @@ type Principal string
 type Action string
 
 const (
-	StatAction       Action = "stat"
-	ListAction       Action = "list"
-	ReadAction       Action = "read"
-	CreateAction     Action = "create"
-	WriteAction      Action = "write" // Explicit create-or-replace permission.
-	RemoveAction     Action = "remove"
-	RemoveTreeAction Action = "remove_tree" // Grants deletion and traversal of a whole subtree.
+	StatAction        Action = "stat"
+	ListAction        Action = "list"
+	ReadAction        Action = "read"
+	CreateAction      Action = "create"
+	CreateChildAction Action = "create_child" // Grants creation of a new direct child under this directory.
+	WriteAction       Action = "write"        // Explicit create-or-replace permission.
+	RemoveAction      Action = "remove"
+	PurgeAction       Action = "purge"       // Explicit permanent removal of one entry.
+	RemoveTreeAction  Action = "remove_tree" // Grants deletion and traversal of a whole subtree.
 )
 
 type Authorizer func(context.Context, Principal, Action, Address) error

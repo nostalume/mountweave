@@ -3,6 +3,7 @@ package dropbox
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +17,16 @@ import (
 	"unicode/utf8"
 
 	core "github.com/nostalume/mountweave"
+	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 )
+
+// ControlHost is the Dropbox account and metadata API host.
+const ControlHost = "api.dropboxapi.com"
+
+// ContentHost is the Dropbox file transfer API host.
+const ContentHost = "content.dropboxapi.com"
+
+const accountRoute = "/users/get_current_account"
 
 // Root selects the API's application default, current account root or a fixed
 // namespace. Its zero value preserves the application's authorized default.
@@ -48,6 +58,24 @@ type Options struct {
 	AllowCreate      bool
 }
 
+// AuthorizationScopes returns the Dropbox permissions required by these file options.
+func (o Options) AuthorizationScopes() []string {
+	scopes := []string{"account_info.read", "files.metadata.read", "files.content.read"}
+	if o.AllowCreate {
+		scopes = append(scopes, "files.content.write")
+	}
+	return scopes
+}
+
+// Validate checks the file options before sending any native request.
+func (o Options) Validate() error {
+	if o.MaxResponseBytes < 0 || o.MaxResponseBytes == math.MaxInt64 || o.Root.mode > 2 ||
+		(o.Root.mode == 2 && !namespaceID(o.Root.id)) || (o.Export != nil && !utf8.ValidString(o.Export.Format)) {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	return core.ValidatePath(cmp.Or(o.RootPath, "/"))
+}
+
 type Driver struct {
 	client      http.Client
 	root        item
@@ -65,34 +93,47 @@ type responseCleanup struct {
 	private bool
 }
 
+// VerifyAccount uses the prepared client to confirm the token's account and returns its email.
+func VerifyAccount(ctx context.Context, client *http.Client, expectedID string) (string, error) {
+	if client == nil {
+		return "", core.Fail(core.InvalidRequest, nil)
+	}
+	d := Driver{client: httpcontent.IsolatedClient(client), limit: 64 << 10}
+	var account struct {
+		ID    string `json:"account_id"`
+		Email string `json:"email"`
+	}
+	if err := errors.Join(d.rpc(ctx, accountRoute, nil, &account), d.Close(), ctx.Err()); err != nil {
+		return "", core.Fail(core.CodeOf(err), httpcontent.PrivateIOError(err))
+	}
+	if account.ID == "" || account.ID != expectedID || account.Email == "" {
+		return "", core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return account.Email, nil
+}
+
 // Open confirms the selected directory. A failed non-nil result retains cleanup
 // and must be closed; the borrowed client and its credentials remain host-owned.
 func Open(ctx context.Context, o Options) (*Driver, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if o.Client == nil || o.MaxResponseBytes < 0 || o.MaxResponseBytes == math.MaxInt64 ||
-		o.Root.mode > 2 || (o.Root.mode == 2 && !namespaceID(o.Root.id)) ||
-		(o.Export != nil && !utf8.ValidString(o.Export.Format)) {
+	if o.Client == nil {
 		return nil, core.Fail(core.InvalidRequest, nil)
 	}
-	if o.RootPath == "" {
-		o.RootPath = "/"
-	}
-	if err := core.ValidatePath(o.RootPath); err != nil {
+	if err := o.Validate(); err != nil {
 		return nil, err
 	}
+	o.RootPath = cmp.Or(o.RootPath, "/")
 	if o.MaxResponseBytes == 0 {
 		o.MaxResponseBytes = 4 << 20
 	}
-	d := &Driver{client: *o.Client, root: item{meta: core.Metadata{Kind: core.Directory}},
+	d := &Driver{client: httpcontent.IsolatedClient(o.Client), root: item{meta: core.Metadata{Kind: core.Directory}},
 		limit: o.MaxResponseBytes, allowCreate: o.AllowCreate}
 	if o.Export != nil {
 		chosen := *o.Export
 		d.export = &chosen
 	}
-	d.client.Jar = nil
-	d.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	var err error
 	if o.Root.mode == 1 {
 		var account struct {
@@ -100,7 +141,7 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 				ID string `json:"root_namespace_id"`
 			} `json:"root_info"`
 		}
-		err = d.rpc(ctx, "/users/get_current_account", nil, &account)
+		err = d.rpc(ctx, accountRoute, nil, &account)
 		if err == nil {
 			if !namespaceID(account.Root.ID) {
 				err = core.Fail(core.InvalidUpstreamResponse, errors.New("account root namespace is missing"))
@@ -178,15 +219,10 @@ func (d *Driver) do(req *http.Request) (*http.Response, bool, error) {
 }
 
 func (d *Driver) rpc(ctx context.Context, route string, argument, output any) (err error) {
-	payload, err := json.Marshal(argument)
+	req, err := rpcRequest(ctx, route, argument)
 	if err != nil {
-		return core.Fail(core.InvalidRequest, err)
+		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.dropboxapi.com/2"+route, bytes.NewReader(payload))
-	if err != nil {
-		return core.Fail(core.InvalidRequest, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 	response, _, err := d.do(req)
 	if err != nil {
 		return err
@@ -197,6 +233,19 @@ func (d *Driver) rpc(ctx context.Context, route string, argument, output any) (e
 		return err
 	}
 	return d.readJSON(response, output, false)
+}
+
+func rpcRequest(ctx context.Context, route string, argument any) (*http.Request, error) {
+	payload, err := json.Marshal(argument)
+	if err != nil {
+		return nil, core.Fail(core.InvalidRequest, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+ControlHost+"/2"+route, bytes.NewReader(payload))
+	if err != nil {
+		return nil, core.Fail(core.InvalidRequest, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
 }
 
 func (d *Driver) readBody(response *http.Response, private bool) ([]byte, error) {
@@ -240,6 +289,7 @@ const (
 	readFailure failureStyle = iota
 	uploadFailure
 	sessionFailure
+	relocationFailure
 )
 
 type writeFailure struct {
@@ -260,7 +310,8 @@ func (d *Driver) failure(response *http.Response, style failureStyle) (string, e
 		readErr = d.decode(data, &problem)
 	}
 	var native struct {
-		Tag  string `json:".tag"`
+		Tag  string       `json:".tag"`
+		To   writeFailure `json:"to"`
 		Path struct {
 			writeFailure
 			Reason json.RawMessage `json:"reason"`
@@ -279,12 +330,23 @@ func (d *Driver) failure(response *http.Response, style failureStyle) (string, e
 		code = core.UpstreamTimeout
 	}
 	diagnostic := string(data)
-	if style != readFailure {
+	if style == relocationFailure {
+		diagnostic = "relocation failed"
+	} else if style != readFailure {
 		// The error body may include a resumable upload session identifier.
 		diagnostic = "upload failed"
 	}
 	if readErr == nil && response.StatusCode == http.StatusConflict {
 		switch native.Tag {
+		case "to":
+			if style == relocationFailure && native.To.Tag == "conflict" {
+				switch native.To.Conflict.Tag {
+				case "file", "folder":
+					code, diagnostic = core.AlreadyExists, "relocation name conflict"
+				case "file_ancestor":
+					code, diagnostic = core.NotDirectory, "relocation ancestor is a file"
+				}
+			}
 		case "unsupported_file":
 			code = core.UnsupportedOperation
 		case "incorrect_offset", "lookup_failed":

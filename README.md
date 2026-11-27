@@ -53,10 +53,12 @@ the application shuts down.
 
 ## Documentation
 
-- Find a storage service for your workload. [Driver recommendations](docs/driver-recommendations.md)
-- Check which operations and guarantees a Driver supports. [Driver capabilities](docs/drivers.md)
-- Understand the file model, mount ownership and optional components. [Architecture](docs/architecture.md)
-- Integrate with the JSON HTTP endpoint. [OpenAPI](api/openapi.json)
+- [Architecture](docs/architecture.md): where responsibilities live and where to make changes.
+- [File service specification](docs/specification.md): addressing, permissions, effects and resource lifetimes.
+- [Driver capabilities](docs/drivers.md): supported operations and links to native configuration.
+- [Driver development](docs/driver-development.md): add or improve a source and verify its guarantees.
+- [Driver recommendations](docs/driver-recommendations.md): compare access requirements, capacity and transfer limits.
+- [OpenAPI](api/openapi.json): JSON HTTP requests and responses.
 
 ## Contributing
 

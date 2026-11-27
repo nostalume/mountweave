@@ -70,7 +70,7 @@ func accept(native nativeItem, expected string) (item, error) {
 	return f, nil
 }
 
-func (d *Driver) address(p core.NativeAddress) (string, error) {
+func rootedPath(root string, p core.NativeAddress) (string, error) {
 	if p.Namespace() != core.TreeNamespace {
 		return "", core.Fail(core.UnsupportedOperation, nil)
 	}
@@ -78,12 +78,17 @@ func (d *Driver) address(p core.NativeAddress) (string, error) {
 		return "", err
 	}
 	if p.Value() == "/" {
-		return d.root, nil
+		return root, nil
 	}
-	if d.root == "/" {
-		return p.Value(), nil
+	return strings.TrimSuffix(root, "/") + p.Value(), nil
+}
+
+func acceptChild(entry nativeItem, parent string) (item, error) {
+	name := path.Base(entry.Path)
+	if !core.ValidName(name) {
+		return item{}, core.Fail(core.InvalidUpstreamResponse, errors.New("listing returned an invalid child name"))
 	}
-	return d.root + p.Value(), nil
+	return accept(entry, strings.TrimSuffix(parent, "/")+"/"+name)
 }
 
 func (d *Driver) metadata(ctx context.Context, p, token string, body bool) (item, error) {
@@ -120,7 +125,7 @@ func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...c
 	if len(selections) == 1 && (selections[0].Version != "" || !selections[0].When.Empty()) {
 		return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
 	}
-	full, err := d.address(p)
+	full, err := rootedPath(d.root, p)
 	if err != nil {
 		return core.Metadata{}, err
 	}
@@ -139,7 +144,7 @@ func (d *Driver) Enumerate(ctx context.Context, q core.NativeQuery) (core.Iterat
 	if q.Delimiter() != "" || q.StartAfter() != "" {
 		return nil, core.Fail(core.UnsupportedOperation, nil)
 	}
-	full, err := d.address(q.Address())
+	full, err := rootedPath(d.root, q.Address())
 	if err != nil {
 		return nil, err
 	}
@@ -230,12 +235,7 @@ func (i *iterator) page(ctx context.Context) ([]core.Metadata, error) {
 		if entry.Errno != nil && *entry.Errno != 0 {
 			return nil, nativeFailure(*entry.Errno, result, token)
 		}
-		name := path.Base(entry.Path)
-		if !core.ValidName(name) {
-			return nil, core.Fail(core.InvalidUpstreamResponse, errors.New("listing returned an invalid child name"))
-		}
-		expected := strings.TrimSuffix(i.parent, "/") + "/" + name
-		f, err := accept(entry, expected)
+		f, err := acceptChild(entry, i.parent)
 		if err != nil {
 			return nil, err
 		}

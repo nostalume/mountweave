@@ -1,4 +1,4 @@
-# 115 Open source
+# 115 source
 
 This optional Go 1.24 module connects ordinary, unencrypted 115 Open account
 files to Mountweave. It uses the standard library and existing Core APIs.
@@ -115,3 +115,22 @@ Official references: [listing](https://open.115.com/doc/115开放平台/API列�
 [token rotation](https://open.115.com/doc/115开放平台/接入指南/接入授权/刷新access_token.md?raw=true).
 The native path endpoint is not substituted for ID-rooted exact traversal without
 proof of equivalent root selection and ambiguity behavior.
+
+## Website connection
+
+`OpenWebsite` takes an authenticated `WebsiteSession`, the selected account
+and root, and a release callback. The optional `cdp` module binds to a tab
+from a dedicated browser. The host owns interactive sign-in and the browser
+profile. The Driver checks the account and native root at construction and
+takes ownership of the release callback on success.
+
+The CDP adapter supports `List`, `Stat`, sequential `Open`, and `Remove` for
+one regular file. Reads retain one verified native page and stream the
+attachment from the related tab. The session stays leased until the body
+closes. The host retires the mount to release the browser.
+
+Removal uses the ordinary recycle request for the verified native file ID.
+The adapter sends it once and checks fresh source pages for that ID before
+reporting success. A lost or unconfirmed result retains an unknown effect.
+Directory and conditional removal, rename, move and byte ranges remain
+unsupported in the website connection.

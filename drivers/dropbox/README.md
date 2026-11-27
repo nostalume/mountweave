@@ -102,7 +102,7 @@ RangeNotSatisfiable without the older response's size/total, since the later
 observation might describe a replacement. The original Body remains Core-owned.
 Ordinary 200/206 paths acquire no extra lookup.
 
-## Optional file creation
+## Optional writes
 
 Set `AllowCreate: true` and provide the `files.content.write` scope to enable
 ordinary `Core.Write` and Copy targets. The driver resolves the parent once and
@@ -129,6 +129,20 @@ submitted size. Before session commit, failure leaves the target unchanged.
 A lost or contradictory commit receipt returns `Unknown`. A response close
 error keeps any confirmed effect. Unfinished sessions expire under Dropbox's
 native session policy.
+
+The same write opt-in enables `Core.Move` for files and folders within one
+mount. Dropbox moves the source item ID to a name under the target parent ID
+without automatic renaming or ownership transfer. The response must identify
+the same item at the exact destination. Conditional moves and native
+case-only renames are unavailable.
+
+[Dropbox move API](https://www.dropbox.com/developers/documentation/http/documentation#files-move_v2)
+
+`Mkdir` remains unavailable. Dropbox folder creation takes a namespace-relative
+path. The endpoint cannot bind the request to the existing parent folder ID,
+which Dropbox mounts use to keep a selected subfolder stable.
+
+[Dropbox folder creation schema](https://github.com/dropbox/dropbox-api-spec/blob/main/files.stone#L1442-L1450)
 
 ## Cost, ownership and scope
 

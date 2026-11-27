@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	core "github.com/nostalume/mountweave"
 )
@@ -137,11 +138,12 @@ func websiteAccount(ctx context.Context, call WebsiteCall, account string) (stri
 }
 
 type websiteRequest struct {
-	Account string `json:"account,omitempty"`
-	Parent  string `json:"parent,omitempty"`
-	Page    int    `json:"page,omitempty"`
-	Size    int    `json:"size,omitempty"`
-	FID     string `json:"fid,omitempty"`
+	Account      string `json:"account,omitempty"`
+	Parent       string `json:"parent,omitempty"`
+	Page         int    `json:"page,omitempty"`
+	Size         int    `json:"size,omitempty"`
+	FID          string `json:"fid,omitempty"`
+	RecycleUntil int64  `json:"recycle_until,omitempty"`
 }
 
 type websiteReply struct {
@@ -153,6 +155,7 @@ type websiteReply struct {
 	Page     int           `json:"page"`
 	Total    *int          `json:"total"`
 	Items    []websiteItem `json:"items"`
+	Task     string        `json:"task"`
 	Grants   []struct {
 		FID  string       `json:"fid"`
 		Size *json.Number `json:"size"`
@@ -172,7 +175,7 @@ func callWebsite(ctx context.Context, call WebsiteCall, request websiteRequest) 
 	if err != nil {
 		return reply, err
 	}
-	raw, err := call(ctx, websiteReadScript, data)
+	raw, err := call(ctx, websiteFileRequest, data)
 	if err != nil {
 		return reply, err
 	}
@@ -207,6 +210,71 @@ func callWebsite(ctx context.Context, call WebsiteCall, request websiteRequest) 
 		return reply, core.Fail(core.InvalidUpstreamResponse, nil)
 	}
 	return reply, core.Fail(core.UpstreamFailure, nil)
+}
+
+func (d *Driver) RemoveWithDisposition(ctx context.Context, target core.NativeAddress, options core.RemoveOptions) (core.Change, error) {
+	if options.Disposition != core.RemoveTrash {
+		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	options.Disposition = ""
+	return d.Remove(ctx, target, options)
+}
+
+// Remove sends one regular file to Trash through the bound website account.
+func (d *Driver) Remove(ctx context.Context, address core.NativeAddress, options ...core.RemoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if len(options) > 1 {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if d.website == nil || len(options) == 1 && (options[0].Disposition != "" || !options[0].When.Empty() ||
+		options[0].Target != "" && options[0].Target != core.RemoveNonDirectory) {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	file, err := d.resolve(ctx, address)
+	if err != nil {
+		return unchanged, err
+	}
+	if file.meta.Kind != core.File {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := d.check(ctx); err != nil {
+		return unchanged, err
+	}
+	// Join the browser's bounded request after dispatch. Canceling the caller's
+	// evaluation alone would leave its page promise free to issue a late POST.
+	settle, cancel := context.WithTimeout(context.WithoutCancel(ctx), 13*time.Second)
+	deadline, _ := settle.Deadline()
+	unknown := core.Change{Effect: core.Unknown}
+	s := d.website
+	reply, err := callWebsite(settle, s.call, websiteRequest{
+		Account: s.account, FID: file.fid, RecycleUntil: deadline.Add(-time.Second).UnixMilli(),
+	})
+	cancel()
+	if err != nil {
+		return unknown, errors.Join(err, ctx.Err())
+	}
+	if err := matchWebsiteAccount(reply.Account, s.account); err != nil {
+		return unknown, err
+	}
+	if !websiteFID.MatchString(reply.Task) {
+		return unknown, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	// Check the admitted file ID in its original parent after the task completes.
+	list := websiteListing{driver: d, parent: file.parent}
+	for {
+		files, err := list.next(ctx)
+		if err != nil && err != io.EOF {
+			return unknown, err
+		}
+		for _, current := range files {
+			if current.fid == file.fid {
+				return unknown, core.Fail(core.InvalidUpstreamResponse, nil)
+			}
+		}
+		if err == io.EOF {
+			return core.Change{Effect: core.Applied}, nil
+		}
+	}
 }
 
 type websiteItem struct {
@@ -259,7 +327,7 @@ func (item websiteItem) entry(parent string) (entry, error) {
 	if !core.ValidName(item.Name) {
 		return entry{}, core.Fail(core.UnrepresentableName, nil)
 	}
-	return entry{fid: item.FID, meta: metadata}, nil
+	return entry{fid: item.FID, parent: parent, meta: metadata}, nil
 }
 
 type websiteListing struct {

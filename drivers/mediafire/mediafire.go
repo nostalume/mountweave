@@ -1,4 +1,4 @@
-// Package mediafire mounts a folder through the MediaFire 1.5 Core API.
+// Package mediafire mounts a folder through MediaFire's API or website.
 package mediafire
 
 import (
@@ -36,6 +36,7 @@ type Driver struct {
 	limit        int64
 	closed       atomic.Bool
 	cleanup      httpcontent.ResponseCleanup
+	website      *websiteAccess
 }
 
 // Open confirms the folder key with MediaFire. Close a non-nil failed result
@@ -73,6 +74,11 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 func singleKey(key string) bool { return core.ValidName(key) && !strings.Contains(key, ",") }
 
 func (d *Driver) confirmRoot(ctx context.Context) error {
+	if d.website != nil {
+		scan := listing{d: d, parent: d.root, chunk: 1}
+		_, err := scan.next(ctx)
+		return err
+	}
 	response, err := d.call(ctx, "folder/get_info", url.Values{"folder_key": {d.root}})
 	if err != nil {
 		return err
@@ -88,6 +94,7 @@ type receipt struct {
 	Error          json.Number
 	FolderInfo     struct{ FolderKey string } `json:"folder_info"`
 	FolderContent  struct {
+		FolderKey      string
 		Type           string      `json:"content_type"`
 		Chunk          json.Number `json:"chunk_number"`
 		More           string      `json:"more_chunks"`
@@ -119,6 +126,10 @@ func (d *Driver) call(ctx context.Context, action string, query url.Values) (res
 		return result, err
 	}
 	defer func() { err = errors.Join(err, d.cleanup.CloseBody(response.Body), ctx.Err()) }()
+	return d.decodeReceipt(response, action)
+}
+
+func (d *Driver) decodeReceipt(response *http.Response, action string) (result receipt, err error) {
 	var envelope struct{ Response receipt }
 	if err := httpcontent.DecodeJSON(response, d.limit, &envelope); err != nil {
 		err = core.Fail(core.CodeOf(err), httpcontent.PrivateIOError(err))
@@ -198,10 +209,15 @@ func nativeFailure(status int, native int64) error {
 	return core.Fail(code, fmt.Errorf("MediaFire returned HTTP %d, API error %d", status, native))
 }
 
-// Close retries internal response cleanup. Both clients remain host-owned.
+// Close retries internal response cleanup and releases an owned website session.
+// Both HTTP clients remain host-owned.
 func (d *Driver) Close() error {
 	d.closed.Store(true)
-	return d.cleanup.Retry()
+	err := d.cleanup.Retry()
+	if d.website != nil {
+		err = errors.Join(err, d.website.close())
+	}
+	return err
 }
 
 var _ core.Driver = (*Driver)(nil)

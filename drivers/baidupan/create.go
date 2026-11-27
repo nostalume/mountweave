@@ -41,7 +41,7 @@ func (d *Driver) Create(ctx context.Context, p core.NativeAddress, input io.Read
 			}
 		}
 	}
-	full, err := d.address(p)
+	full, err := rootedPath(d.root, p)
 	if err != nil {
 		return result, err
 	}

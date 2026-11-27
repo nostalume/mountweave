@@ -94,7 +94,7 @@ func contentRequest(ctx context.Context, method, route string, argument any, bod
 	if err != nil {
 		return nil, core.Fail(core.InvalidRequest, err)
 	}
-	target := "https://content.dropboxapi.com/2" + route
+	target := "https://" + ContentHost + "/2" + route
 	if !private {
 		target += "?" + (url.Values{"arg": {string(payload)}}).Encode()
 	}

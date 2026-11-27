@@ -301,6 +301,13 @@ func networkError(err error) error {
 	return core.Fail(core.UpstreamFailure, err)
 }
 
+type graphError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e graphError) Error() string { return fmt.Sprintf("Graph %s: %s", e.Code, e.Message) }
+
 // responseFailure keeps a recoverable remote failure separate from cleanup,
 // which cannot be erased by successfully retrying the native operation.
 func (d *Driver) responseFailure(response *http.Response) (failure, cleanup error) {
@@ -308,15 +315,12 @@ func (d *Driver) responseFailure(response *http.Response) (failure, cleanup erro
 		return statusError(response.StatusCode), d.closeBody(response.Body)
 	}
 	var native struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Error graphError `json:"error"`
 	}
 	_, decodeErr := decodeJSON(response.Body, d.opts.MaxResponseBytes, &native)
 	var cause error
 	if native.Error.Code != "" || native.Error.Message != "" {
-		cause = fmt.Errorf("Graph %s: %s", native.Error.Code, native.Error.Message)
+		cause = native.Error
 	}
 	return errors.Join(statusError(response.StatusCode), cause, decodeErr), d.closeBody(response.Body)
 }

@@ -15,7 +15,7 @@ import (
 // Mkdir creates one directory with the native failure-on-conflict policy.
 func (d *Driver) Mkdir(ctx context.Context, p core.NativeAddress) (core.Change, error) {
 	unchanged := core.Change{Effect: core.Unchanged}
-	full, err := d.address(p)
+	full, err := rootedPath(d.root, p)
 	if err != nil {
 		return unchanged, err
 	}

@@ -17,6 +17,7 @@ import (
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/childscan"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
+	"github.com/nostalume/mountweave/drivers/internal/upload"
 )
 
 // APIOrigin is the recipient of the application's Mobile Cloud business ticket.
@@ -46,6 +47,7 @@ type Driver struct {
 	website        Website
 	accountID      string
 	releaseWebsite func() error
+	upload         *upload.Staging
 }
 
 // Open verifies the selected folder. Close a non-nil failed result to retry
@@ -315,23 +317,31 @@ func (d *Driver) resolve(ctx context.Context, p core.NativeAddress) (entry, erro
 		if cur.metadata.Kind != core.Directory {
 			return entry{}, core.Fail(core.NotDirectory, nil)
 		}
-		i := listing{d: d, parent: cur.id, pageSize: 100}
-		child, ok, err := childscan.Unique(ctx, name, func(ctx context.Context) ([]entry, error) {
-			if pages == 0 {
-				return nil, core.Fail(core.ResolutionBudgetExceeded, nil)
-			}
-			pages--
-			return i.next(ctx)
-		}, func(f entry) (string, string) { return f.id, f.metadata.Name })
+		child, err := d.child(ctx, cur.id, name, &pages)
 		if err != nil {
 			return entry{}, err
-		}
-		if !ok {
-			return entry{}, core.Fail(core.NotFound, nil)
 		}
 		cur = child
 	}
 	return cur, nil
+}
+
+func (d *Driver) child(ctx context.Context, parent, name string, pages *int) (entry, error) {
+	i := listing{d: d, parent: parent, pageSize: 100}
+	child, ok, err := childscan.Unique(ctx, name, func(ctx context.Context) ([]entry, error) {
+		if *pages == 0 {
+			return nil, core.Fail(core.ResolutionBudgetExceeded, nil)
+		}
+		*pages -= 1
+		return i.next(ctx)
+	}, func(f entry) (string, string) { return f.id, f.metadata.Name })
+	if err != nil {
+		return entry{}, err
+	}
+	if !ok {
+		return entry{}, core.Fail(core.NotFound, nil)
+	}
+	return child, nil
 }
 
 func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...core.ReadSelection) (core.Metadata, error) {

@@ -276,3 +276,77 @@ func TestMoveAdmissionAndReceipt(t *testing.T) {
 		})
 	}
 }
+
+type directoryRelocatingDriver struct {
+	core.Driver
+	move func(context.Context, core.NativeAddress, core.NativeAddress) (string, core.Change, error)
+}
+
+func (d *directoryRelocatingDriver) RelocateInto(ctx context.Context, source, directory core.NativeAddress) (string, core.Change, error) {
+	return d.move(ctx, source, directory)
+}
+
+func TestMoveIntoAdmissionAndReceipt(t *testing.T) {
+	denyPrimary, calls := true, 0
+	c := newCore(t, core.Options{Authorize: func(_ context.Context, _ core.Principal, action core.Action, at core.Address) error {
+		switch {
+		case action == core.RemoveAction && at == core.Path("/files/a"):
+			return nil
+		case action == core.CreateChildAction && (at == core.Path("/alias") || !denyPrimary && at == core.Path("/files/dir")):
+			return nil
+		default:
+			return errors.New("denied")
+		}
+	}})
+	defer closeCore(t, c)
+	d := &directoryRelocatingDriver{Driver: &fakeDriver{stat: func(_ context.Context, path string) (core.Metadata, error) {
+		return core.Metadata{Name: "dir", Kind: core.Directory}, nil
+	}}}
+	m, err := c.Install("/files", d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BindAlias(context.Background(), "/alias", m, "/dir"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	from, directory := core.Path("/files/a"), core.Path("/alias")
+	for _, tc := range []struct {
+		name, leaf   string
+		deny, cancel bool
+		wantCode     core.Code
+		effect       core.Effect
+		destination  core.Address
+		wantCalls    int
+	}{
+		{name: "deny primary", deny: true, wantCode: core.PermissionDenied, effect: core.Unchanged},
+		{name: "reject native path", leaf: "../elsewhere", wantCode: core.InvalidUpstreamResponse, effect: core.Unknown, wantCalls: 1},
+		{name: "preserve confirmed placement", leaf: "a (2)", cancel: true, effect: core.Applied, destination: core.Path("/alias/a (2)"), wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			denyPrimary, calls = tc.deny, 0
+			d.move = func(_ context.Context, from, parent core.NativeAddress) (string, core.Change, error) {
+				calls++
+				if from != core.NativePath("/a") || parent != core.NativePath("/dir") {
+					t.Fatal(from, parent)
+				}
+				if tc.cancel {
+					cancel()
+				}
+				return tc.leaf, core.Change{Effect: core.Applied}, nil
+			}
+			result, err := c.MoveInto(ctx, "alice", from, directory)
+			if result.Source.Effect != tc.effect || result.Target.Effect != tc.effect || result.Destination != tc.destination || calls != tc.wantCalls {
+				t.Fatal(result, err, calls)
+			}
+			if tc.cancel {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			} else if core.CodeOf(err) != tc.wantCode {
+				t.Fatal(err)
+			}
+		})
+	}
+}

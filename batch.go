@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"slices"
 )
 
 // ItemResult records one attempted input occurrence, including repeated inputs.
@@ -21,20 +22,8 @@ type CopyRequest struct {
 // RemoveBatch retains input order and duplicates. Execution is serial unless an
 // explicit concurrency option is supplied. On failure no more items start;
 // already started items finish and retain their receipts in the returned prefix.
-func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []Address, options ...ExecutionOptions) (result []ItemResult, err error) {
-	ctx, turn, err := enterOrder(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { turn.finish(itemsUncertain(result)) }()
-	if c == nil {
-		return nil, Fail(InvalidRequest, errors.New("core is required"))
-	}
-	limit, err := concurrency(options)
-	if err != nil {
-		return nil, err
-	}
-	return execute(ctx, len(targets), limit, nil, func(i int) work[ItemResult] {
+func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []Address, options ...ExecutionOptions) ([]ItemResult, error) {
+	return runBatch(c, ctx, len(targets), options, ItemResult.uncertain, func(ctx context.Context, i int) work[ItemResult] {
 		target := targets[i]
 		at := c.capture(ctx, target)
 		return work[ItemResult]{accesses: []access{{at: at, write: true}}, run: func() (ItemResult, error) {
@@ -53,20 +42,8 @@ func (c *Core) RemoveBatch(ctx context.Context, p Principal, targets []Address, 
 // CopyBatch follows RemoveBatch's prefix and stop contract. Its conflict ranges
 // include both source reads and target writes after explicit alias resolution.
 // Unknown physical aliases and external mutations are not transactionally locked.
-func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyRequest, options ...ExecutionOptions) (result []ItemResult, err error) {
-	ctx, turn, err := enterOrder(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { turn.finish(itemsUncertain(result)) }()
-	if c == nil {
-		return nil, Fail(InvalidRequest, errors.New("core is required"))
-	}
-	limit, err := concurrency(options)
-	if err != nil {
-		return nil, err
-	}
-	return execute(ctx, len(requests), limit, nil, func(i int) work[ItemResult] {
+func (c *Core) CopyBatch(ctx context.Context, p Principal, requests []CopyRequest, options ...ExecutionOptions) ([]ItemResult, error) {
+	return runBatch(c, ctx, len(requests), options, ItemResult.uncertain, func(ctx context.Context, i int) work[ItemResult] {
 		request := requests[i]
 		from, to := c.capture(ctx, request.Source), c.capture(ctx, request.Target)
 		return work[ItemResult]{accesses: []access{{at: from}, {at: to, write: true}}, run: func() (ItemResult, error) {
@@ -100,28 +77,8 @@ type MoveItemResult struct {
 
 // MoveBatch follows the same prefix and stop contract as CopyBatch. Both
 // endpoints are writes, including their descendants, within this finite call.
-func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveRequest, options ...ExecutionOptions) (result []MoveItemResult, err error) {
-	ctx, turn, err := enterOrder(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		for _, r := range result {
-			if r.Source.Effect == Unknown || r.Target.Effect == Unknown || r.Removed != nil && r.Removed.Change.Effect == Unknown {
-				turn.finish(true)
-				return
-			}
-		}
-		turn.finish(false)
-	}()
-	if c == nil {
-		return nil, Fail(InvalidRequest, errors.New("core is required"))
-	}
-	limit, err := concurrency(options)
-	if err != nil {
-		return nil, err
-	}
-	return execute(ctx, len(requests), limit, nil, func(i int) work[MoveItemResult] {
+func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveRequest, options ...ExecutionOptions) ([]MoveItemResult, error) {
+	return runBatch(c, ctx, len(requests), options, MoveItemResult.uncertain, func(ctx context.Context, i int) work[MoveItemResult] {
 		request := requests[i]
 		from, to := c.capture(ctx, request.Source), c.capture(ctx, request.Target)
 		if from == nil || to == nil || from.mount != to.mount {
@@ -141,11 +98,22 @@ func (c *Core) MoveBatch(ctx context.Context, p Principal, requests []MoveReques
 	})
 }
 
-func itemsUncertain(items []ItemResult) bool {
-	for _, item := range items {
-		if item.Change.Effect == Unknown {
-			return true
-		}
+func (r ItemResult) uncertain() bool { return r.Change.Effect == Unknown }
+
+func runBatch[T any](c *Core, ctx context.Context, count int, options []ExecutionOptions, uncertain func(T) bool, prepare func(context.Context, int) work[T]) (result []T, err error) {
+	ctx, turn, err := enterOrder(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
-	return false
+	if turn != nil {
+		defer func() { turn.finish(slices.ContainsFunc(result, uncertain)) }()
+	}
+	if c == nil {
+		return nil, Fail(InvalidRequest, errors.New("core is required"))
+	}
+	limit, err := concurrency(options)
+	if err != nil {
+		return nil, err
+	}
+	return execute(ctx, count, limit, nil, func(i int) work[T] { return prepare(ctx, i) })
 }

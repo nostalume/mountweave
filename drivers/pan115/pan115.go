@@ -3,6 +3,7 @@ package pan115
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,14 +13,18 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	core "github.com/nostalume/mountweave"
 	"github.com/nostalume/mountweave/drivers/internal/httpcontent"
 )
 
 const (
-	endpoint      = "https://proapi.115.com"
+	ControlHost   = "proapi.115.com"
+	endpoint      = "https://" + ControlHost
 	downloadRoute = "/open/ufile/downurl"
 )
 
@@ -41,6 +46,7 @@ type Driver struct {
 	resolvePages int
 	closed       atomic.Bool
 	cleanup      httpcontent.ResponseCleanup
+	website      *websiteBinding
 }
 
 // Open validates settings, resolves the root and confirms readable directory
@@ -61,11 +67,8 @@ func Open(ctx context.Context, o Options) (*Driver, error) {
 			return nil, err
 		}
 	}
-	if o.MaxResponseBytes == 0 {
-		o.MaxResponseBytes = 4 << 20
-	}
 	d := &Driver{root: item{ID: "0", Category: "0", meta: core.Metadata{Kind: core.Directory}}, api: httpcontent.IsolatedClient(o.Client),
-		content: httpcontent.IsolatedClient(o.ContentClient), limit: o.MaxResponseBytes, resolvePages: o.MaxResolvePages}
+		content: httpcontent.IsolatedClient(o.ContentClient), limit: cmp.Or(o.MaxResponseBytes, 4<<20), resolvePages: o.MaxResolvePages}
 	d.content.CheckRedirect = d.cleanup.RedirectDownload
 	var err error
 	if o.RootPath != "" && o.RootPath != "/" {
@@ -131,7 +134,13 @@ func (d *Driver) closeBody(body io.Closer, private bool) error {
 // Close retries owned response cleanup after Core has joined active uses.
 func (d *Driver) Close() error {
 	d.closed.Store(true)
-	return d.cleanup.Retry()
+	if err := d.cleanup.Retry(); err != nil {
+		return err
+	}
+	if d.website != nil {
+		return d.website.close()
+	}
+	return nil
 }
 
 func (d *Driver) exchange(client *http.Client, req *http.Request, private bool) (*http.Response, error) {
@@ -144,6 +153,148 @@ func (d *Driver) exchange(client *http.Client, req *http.Request, private bool) 
 		err = errors.Join(err, d.closeBody(response.Body, private))
 	}
 	return nil, errors.Join(core.Fail(core.UpstreamFailure, err), req.Context().Err())
+}
+
+const passport = "https://passportapi.115.com/open/"
+const scanStatus = "https://qrcodeapi.115.com/get/status/"
+
+// AuthorizationClient decodes a bounded JSON response without redirects or request replay.
+type AuthorizationClient func(*http.Request, any) (int, error)
+
+var (
+	ErrApplicationRejected = errors.New("115 Open rejected the application")
+	ErrRefreshRejected     = errors.New("115 Open rejected the refresh credential")
+	ErrScanExpired         = errors.New("The 115 authorization code is no longer valid.")
+)
+
+// TokenReceipt reports the credentials in an accepted token reply. A nonempty
+// Refresh is authoritative even when Access cannot be used.
+type TokenReceipt struct {
+	Access, Refresh string
+	ExpiresAt       time.Time
+}
+
+// Authorize returns tokens and the verified account ID and name. The caller
+// supplies the PKCE proof and deadline. present may return a cleanup for the code.
+func (send AuthorizationClient) Authorize(ctx context.Context, appID, verifier, challenge string, present func(string) (func(), error)) (TokenReceipt, int64, string, error) {
+	if present == nil {
+		return TokenReceipt{}, 0, "", core.Fail(core.InvalidRequest, nil)
+	}
+	var device struct {
+		UID  string `json:"uid"`
+		Time *int64 `json:"time"`
+		Sign string `json:"sign"`
+		QR   string `json:"qrcode"`
+	}
+	if err := send.request(ctx, passport+"authDeviceCode", url.Values{
+		"client_id": {appID}, "code_challenge": {challenge}, "code_challenge_method": {"sha256"},
+	}, "", &device); err != nil {
+		return TokenReceipt{}, 0, "", err
+	} else if device.UID == "" || device.Time == nil || device.Sign == "" || device.QR == "" {
+		return TokenReceipt{}, 0, "", core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	closeQR, err := present(device.QR)
+	if err != nil {
+		return TokenReceipt{}, 0, "", err
+	} else if closeQR != nil {
+		defer closeQR()
+	}
+
+	poll := scanStatus + "?" + (url.Values{"uid": {device.UID}, "time": {strconv.FormatInt(*device.Time, 10)}, "sign": {device.Sign}}).Encode()
+scan:
+	for {
+		var state struct{ Status *int }
+		err := send.request(ctx, poll, nil, "", &state)
+		switch {
+		case err != nil && !errors.Is(err, context.DeadlineExceeded):
+			return TokenReceipt{}, 0, "", err
+		case err == nil && state.Status != nil && *state.Status == 2:
+			break scan
+		case err == nil && (state.Status == nil || *state.Status != 0 && *state.Status != 1):
+			return TokenReceipt{}, 0, "", core.Fail(core.InvalidUpstreamResponse, nil)
+		}
+		select {
+		case <-ctx.Done():
+			return TokenReceipt{}, 0, "", ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	token, err := send.token(ctx, "deviceCodeToToken", url.Values{"uid": {device.UID}, "code_verifier": {verifier}})
+	if err != nil {
+		return TokenReceipt{}, 0, "", err
+	}
+	var account struct {
+		ID   int64  `json:"user_id"`
+		Name string `json:"user_name"`
+	}
+	if err := send.request(ctx, endpoint+"/open/user/info", nil, token.Access, &account); err != nil {
+		return TokenReceipt{}, 0, "", err
+	} else if account.ID <= 0 {
+		return TokenReceipt{}, 0, "", core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return token, account.ID, account.Name, nil
+}
+
+// Refresh attempts a single rotation. The host persists its checkpoint before
+// calling and retains a confirmed replacement even if access cannot be used.
+func (send AuthorizationClient) Refresh(ctx context.Context, refresh string) (TokenReceipt, error) {
+	return send.token(ctx, "refreshToken", url.Values{"refresh_token": {refresh}})
+}
+
+func (send AuthorizationClient) token(ctx context.Context, route string, fields url.Values) (TokenReceipt, error) {
+	var reply struct {
+		Refresh  string `json:"refresh_token"`
+		Access   string `json:"access_token"`
+		Lifetime int64  `json:"expires_in"`
+	}
+	if err := send.request(ctx, passport+route, fields, "", &reply); err != nil {
+		return TokenReceipt{}, err
+	} else if reply.Refresh == "" || reply.Access == "" || reply.Lifetime <= 0 || reply.Lifetime > math.MaxInt64/int64(time.Second) {
+		return TokenReceipt{Refresh: reply.Refresh}, core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return TokenReceipt{Access: reply.Access, Refresh: reply.Refresh, ExpiresAt: time.Now().Add(time.Duration(reply.Lifetime) * time.Second)}, nil
+}
+
+func (send AuthorizationClient) request(ctx context.Context, target string, fields url.Values, access string, out any) error {
+	if send == nil {
+		return core.Fail(core.InvalidRequest, nil)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	if fields != nil {
+		form := fields.Encode()
+		req.Method, req.Body, req.ContentLength = http.MethodPost, io.NopCloser(strings.NewReader(form)), int64(len(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else if access != "" {
+		req.Header.Set("Authorization", "Bearer "+access)
+	}
+	var reply struct {
+		State, Data json.RawMessage
+		Code        int
+	}
+	status, err := send(req, &reply)
+	if err != nil {
+		return err
+	}
+	switch reply.Code {
+	case 40140100, 40140106, 40140107, 40140108, 40140109, 40140110, 40140118:
+		return fmt.Errorf("%w (%d).", ErrApplicationRejected, reply.Code)
+	case 40140114, 40140115, 40140116, 40140119, 40140120, 40140137:
+		return fmt.Errorf("%w (%d).", ErrRefreshRejected, reply.Code)
+	case 40140117:
+		return core.Fail(core.UpstreamThrottled, nil)
+	}
+	switch state := string(reply.State); {
+	case status == http.StatusOK && strings.HasPrefix(target, scanStatus+"?") && (state == "0" || state == "false"):
+		return ErrScanExpired
+	case status != http.StatusOK || reply.Code != 0 || state != "1" && state != "true":
+		return core.Fail(core.UpstreamFailure, fmt.Errorf("115 authorization returned HTTP %d and code %d", status, reply.Code))
+	case json.Unmarshal(reply.Data, out) != nil:
+		return core.Fail(core.InvalidUpstreamResponse, nil)
+	}
+	return nil
 }
 
 type envelope struct {
@@ -251,13 +402,12 @@ func (d *Driver) Stat(ctx context.Context, p core.NativeAddress, selections ...c
 	if err != nil {
 		return core.Metadata{}, err
 	}
-	if p.Value() == "/" && file.ID == "0" {
-		if _, err = d.readPage(ctx, "0", 0, 1); err != nil {
-			return core.Metadata{}, err
+	if p.Value() == "/" {
+		if file.ID == "0" || d.website != nil {
+			_, err = d.readPage(ctx, string(file.ID), 0, 1)
+		} else {
+			file, err = d.info(ctx, string(file.ID))
 		}
-	}
-	if p.Value() == "/" && file.ID != "0" {
-		file, err = d.info(ctx, string(file.ID))
 		if err != nil {
 			return core.Metadata{}, err
 		}
@@ -276,7 +426,7 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 	if err := o.Validate(); err != nil {
 		return core.Opened{}, err
 	}
-	if o.Mode != core.StreamRead || o.NoFollow || o.Selection.Version != "" {
+	if o.Mode != core.StreamRead || o.NoFollow || o.Selection.Version != "" || d.website != nil && o.Range != nil {
 		return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
 	}
 	selectionErr := o.Selection.Check(core.Evidence{})
@@ -298,6 +448,9 @@ func (d *Driver) Open(ctx context.Context, p core.NativeAddress, o core.OpenOpti
 	}
 	if selectionErr != nil {
 		return core.Opened{}, selectionErr
+	}
+	if d.website != nil {
+		return d.openWebsiteBody(ctx, file)
 	}
 	if file.Pick == "" {
 		return core.Opened{}, core.Fail(core.InvalidUpstreamResponse, errors.New("file omitted download capability reference"))

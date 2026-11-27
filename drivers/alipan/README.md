@@ -131,14 +131,22 @@ There is no new public upload session or durable multipart resume API.
 
 ## Website publication
 
-`WebsiteAccount.OpenWritable` enables known-length exclusive publication,
-directory creation, and file trash for the selected resource-drive folder.
-It requires a separate staging folder on the same drive and a bounded
-upload buffer. The Driver uploads each body to a unique staging name and
-uses the website's v2 move to claim the final name. It resolves an uncertain
-move by native file ID. It leaves the staging object available for
-reconciliation when the move may still complete. Use
-`core.Publish(core.IfAbsent())` for file publication.
+For website access, the host supplies an authenticated page through `Website`
+and controls its lifetime until a Driver opens successfully. `Website.Account`
+checks the account and resource drive. `WebsiteAccount.Open` binds one folder
+for metadata, listing and original-file reads. Keep the verified account,
+drive and folder together when reopening a saved mount.
+
+`WebsiteAccount.OpenWritable` enables known-length exclusive file creation,
+directory creation, file rename and move within the mounted tree, and file
+recycling by native ID. Native relocation is exclusive. Folder relocation,
+directory removal, and conditional move or removal remain unavailable.
+
+The driver requires a separate staging folder on the same resource drive and a
+bounded upload buffer. `Core.Write` and the `core.Publish(core.IfAbsent())` policy
+upload to a unique staging name before claiming the final name with the website's
+v2 move. An uncertain move is checked by file ID. A staging object is kept if
+its move may still complete.
 
 ## Rotating credentials
 

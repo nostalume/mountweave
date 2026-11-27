@@ -84,6 +84,28 @@ A native chain
 that requires the client to forward the account token to a different origin is
 therefore outside this source's supported credential boundary.
 
+## Website reads
+
+`OpenWebsite` constructs a Core source from an authenticated
+website transport. The transport supplies the independently observed current
+account, directory request, page number, and original first-party response
+through `WebsiteOptions.ReadPage`. The driver uses the existing Baidu metadata
+checks for each direct child and accepts ownership of the session only after
+verifying the selected root. `RootID` checks the native folder at open time.
+Browsing uses the selected path within the bound account.
+
+`Stat` and `List` use the normal Core API. A full native page has 100 items.
+A valid short page ends the listing, while a service error, wrong account,
+wrong directory, or repeated full page is reported as a failure. The iterator
+retains just the current page position and preceding full-page identities.
+
+An optional `ReadFile` callback takes the exact file selected from the directory.
+Use `WebsiteDownloadTarget` to verify the observed single-file grant and bind
+its first iframe request. The callback supplies the terminal HTTPS attachment.
+`Core.Open` checks the selected account, path, integer file ID and known size,
+then uses the existing body and cleanup rules. This path serves full sequential
+reads. The website transport must verify the browser response through EOF
+and retain it until the caller closes the body.
 ## Exclusive creation
 
 The same instance implements Core's existing Mkdir and Create/default Write
@@ -165,6 +187,9 @@ all-CDN compatibility claim follows from the confined HTTP fixtures.
 
 The development module uses the adjacent Core checkout; no new version is
 published.
+
+The optional [website transport](cdp/README.md) captures a download started by
+the caller from the ordinary website action. It belongs to a separate module.
 
 Official references: [authorization](https://pan.baidu.com/union/doc/使用入门/接入授权/授权介绍/),
 [permissions](https://pan.baidu.com/union/doc/使用入门/权限与配额/),

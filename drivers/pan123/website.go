@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path"
 	"sync"
 
 	core "github.com/nostalume/mountweave"
@@ -22,6 +23,20 @@ var (
 type WebsiteSession interface {
 	List(ctx context.Context, parentID, cursor string) (WebsitePage, error)
 	Download(ctx context.Context, parentID string, file WebsiteFile) (WebsiteGrant, error)
+}
+
+// Optional mutation methods use the selected account, parent and file identity.
+// They confirm native effects and report uncertainty when a reply is lost.
+type websiteRenamer interface {
+	Rename(ctx context.Context, parent string, file WebsiteFile, name string) (core.Change, error)
+}
+
+type websiteMover interface {
+	Move(ctx context.Context, parent string, file WebsiteFile, directory string) (string, core.Change, error)
+}
+
+type websiteRecycler interface {
+	Recycle(ctx context.Context, parent string, file WebsiteFile) (core.Change, error)
 }
 
 // WebsitePage is one directory batch. An empty Next marks the last batch.
@@ -62,7 +77,7 @@ type WebsiteOptions struct {
 	Release func() error
 }
 
-// Website exposes the read-only filesystem granted by an authenticated website.
+// Website exposes the filesystem granted by an authenticated website.
 type Website struct {
 	*reader
 	session WebsiteSession
@@ -189,7 +204,7 @@ func (d *Website) readPage(ctx context.Context, parent, after string, _ int) ([]
 }
 
 func (d *Website) download(ctx context.Context, f item) (string, *int64, error) {
-	request := WebsiteFile{Account: d.account, ID: string(f.ID), Name: f.Name, Size: *f.meta.Size}
+	request := d.websiteFile(f)
 	grant, err := d.session.Download(ctx, string(f.Parent), request)
 	if err := websiteCallError(ctx, err); err != nil {
 		return "", nil, err
@@ -203,4 +218,136 @@ func (d *Website) download(ctx context.Context, f item) (string, *int64, error) 
 	return grant.URL, f.meta.Size, nil
 }
 
-var _ core.Driver = (*Website)(nil)
+func (d *Website) websiteFile(f item) WebsiteFile {
+	return WebsiteFile{Account: d.account, ID: string(f.ID), Name: f.Name, Size: *f.meta.Size}
+}
+
+func (d *Website) resolveMutationFile(ctx context.Context, pathname string) (item, error) {
+	file, err := d.resolve(ctx, pathname)
+	if err != nil {
+		return item{}, err
+	}
+	if file.meta.Kind != core.File {
+		return item{}, core.Fail(core.UnsupportedOperation, nil)
+	}
+	return file, d.active(ctx)
+}
+
+// Relocate admits only an exclusive rename of a regular file in its current directory.
+func (d *Website) Relocate(ctx context.Context, source, target core.NativeAddress, policies ...core.MoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if len(policies) > 1 {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(policies) == 1 {
+		policy := policies[0]
+		if !policy.Source.Empty() || !policy.Target.Empty() || policy.Existing != "" && policy.Existing != core.CreateNew {
+			return unchanged, core.Fail(core.UnsupportedOperation, nil)
+		}
+	}
+	renamer, ok := d.session.(websiteRenamer)
+	if !ok {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := d.check(ctx, source); err != nil {
+		return unchanged, err
+	}
+	if err := d.check(ctx, target); err != nil {
+		return unchanged, err
+	}
+	from, to := source.Value(), target.Value()
+	if from == "/" || to == "/" || from == to {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if path.Dir(from) != path.Dir(to) {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	file, err := d.resolveMutationFile(ctx, from)
+	if err != nil {
+		return unchanged, err
+	}
+	change, err := renamer.Rename(ctx, string(file.Parent), d.websiteFile(file), path.Base(to))
+	return change, websiteCallError(ctx, err)
+}
+
+// RelocateInto moves a regular file to a selected directory and confirms its resulting name.
+func (d *Website) RelocateInto(ctx context.Context, source, directory core.NativeAddress) (string, core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	mover, ok := d.session.(websiteMover)
+	if !ok {
+		return "", unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := d.check(ctx, source); err != nil {
+		return "", unchanged, err
+	}
+	if err := d.check(ctx, directory); err != nil {
+		return "", unchanged, err
+	}
+	if source.Value() == "/" || source == directory {
+		return "", unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	file, err := d.resolveMutationFile(ctx, source.Value())
+	if err != nil {
+		return "", unchanged, err
+	}
+	parent, err := d.resolve(ctx, directory.Value())
+	if err != nil {
+		return "", unchanged, err
+	}
+	if parent.meta.Kind != core.Directory {
+		return "", unchanged, core.Fail(core.NotDirectory, nil)
+	}
+	if parent.ID == file.Parent {
+		return "", unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	name, change, err := mover.Move(ctx, string(file.Parent), d.websiteFile(file), string(parent.ID))
+	if change.Effect != core.Applied {
+		return "", change, websiteCallError(ctx, err)
+	}
+	if !core.ValidName(name) {
+		return "", core.Change{Effect: core.Unknown}, core.Fail(core.InvalidUpstreamResponse, err)
+	}
+	// The exact visible name must resolve to the same file in the selected parent.
+	confirmed, findErr := d.resolve(ctx, path.Join(directory.Value(), name))
+	if findErr != nil || confirmed.ID != file.ID || confirmed.Parent != parent.ID || confirmed.meta.Kind != core.File {
+		return "", core.Change{Effect: core.Unknown}, core.Fail(core.InvalidUpstreamResponse, errors.Join(err, findErr))
+	}
+	return name, change, websiteCallError(ctx, err)
+}
+
+// Remove recycles a single regular file by native identity.
+func (d *Website) Remove(ctx context.Context, address core.NativeAddress, policies ...core.RemoveOptions) (core.Change, error) {
+	unchanged := core.Change{Effect: core.Unchanged}
+	if len(policies) > 1 {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	if len(policies) == 1 {
+		policy := policies[0]
+		if !policy.When.Empty() || policy.Target != "" && policy.Target != core.RemoveNonDirectory {
+			return unchanged, core.Fail(core.UnsupportedOperation, nil)
+		}
+	}
+	recycler, ok := d.session.(websiteRecycler)
+	if !ok {
+		return unchanged, core.Fail(core.UnsupportedOperation, nil)
+	}
+	if err := d.check(ctx, address); err != nil {
+		return unchanged, err
+	}
+	if address.Value() == "/" {
+		return unchanged, core.Fail(core.InvalidRequest, nil)
+	}
+	file, err := d.resolveMutationFile(ctx, address.Value())
+	if err != nil {
+		return unchanged, err
+	}
+	change, err := recycler.Recycle(ctx, string(file.Parent), d.websiteFile(file))
+	return change, websiteCallError(ctx, err)
+}
+
+var (
+	_ core.Driver             = (*Website)(nil)
+	_ core.Relocator          = (*Website)(nil)
+	_ core.DirectoryRelocator = (*Website)(nil)
+	_ core.Remover            = (*Website)(nil)
+)

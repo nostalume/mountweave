@@ -3,6 +3,15 @@
 Use Go 1.24 or newer for Core and Go 1.27 or newer for a full repository check.
 Each optional module declares its minimum Go version in `go.mod`.
 
+## Find the owner of a change
+
+Start with [Architecture](docs/architecture.md#where-to-change-behavior), then
+check the [file service specification](docs/specification.md) for the behavior
+your change must preserve. For a cloud source or storage protocol, use the
+[driver development guide](docs/driver-development.md) and the relevant native
+reference in the [capability table](docs/drivers.md). A server-side protocol
+change belongs to its adapter under [`protocols/`](protocols/).
+
 ## Verify a change
 
 Run the existing test that exercises the changed behavior through a public
@@ -43,7 +52,8 @@ Use the batch tool to plan and verify candidate versions. [Release guide](docs/r
 
 - Keep optional dependencies in the modules that use them.
 - Use English for code, comments, schemas and public documentation.
-- Document behavioral contracts with the owning Go package.
+- Document behavioral contracts with the owning Go package. Update the file
+  service specification when the common behavior changes.
 - Update the relevant reference for native options or wire changes. [Driver capabilities](docs/drivers.md) · [OpenAPI](api/openapi.json)
 - Explain API changes and their compatibility impact. Keep credentials, private notes and generated caches out of the contribution.
 

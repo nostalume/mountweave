@@ -2,6 +2,8 @@
 
 See [Choosing a driver](driver-recommendations.md) for workloads, quotas and setup.
 Each driver reference below lists its configuration and native limits.
+For the common semantics see the [file service specification](specification.md).
+To change a source see [Driver development](driver-development.md).
 
 ## Behaviors by driver
 
@@ -36,28 +38,33 @@ also requires safe source deletion.
 | Driver | Read scope and extra capabilities | Changes |
 | --- | --- | --- |
 | [Aliyun Drive Open](../drivers/alipan/README.md) | Authorized root or folder. Frozen files remain visible, with content reads refused | Optional known-length Create, Mkdir, file removal, Subtree, same-parent rename and same-name file move. Coordinate concurrent same-name Mkdir in the host |
+| [Aliyun Drive website](../drivers/alipan/README.md#website-publication) | Resource-drive folder in a host-supplied website session. Metadata, listings and original-file reads | With separate staging enabled, known-length exclusive Write and Publish, Mkdir, single-file move and rename, and file trash |
 | [BabelBird](../drivers/babelbird/README.md) | Enterprise or personal space, with optional subdirectory | — |
 | [Baidu Netdisk](../drivers/baidupan/README.md) | App-authorized directory and ordinary downloads | Mkdir and Create. Larger uploads require a stable replayable source |
 | [DingTalk Drive](../drivers/dingtalkdrive/README.md) | Approved space and folder for the configured operator | — |
 | [Fangcloud](../drivers/fangcloud/README.md) | Authorized personal space or folder | — |
+| [FEB Box](../drivers/febbox/README.md) | Authorized own disk or private folder, with paged listing and original-file ranges | — |
 | [Feishu Drive](../drivers/feishudrive/README.md) | Folder, uploaded originals and optional document exports | Optional recycling of one uploaded file |
 | [Gokuai](../drivers/gokuai/README.md) | Enterprise library or selected path | — |
-| [Guangya Pan](../drivers/guangyapan/README.md) | Authorized root or folder, signed originals and actual ranges | — |
+| [Guangya Pan](../drivers/guangyapan/README.md) | Authorized root or folder, signed originals and actual ranges | Exclusive directory creation, same-directory file rename and file moves into a directory with website authentication |
 | [Huawei Drive Kit](../drivers/huaweidrive/README.md) | Personal drive. `Stat` and `Open` accept a known version ID with history access | — |
 | [KDocs](../drivers/kdocs/README.md) | Personal My Documents or a selected folder | — |
 | [KooDrive](../drivers/koodrive/README.md) | Individual, department or group space | Optional Mkdir and known-length Create in the individual space |
-| [China Mobile Cloud](../drivers/mobilepan/README.md) | Personal drive. Metadata, paged listing and original-file reads with ranges. Library access through a registered application or a website session | — |
+| [China Mobile Cloud](../drivers/mobilepan/README.md) | Personal drive. Metadata, paged listing and original-file reads with ranges. Library access through a registered application or a website session | Exclusive Mkdir, single-part Create for nonempty files, same-directory file rename, file moves into a directory and confirmed single-file removal with website authentication |
 | [115 Open](../drivers/pan115/README.md) | Authorized root or folder, ordinary unencrypted files and actual ranges | — |
-| [123 Cloud Drive](../drivers/pan123/README.md) | Open API or authenticated website folder. Website reads use ordinary downloads offered by the provider | Open API supports optional Mkdir, single-file recycling and Create through single-step or multipart upload |
+| [115 website](../drivers/pan115/README.md) | Protected browser session, native pages and sequential original-file reads | Single regular-file recycle in the development version |
+| [123 Cloud Drive website](../drivers/pan123/README.md#website-connection) | Development candidate. Protected website session, directory pages and originals eligible for ordinary download | Same-directory single-file rename, file moves into a directory and ordinary file recycling |
+| [123 Open](../drivers/pan123/README.md) | Account tree, ordinary downloads and optional direct links for authorized directories | Optional Mkdir, single-file recycling and Create through single-step or multipart upload |
 | [Alibaba Cloud PDS](../drivers/pdsshare/README.md) | Authorized standard drive or received share | — |
-| [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | — |
-| [UC Cloud Drive](../drivers/uc/README.md) | Authenticated website folder, native pagination, original attachments and exact single byte ranges | — |
+| [Quark Cloud Drive](../drivers/quark/README.md) | Authorized drive or subdirectory, paged listing, original files and actual byte ranges. Open API and website session support | Single regular-file recycling with website authentication in the development version |
+| [UC Cloud Drive](../drivers/uc/README.md) | Authenticated website folder, native pagination, original attachments and exact single byte ranges | Single regular-file recycling in the development version |
 | [LanZou Cloud](../drivers/lanzou/README.md) | Authenticated website folder, native listing, and original-file downloads through supported existing shares. Reports actual byte ranges or complete originals | — |
 | [Teambition](../drivers/teambition/README.md) | Approved enterprise project collection and its original files | — |
 | [Tencent Docs](../drivers/tencentdocs/README.md) | Authorized folder and optional asynchronous document export | — |
+| [Tianyi Personal Cloud](../drivers/tianyipan/README.md) | Personal website session, native paging and ordinary single-file downloads | Same-directory regular-file rename and single-file recycling in the development version |
 | [Tencent Cloud SMH](../drivers/tencentsmh/README.md) | Tenant space or recipient share, with signed downloads | — |
 | [WeCom Wedrive](../drivers/wecomdrive/README.md) | Approved space folder and uploaded originals. Online documents appear in listings | — |
-| [Tencent Weiyun](../drivers/weiyun/README.md) | Official MCP personal root and ordinary downloads | — |
+| [Tencent Weiyun](../drivers/weiyun/README.md) | Official MCP personal root or selected subfolder, with ordinary downloads | — |
 | [WPS 365](../drivers/wps365/README.md) | Authorized enterprise drive or folder and ordinary downloads | Optional Mkdir and single-file removal |
 | [WUYING Drive](../drivers/wuyingdrive/README.md) | Assigned personal or team space and signed downloads | — |
 | [360 AI Cloud Disk](../drivers/yunpan360/README.md) | Official MCP personal root and ordinary downloads | — |
@@ -72,16 +79,16 @@ also requires safe source deletion.
 | [Cloudreve](../drivers/cloudreve/README.md) | Authorized Cloudreve V4 directory and ordinary files | Optional Create and durable continuation for the supported OneDrive upload workflow |
 | [CNB Releases](../drivers/cnbreleases/README.md) | Uploaded assets of a selected release | — |
 | [CodeArts Repo](../drivers/codeartsrepo/README.md) | Fixed commit and optional subtree, with raw Git blobs | — |
-| [Dropbox](../drivers/dropbox/README.md) | Personal or team root, ordinary files and optional explicit exports | Optional Create through one request or an upload session |
+| [Dropbox](../drivers/dropbox/README.md) | Personal or team root, ordinary files and optional explicit exports | Optional Create through one request or an upload session, and same-mount Move for files and directories with either an exact target or native directory placement |
 | [Emby](../drivers/emby/README.md) | Selected media tree and downloadable originals | — |
 | [GitHub Releases](../drivers/githubreleases/README.md) | Uploaded assets of a selected release | — |
 | [GitHub Repo](../drivers/githubrepo/README.md) | Fixed Git tree, raw blobs and actual ranges | — |
 | [Google Drive](../drivers/googledrive/README.md) | Authorized folder or shared drive, ordinary files and configured exports | — |
 | [Google Photos](../drivers/googlephotos/README.md) | App-created album and its available download representation | — |
-| [Graph Drive](../drivers/graphdrive/README.md) | Authorized drive, folder or share | Optional Create, exclusive Publish and durable upload continuation on ordinary mounts |
+| [Graph Drive](../drivers/graphdrive/README.md) | Authorized drive, folder or share | Mkdir, optional Create, exclusive Publish and durable upload continuation on ordinary mounts |
 | [CloudFlare ImgBed](../drivers/imgbed/README.md) | Indexed deployment folder and ordinary files | — |
 | [IPFS](../drivers/ipfs/README.md) | Fixed UnixFS directory CID through a trusted Kubo endpoint | — |
-| [MediaFire](../drivers/mediafire/README.md) | Authorized folder and files with eligible native download links | — |
+| [MediaFire](../drivers/mediafire/README.md) | Authorized folder and files with eligible native download links | Exclusive Mkdir, optional staged Create for nonempty files, file moves into a directory, regular-file recycling and explicit subtree recycling with website authentication |
 | [PikPak](../drivers/pikpak/README.md) | Read-only personal access token, selected folder or current drive root, native pagination and original-file ranges | — |
 | [Misskey](../drivers/misskey/README.md) | Selected account folder and downloadable entries | — |
 | [Seafile](../drivers/seafile/README.md) | Authorized library or directory | — |

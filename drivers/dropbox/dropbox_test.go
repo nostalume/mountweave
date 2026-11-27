@@ -152,6 +152,34 @@ func (s *fixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"account_id": "dbid:account", "root_info": map[string]string{".tag": "team", "root_namespace_id": "team-ns", "home_namespace_id": "home-ns", "home_path": "/Member"}})
+	case "/2/files/move_v2":
+		to, _ := arg["to_path"].(string)
+		parent, name, ok := strings.Cut(to, "/")
+		id, _ := arg["from_path"].(string)
+		into := strings.HasPrefix(mode, "move-into-")
+		if selection != "root:team-ns" || arg["autorename"] != into || arg["allow_ownership_transfer"] != false ||
+			(into && (parent != "id:dir" || name != nativeName)) ||
+			!ok || !core.ValidName(name) || (parent != "id:archive" && parent != "id:dir") ||
+			(id != "id:blob" && id != "id:dir") {
+			nativeError(w, 400, "unbound relocation")
+			return
+		}
+		if mode == "move-name-conflict" {
+			w.WriteHeader(409)
+			io.WriteString(w, `{"error":{".tag":"to","to":{".tag":"conflict","conflict":{".tag":"file"}}}}`)
+			return
+		}
+		if into {
+			name += " (2)"
+		}
+		m := metadata(id, name, id == "id:dir")
+		if parent == "id:dir" {
+			m["path_lower"] = "/archive/dir/" + strings.ToLower(name)
+		}
+		if mode == "move-wrong-destination" || mode == "move-into-wrong-parent" {
+			m["path_lower"] = "/elsewhere/" + strings.ToLower(name)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"metadata": m})
 	case "/2/files/get_metadata":
 		if mode == "wait" {
 			s.wait(w, r)
@@ -446,8 +474,8 @@ func setup(t *testing.T) (*fixture, *Driver, *core.Core, *core.Mount, Options) {
 		if (uploading || strings.Contains(r.URL.Path, "/files/download") || strings.Contains(r.URL.Path, "/files/export")) != (r.URL.Host == "content.dropboxapi.com") {
 			return nil, errors.New("wrong native API host")
 		}
-		if uploading && r.GetBody != nil {
-			return nil, errors.New("upload request enabled body replay")
+		if (uploading || r.URL.Path == "/2/files/move_v2") && r.GetBody != nil {
+			return nil, errors.New("mutation request enabled body replay")
 		}
 		call := r.Clone(r.Context())
 		u := *r.URL
@@ -522,6 +550,68 @@ func readOpened(t *testing.T, c *core.Core, path string, o core.OpenOptions) ([]
 		t.Fatal(err)
 	}
 	return data, opened
+}
+
+func TestExclusiveRelocation(t *testing.T) {
+	s, readOnly, c, _, opts := setup(t)
+	ctx := t.Context()
+	opts.Root, opts.AllowCreate = AccountRoot(), true
+	d, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Install("/move", d); err != nil {
+		t.Fatal(errors.Join(err, d.Close()))
+	}
+	source := core.NativePath("/" + nativeName)
+	target := core.NativePath("/Dir/new")
+	if got, err := readOnly.Relocate(ctx, source, target); got.Effect != core.Unchanged || core.CodeOf(err) != core.UnsupportedOperation {
+		t.Fatalf("read-only source enabled relocation: %+v %v", got, err)
+	}
+	if got, err := d.Relocate(ctx, source, core.NativePath(strings.ToUpper(source.Value()))); got.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || s.count("/2/files/move_v2") != 0 {
+		t.Fatalf("case-only rename reached native relocation: %+v %v", got, err)
+	}
+	if got, err := d.Relocate(ctx, source, target, core.MoveOptions{Target: core.IfAbsent()}); got.Effect != core.Unchanged ||
+		core.CodeOf(err) != core.UnsupportedOperation || s.count("/2/files/move_v2") != 0 {
+		t.Fatalf("unsupported condition reached native relocation: %+v %v", got, err)
+	}
+	for _, tc := range []struct {
+		mode, source, target string
+		effect               core.Effect
+		code                 core.Code
+	}{
+		{"", nativeName, "new", core.Applied, core.CodeOf(nil)},
+		{"", nativeName, "Dir/new", core.Applied, core.CodeOf(nil)},
+		{"", "Dir", "new-dir", core.Applied, core.CodeOf(nil)},
+		{"move-name-conflict", nativeName, "Dir/new", core.Unchanged, core.AlreadyExists},
+		{"move-wrong-destination", nativeName, "Dir/new", core.Unknown, core.InvalidUpstreamResponse},
+	} {
+		s.set(tc.mode)
+		before := s.count("/2/files/move_v2")
+		got, err := c.Move(ctx, "u", core.Path("/move/"+tc.source), core.Path("/move/"+tc.target), core.MoveOptions{NoCopy: true})
+		if got.Source.Effect != tc.effect || got.Target.Effect != tc.effect || core.CodeOf(err) != tc.code ||
+			s.count("/2/files/move_v2") != before+1 {
+			t.Fatalf("relocate %s to %s: %+v, %v", tc.source, tc.target, got, err)
+		}
+	}
+	for _, tc := range []struct {
+		mode        string
+		destination core.Address
+		effect      core.Effect
+		code        core.Code
+	}{
+		{"move-into-allocated", core.Path("/move/Dir/" + nativeName + " (2)"), core.Applied, core.CodeOf(nil)},
+		{"move-into-wrong-parent", core.Address{}, core.Unknown, core.InvalidUpstreamResponse},
+	} {
+		s.set(tc.mode)
+		before := s.count("/2/files/move_v2")
+		got, err := c.MoveInto(ctx, "u", core.Path("/move/"+nativeName), core.Path("/move/Dir"))
+		if got.Destination != tc.destination || got.Source.Effect != tc.effect || got.Target.Effect != tc.effect ||
+			core.CodeOf(err) != tc.code || s.count("/2/files/move_v2") != before+1 {
+			t.Fatalf("%s: %+v, %v", tc.mode, got, err)
+		}
+	}
 }
 
 func TestRootsExactPathsPagingAndCopy(t *testing.T) {

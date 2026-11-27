@@ -215,6 +215,95 @@ func (b *badClose) Close() error {
 	}
 	return b.ReadCloser.Close()
 }
+
+type websiteFixture struct {
+	t                      *testing.T
+	account                string
+	lists, reads, releases int
+	canceled               context.CancelFunc
+	body                   *badClose
+}
+
+func (s *websiteFixture) List(_ context.Context, account, parent string, offset int64, limit int) (WebsitePage, error) {
+	s.t.Helper()
+	if account != "account" || offset != 0 {
+		s.t.Fatalf("listing lost its bound account or offset: %q, %d", account, offset)
+	}
+	s.lists++
+	row := WebsiteItem{ID: "1", ParentID: "0", Name: "archive", Directory: true}
+	if parent == "1" {
+		row = WebsiteItem{ID: "10", ParentID: "1", Name: "report", Size: 6}
+	} else if parent != "0" {
+		s.t.Fatalf("listing received wrong directory %q", parent)
+	}
+	return WebsitePage{Account: s.account, ParentID: parent, Limit: int64(limit), Count: 1, Items: []WebsiteItem{row}}, nil
+}
+
+func (s *websiteFixture) Read(_ context.Context, account, parent string, file WebsiteItem) (io.ReadCloser, error) {
+	s.t.Helper()
+	if account != "account" || parent != "1" || file != (WebsiteItem{ID: "10", ParentID: "1", Name: "report", Size: 6}) {
+		s.t.Fatalf("body request lost its binding: %q, %q, %+v", account, parent, file)
+	}
+	s.reads++
+	s.body = &badClose{ReadCloser: io.NopCloser(strings.NewReader("abcdef"))}
+	if s.canceled != nil {
+		s.canceled()
+	}
+	return s.body, nil
+}
+
+func TestWebsiteOriginalBodyBinding(t *testing.T) {
+	ctx := t.Context()
+	s := &websiteFixture{t: t, account: "account"}
+	closeFailure := errors.New("session release temporarily unavailable")
+	opts := WebsiteOptions{Session: s, Account: s.account, RootPath: "/archive", RootID: "9",
+		Release: func() error {
+			s.releases++
+			if s.releases == 1 {
+				return closeFailure
+			}
+			return nil
+		}}
+	if driver, err := OpenWebsite(ctx, opts); driver != nil || !errors.Is(err, ErrWebsiteBindingMismatch) || s.releases != 0 {
+		t.Fatalf("replaced root must leave the session with its caller: %v", err)
+	}
+	opts.RootID = "1"
+	d, err := OpenWebsite(ctx, opts)
+	if err != nil || d.RootID() != "1" {
+		t.Fatalf("bound website mount failed: %v", err)
+	}
+	path := core.NativePath("/report")
+	reads := s.lists
+	if _, err := d.Open(ctx, path, core.OpenOptions{Range: &core.Range{Start: 1, End: 1}}); core.CodeOf(err) != core.UnsupportedOperation || s.lists != reads {
+		t.Fatalf("range must be rejected before a website request: %v", err)
+	}
+	s.account = "different"
+	if opened, err := d.Open(ctx, path, core.OpenOptions{}); !errors.Is(err, ErrWebsiteBindingMismatch) || opened.Body != nil || s.reads != 0 {
+		t.Fatalf("account mismatch reached the body: %v", err)
+	}
+	s.account = "account"
+	opened, err := d.Open(ctx, path, core.OpenOptions{})
+	if err != nil || opened.Length == nil || *opened.Length != 6 {
+		t.Fatalf("whole-file response failed: %+v, %v", opened, err)
+	}
+	data, err := io.ReadAll(opened.Body)
+	if closeErr := opened.Body.Close(); err != nil || closeErr != nil || string(data) != "abcdef" || s.releases != 0 {
+		t.Fatalf("closing the file must preserve the session: %q, %v, %v", data, err, closeErr)
+	}
+	call, cancel := context.WithCancel(ctx)
+	s.canceled = cancel
+	opened, err = d.Open(call, path, core.OpenOptions{})
+	if !errors.Is(err, context.Canceled) || opened.Body != nil || s.body.calls != 1 {
+		t.Fatalf("cancellation must close the acquired body: %+v, %v", opened, err)
+	}
+	if err := d.Close(); !errors.Is(err, closeFailure) {
+		t.Fatalf("failed session release must preserve its error: %v", err)
+	}
+	if err := errors.Join(d.Close(), d.Close()); err != nil || s.releases != 2 {
+		t.Fatalf("session release should retry once and then succeed idempotently: %d, %v", s.releases, err)
+	}
+}
+
 func setup(t *testing.T) (*fixture, *Driver, *core.Core, *core.Mount, Options) {
 	t.Helper()
 	s := &fixture{entered: make(chan struct{}, 4)}

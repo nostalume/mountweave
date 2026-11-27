@@ -110,6 +110,11 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	if changed.Effect != core.Unchanged {
 		t.Fatal(changed)
 	}
+	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"), core.RemoveOptions{Disposition: core.RemovePermanent})
+	code(t, err, core.UnsupportedOperation)
+	if changed.Effect != core.Unchanged {
+		t.Fatal(changed)
+	}
 	changed, err = c.Remove(ctx, "alice", core.Path("/files/folder/complete"), core.RemoveOptions{Target: core.RemoveNonDirectory})
 	if err != nil || changed.Effect != core.Applied {
 		t.Fatal(changed, err)
@@ -137,6 +142,57 @@ func TestLocalChangesAndInputBoundaries(t *testing.T) {
 	}
 
 }
+
+func TestExplicitRemoval(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "folder", "empty"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "folder/sample", []byte("contents"))
+	blockPurge := true
+	c := newCore(t, core.Options{Authorize: func(_ context.Context, _ core.Principal, a core.Action, p core.Address) error {
+		if blockPurge && a == core.PurgeAction && p.Value() == "/files/folder/sample" {
+			return errors.New("permanent removal denied on the primary path")
+		}
+		return nil
+	}})
+	defer closeCore(t, c)
+	m := mountLocal(t, c, root)
+	if err := c.BindAlias(ctx, "/alias", m, "/folder"); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Path("/alias/sample")
+	purge := core.RemoveOptions{Disposition: core.RemovePermanent, Target: core.RemoveNonDirectory}
+	for _, tc := range []struct {
+		disposition core.RemoveDisposition
+		code        core.Code
+	}{
+		{"invalid", core.InvalidRequest},
+		{core.RemoveTrash, core.UnsupportedOperation},
+		{core.RemovePermanent, core.PermissionDenied},
+	} {
+		attempt := purge
+		attempt.Disposition = tc.disposition
+		result, err := c.Remove(ctx, "alice", target, attempt)
+		code(t, err, tc.code)
+		if result.Effect != core.Unchanged {
+			t.Fatal(result)
+		}
+	}
+	blockPurge = false
+	result, err := c.Remove(ctx, "alice", target, purge)
+	if err != nil || result.Effect != core.Applied {
+		t.Fatal(result, err)
+	}
+	result, err = c.Remove(ctx, "alice", core.Path("/files/folder/empty"), core.RemoveOptions{
+		Disposition: core.RemovePermanent, Target: core.RemoveEmptyDirectory,
+	})
+	if err != nil || result.Effect != core.Applied {
+		t.Fatal(result, err)
+	}
+}
+
 func ptr(n int64) *int64 { return &n }
 
 func TestChangeReceiptsSurviveErrorsAndCancellation(t *testing.T) {

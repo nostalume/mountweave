@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/nostalume/mountweave"
 )
@@ -23,15 +24,35 @@ func TestWebsiteRead(t *testing.T) {
 		rows[i] = websiteItem{FID: id, Parent: "0", Name: id, Dir: &dir}
 	}
 	var accountReply, grantReply, startReply string
+	var recycleCalls int
+	var recycleApplies bool
+	var duringRecycle context.CancelFunc
 	pageOverrides := make(map[int]string)
-	call := func(_ context.Context, script string, args json.RawMessage) (json.RawMessage, error) {
+	call := func(callCtx context.Context, script string, args json.RawMessage) (json.RawMessage, error) {
 		switch script {
-		case websiteReadScript:
+		case websiteFileRequest:
 			var request websiteRequest
 			if err := json.Unmarshal(args, &request); err != nil {
 				return nil, err
 			}
 			switch {
+			case request.RecycleUntil != 0:
+				recycleCalls++
+				deadline, hasDeadline := callCtx.Deadline()
+				if !hasDeadline || request.RecycleUntil <= time.Now().UnixMilli() ||
+					request.RecycleUntil >= deadline.UnixMilli() || request.Account != account || request.FID != "selected" {
+					t.Fatalf("unexpected recycle request: %+v", request)
+				}
+				if duringRecycle != nil {
+					duringRecycle()
+					if callCtx.Err() != nil {
+						t.Fatal("caller ended the dispatched browser operation")
+					}
+				}
+				if recycleApplies {
+					pageOverrides[2] = `{"http":200,"account":"` + account + `","code":0,"page":2,"total":51,"items":[{"fid":"new-id","file":true,"size":6,"file_name":"original.txt"}]}`
+				}
+				return json.RawMessage(`{"http":200,"account":"` + account + `","code":0,"task":"task-id"}`), nil
 			case request.FID != "":
 				if request != (websiteRequest{Account: account, FID: "selected"}) {
 					t.Fatalf("unexpected grant request: %+v", request)
@@ -191,6 +212,24 @@ func TestWebsiteRead(t *testing.T) {
 	invalidRange = true
 	if opened, err := d.Open(ctx, address, opts); opened.Body != nil || core.CodeOf(err) != core.InvalidUpstreamResponse {
 		t.Fatalf("accepted the wrong range receipt: %v", err)
+	}
+	typed := core.RemoveOptions{Target: core.RemoveNonDirectory}
+	if got, err := d.Remove(ctx, core.NativePath("/dir-0"), typed); got.Effect != core.Unchanged || core.CodeOf(err) != core.UnsupportedOperation || recycleCalls != 0 {
+		t.Fatalf("wrong type recycle: %+v, %v, calls=%d", got, err, recycleCalls)
+	}
+	if got, err := d.Remove(ctx, address, typed); got.Effect != core.Unknown || core.CodeOf(err) != core.InvalidUpstreamResponse || recycleCalls != 1 {
+		t.Fatalf("unconfirmed recycle: %+v, %v, calls=%d", got, err, recycleCalls)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	duringRecycle = cancel
+	if got, err := d.Remove(canceled, address, typed); got.Effect != core.Unknown || !errors.Is(err, context.Canceled) || recycleCalls != 2 {
+		t.Fatalf("canceled confirmation: %+v, %v, calls=%d", got, err, recycleCalls)
+	}
+	duringRecycle = nil
+	recycleApplies = true
+	typed.Disposition = core.RemoveTrash
+	if got, err := d.RemoveWithDisposition(ctx, address, typed); got.Effect != core.Applied || err != nil || recycleCalls != 3 {
+		t.Fatalf("exact ID recycle: %+v, %v, calls=%d", got, err, recycleCalls)
 	}
 	accountReply = `{"http":401,"code":31001}`
 	if _, err := d.Stat(ctx, core.NativePath("/")); !errors.Is(err, ErrWebsiteSignIn) {

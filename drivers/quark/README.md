@@ -29,3 +29,10 @@ uses the site's 50-item pages and checks the reported total. The caller's
 `WebsiteTransfer` opens the matched browser response stream. The Driver
 checks the download grant, original-file metadata and byte-range response
 before returning the stream.
+
+`Core.Remove` sends one file to Trash by FID, checks the terminal native task
+and verifies the original directory no longer lists that file ID. An uncertain
+result reports an unknown effect. Directory and conditional removal are
+unavailable.
+
+[Quark Trash](https://www.quark.cn/documents/help/recycle-bin)

@@ -2,7 +2,8 @@
 
 An optional, standard-library-only Driver for the Microsoft Graph v1.0 Drive
 contract. It provides a fixed tree root, metadata, native paging, streaming
-downloads and known-length exclusive uploads through the existing Core API.
+downloads, exclusive directory creation, and known-length exclusive uploads
+through the existing Core API.
 
 ```go
 d, err := graphdrive.Open(ctx, graphdrive.Options{
@@ -80,6 +81,13 @@ construction. JSON control responses have a 4 MiB default limit in this mode.
 [Microsoft Graph Shares API](https://learn.microsoft.com/en-us/graph/api/shares-get?view=graph-rest-1.0)
 
 ## Files and publication
+
+`Core.Mkdir` creates one directory under its resolved native parent. A native
+name conflict preserves the existing file or directory. The Driver checks the
+new directory's name, item ID, parent ID and drive in the response. Graph
+requires write permission for this operation.
+
+[Create a Graph folder](https://learn.microsoft.com/en-us/graph/api/driveitem-post-children?view=graph-rest-1.0)
 
 Every path segment is checked against the stored name before its ID is used.
 Native case-insensitive lookup therefore does not authorize a different spelling.

@@ -111,8 +111,11 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 	if len(policies) > 1 {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.InvalidRequest, nil)
 	}
-	if len(policies) == 1 && (!policies[0].When.Empty() || policies[0].Target != "") {
-		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+	if len(policies) == 1 {
+		o := policies[0]
+		if o.Disposition != "" || !o.When.Empty() || o.Target != "" && (d.website == nil || o.Target != core.RemoveNonDirectory) {
+			return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
+		}
 	}
 	if pAddress.Namespace() != core.TreeNamespace {
 		return core.Change{Effect: core.Unchanged}, core.Fail(core.UnsupportedOperation, nil)
@@ -129,6 +132,7 @@ func (d *Driver) Remove(ctx context.Context, pAddress core.NativeAddress, polici
 	}
 	// No native empty-directory condition is supplied; a prior listing cannot
 	// establish that condition against concurrent child creation.
+	// Website trash addresses the admitted file by ID, which preserves its type.
 	if f.Type != "file" {
 		return unchanged, core.Fail(core.UnsupportedOperation, nil)
 	}
